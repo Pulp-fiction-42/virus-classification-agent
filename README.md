@@ -1,122 +1,84 @@
-# BioAgent
+# BioAgent Runtime
 
-Virus Classify Agent 
+BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime，面向病毒分类和固定 Snakemake 生物信息学工作流。
 
----
+## 本次改进
 
-## 架构
+- 引入 `/plan` 和 `/execute` 模式切换，并将 Open WebUI `chat_id` 直接映射到持久 Claude SDK session。
+- `plan` mode 默认只保留 permission mode，不额外注入 runtime prompt；`execute` mode 在用户请求前追加 `遵循之前计划模式下生成的计划执行`。
+- 固定 Snakemake workflow gatekeeper 改为一次确认后直接执行，取消 dry-run 和第二次确认。
 
-```
-浏览器
-  │  http://localhost:3000
-  ▼
-Open WebUI（Docker）
-  │  POST /chat/completions
-  │  http://host.docker.internal:8001
-  ▼
-adapter.py（宿主机 :8001）
-  │  Claude Agent SDK
-  ▼
-MiniMax API（远程）
-```
-
----
-
-## 文件结构
-
-```
-agent_sdk/
-├── adapter.py     # OpenAI 兼容接口，协议转换层
-├── phases.py      # Agent 阶段状态、系统提示词
-├── tools/
-│   └── watch.py    # 可选调试脚本，监控 Open WebUI 与 adapter 的消息传递
-└── README.md
-```
-
-**`adapter.py`**
-接收 Open WebUI 发来的 OpenAI 格式请求，转交给 `ClaudeSDKClient`，将流式响应转换回 OpenAI SSE 格式返回。
-
-**`phases.py`**
-维护当前阶段（`plan` / `execute`），提供对应的系统提示词和阶段切换函数。
-
-**`tools/watch.py`**
-可选的 mitmproxy 调试脚本，用于查看 Open WebUI 发给 adapter 的 `messages` 和 adapter 返回的 SSE 内容。
-
----
-
-## 启动
-
-**1. 启动 adapter**
-```bash
-cd /path/to/agent_sdk
-export ANTHROPIC_AUTH_TOKEN="你的 MiniMax API Key"
-uvicorn adapter:app --port 8001 --host 0.0.0.0
-```
-验证：浏览器打开 `http://localhost:8001/v1/models`，看到 BioAgent 即成功。
-
-**2. 启动 Open WebUI**
-```bash
-docker run -d -p 3000:8080 \
-  -v ~/.open-webui:/app/backend/data \
-  ghcr.io/open-webui/open-webui:main
-```
-等约 1-2 分钟后打开 `http://localhost:3000`。
-
-**3. 连接 adapter**
-
-Settings → Connections → OpenAI API → 齿轮图标：
-- URL: `http://host.docker.internal:8001`
-- Key: 任意字符
-
-保存后模型下拉框出现 BioAgent 即连通。
-
----
-
-## 使用
-
-**阶段切换**
-
-| 命令 | 效果 |
-|------|------|
-| `/execute` | 切换到执行阶段，工具启用 |
-| `/plan` | 切换回规划阶段，工具禁用 |
-
-**文件上传**
-
-直接在 Open WebUI 输入框旁点附件图标上传文件，Open WebUI 会自动将文件内容提取并附加到消息中发给 Agent。
-
-**对话历史**
-
-挂载 `-v ~/.open-webui:/app/backend/data` 后，对话历史持久化到本机，重启容器不丢失，侧边栏可查看历史会话。
-
----
-
-## 调试
-
-如需查看 Open WebUI 与 adapter 之间的请求和响应，可使用可选监控脚本：
-
-```bash
-mitmdump --mode reverse:http://localhost:8001 --listen-port 8888 -s tools/watch.py
-```
-
-然后将 Open WebUI 的 API URL 临时改为：
+## 结构
 
 ```text
-http://host.docker.internal:8888
+agent_sdk/
+├── adapter.py       # HTTP/OpenAI SSE 协议适配
+├── runtime.py       # SDK 配置、会话恢复和结果流
+├── config.py        # 模型、密钥、路径等静态配置
+├── .claude/
+│   ├── skills/      # 项目级 Agent Skills
+│   └── sessions/    # SDK JSONL transcript，不提交 Git
+├── tests/
+└── tools/watch.py   # 可选的消息监控脚本
 ```
 
-该脚本只用于调试消息传递，不是 BioAgent 的运行必需组件。
+## 会话模型
 
----
+Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。该 ID 直接作为 Claude SDK 的 session ID，不维护额外数据库映射：
 
-## 依赖
+1. adapter 为每个 `chat_id` 保留一个常驻 `ClaudeSDKClient`。
+2. 同一 `chat_id` 的请求复用同一个 client，并通过会话锁串行写入 SDK stream。
+3. 新建 client 时以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("plan")`，默认活动模式仍是 `plan`。
+4. 每轮用 `client.query(prompt, session_id=chat_id)` 绑定 SDK 会话。
+5. transcript 存在时只发送最新用户消息；不存在时用 Open WebUI 请求历史引导一次旧聊天。
+6. SDK transcript 保存在 `.claude/sessions/projects/<project>/<chat_id>.jsonl`。
+7. adapter 重启后内存 client 丢失，下一轮会重新创建 client，并用相同 `chat_id` 继续 SDK session。
+
+空闲 client 会在超时后断开；FastAPI shutdown 时会断开所有 client。当前部署仍假设单个 uvicorn worker。
+
+## Agent 能力
+
+- 会话开始时通过 `setting_sources=["project"]`、`skills="all"` 加载 `.claude/skills/`。
+- 默认 `/plan`：活动 SDK permission mode 为 `plan`，不额外注入 runtime prompt。
+- `/execute`：调用 `set_permission_mode("bypassPermissions")`，并在用户消息前额外注入 `遵循之前计划模式下生成的计划执行`。
+- `/plan` 和 `/execute` 命令由 adapter 拦截，不发送给 Claude，不污染对话上下文。
+- 固定 Snakemake 工作流的识别和一次确认后直接执行规则位于 `bioinformatics-workflow-gatekeeper` Skill。
+
+## 用户命令
+
+```text
+/plan
+/execute
+```
+
+## cyclone 部署
+
+```text
+Agent:       /data/bioagent/agent
+Open WebUI:  /data/bioagent/open-webui
+Sessions:    /data/bioagent/agent/.claude/sessions
+Workflows:   /data/user/guojindan/Projects/Workflows
+Runs:        /data/runs
+```
+
+服务由用户级 systemd 管理：
 
 ```bash
-pip install claude-agent-sdk fastapi uvicorn
-# 可选调试工具
-pip install mitmproxy
+systemctl --user restart bioagent-adapter open-webui-backend
+systemctl --user status bioagent-adapter open-webui-backend
 ```
 
-- Python 3.10+
-- Docker
-- `ANTHROPIC_AUTH_TOKEN` 或 `MINIMAX_API_KEY` 环境变量
+Open WebUI 必须启用：
+
+```text
+ENABLE_FORWARD_USER_INFO_HEADERS=True
+```
+
+## 验证
+
+```bash
+python -m unittest discover -s tests -v
+curl http://127.0.0.1:8001/v1/models
+```
+
+`config.py` 是唯一配置源，包括 API 密钥。SDK subprocess 所需变量由 runtime 从这些 Python 常量构造，不从 shell 环境读取配置。

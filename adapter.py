@@ -1,64 +1,89 @@
-# adapter.py — OpenAI-compatible API adapter for the BioAgent runtime
+"""OpenAI-compatible HTTP adapter for the BioAgent runtime."""
+
+from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ResultMessage, PermissionResultAllow
-from claude_agent_sdk.types import StreamEvent
+from runtime import EXECUTE_MODE, PLAN_MODE, InvalidSessionError, SessionManager, SessionStateError
 
-import phases
 
-# Initialize FastAPI application
 app = FastAPI()
+sessions = SessionManager()
+
 
 class ChatRequest(BaseModel):
-    """Represents a chat completion request from the OpenAI API."""
     model: str = "BioAgent"
     messages: list[dict]
     stream: bool = True
 
 
-async def auto_allow(tool_name: str, input_data: dict, context) -> PermissionResultAllow:
-    """Permission handler that allows all tool requests automatically."""
-    return PermissionResultAllow()
+def completion_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
 
-def sse(chunk: str) -> str:
-    """Wrap a text chunk in OpenAI SSE format (Server-Sent Events).
-
-    Args:
-        chunk (str): The text chunk to send to the client.
-
-    Returns:
-        str: Formatted SSE data line.
-    """
+def sse(chunk: str, response_id: str) -> str:
     payload = {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",  # Generate a unique short ID for the chunk
+        "id": response_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": "BioAgent",
         "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
     }
-    return f"data: {json.dumps(payload)}\n\n"
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def latest_user_text(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                return "\n".join(parts).strip()
+    return ""
+
+
+def completion_response(content: str, response_id: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "BioAgent",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+
+def streaming_text_response(content: str, response_id: str) -> StreamingResponse:
+    async def stream():
+        yield sse(content, response_id)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
-    """
-    GET /v1/models
-
-    Lists available models in an OpenAI-compatible format.
-
-    Returns:
-        dict: List of available models with ownership metadata.
-    """
     return {
         "object": "list",
         "data": [{"id": "BioAgent", "object": "model", "owned_by": "local"}],
@@ -67,76 +92,49 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
-async def chat(req: ChatRequest):
-    """
-    POST /v1/chat/completions
+async def chat(req: ChatRequest, request: Request):
+    chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
+    command = latest_user_text(req.messages)
+    response_id = completion_id()
 
-    Handles chat completion requests, streaming responses following OpenAI SSE format.
+    if command in {"/plan", "/execute"}:
+        mode = PLAN_MODE if command == "/plan" else EXECUTE_MODE
+        try:
+            await sessions.set_mode(chat_id, mode)
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SessionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    Args:
-        req (ChatRequest): The chat request payload with message history and configuration.
+        content = f"已切换到 {mode} mode"
+        if not req.stream:
+            return completion_response(content, response_id)
+        return streaming_text_response(content, response_id)
 
-    Returns:
-        StreamingResponse: FastAPI response that streams partial completions as SSE.
-    """
-    prompt = "\n".join(
-        f"{m['role'].upper()}: {m['content']}" for m in req.messages
-    )
+    if not req.stream:
+        try:
+            content = "".join([chunk async for chunk in sessions.stream_turn(req.messages, chat_id)])
+        except SessionStateError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return completion_response(content, response_id)
 
-    # Handle /execute phase switch command
-    last_user = next((m["content"].strip() for m in reversed(req.messages) if m["role"] == "user"), "")
-    if last_user == "/execute":
-        phases.switch_to_execute()
-        async def switch_stream():
-            yield sse("✅ Switched to Execute phase. Tools are now enabled.")
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(switch_stream(), media_type="text/event-stream")
-
-    if last_user == "/plan":
-        phases.switch_to_plan()
-        async def plan_stream():
-            yield sse("✅ Switched to Plan phase. Tools are now disabled.")
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(plan_stream(), media_type="text/event-stream")
-
-    api_key = os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("MINIMAX_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="Set ANTHROPIC_AUTH_TOKEN or MINIMAX_API_KEY before starting the adapter.",
-        )
-
-    # Construct ClaudeAgentOptions, including dynamic system prompt per phase
-    options = ClaudeAgentOptions(
-        system_prompt=phases.system_prompt(),
-        can_use_tool=auto_allow,         # All tool uses are automatically permitted in this adapter
-        permission_mode="bypassPermissions",  # This disables user confirmation for tool use
-        model="MiniMax-M3",
-        include_partial_messages=True,
-        env={
-            "ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
-            "ANTHROPIC_AUTH_TOKEN": api_key,
-        },
-    )
+    try:
+        await sessions.ensure_session(chat_id)
+    except InvalidSessionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SessionStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def stream():
-        """
-        Async generator that streams partial completions as SSE to the client.
-        """
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            # Iterate over streaming response events from agent
-            async for event in client.receive_response():
-                if isinstance(event, StreamEvent):
-                    e = event.event
-                    # Check for content block delta events (partial output)
-                    if e.get("type") == "content_block_delta":
-                        delta = e.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            # Send only actual text deltas to the client
-                            yield sse(delta["text"])
-        # Signal the end of the stream to the OpenAI-compatible client
+        async for chunk in sessions.stream_turn(req.messages, chat_id):
+            yield sse(chunk, response_id)
         yield "data: [DONE]\n\n"
 
-    # Return a streaming response with SSE for OpenAI compatibility
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.on_event("shutdown")
+async def shutdown_sessions():
+    await sessions.close_all()
