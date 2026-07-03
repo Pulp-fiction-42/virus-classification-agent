@@ -68,7 +68,10 @@ SDK_EXECUTE_PERMISSION_MODE = "bypassPermissions"
 
 PLAN_PROMPT_PREFIX = ""
 
-EXECUTE_PROMPT_PREFIX = "遵循之前计划模式下生成的计划执行"
+EXECUTE_PROMPT_PREFIX = """当前是 execute 模式。遵循之前计划模式下生成的计划执行。
+
+执行回合只返回普通 Markdown 状态或结果说明；不要输出 analysis_scheme fenced block，也不要输出任何卡片 JSON。
+真实 Snakemake 运行开始后，需要写入 /data/runs/<run_id>/.bioagent/state.json，并将 Snakemake stdout/stderr 记录到 /data/runs/<run_id>/.bioagent/execution.log。"""
 
 
 class SessionError(RuntimeError):

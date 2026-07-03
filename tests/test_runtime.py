@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import config
 import runtime
 from runtime import (
     EXECUTE_MODE,
@@ -160,6 +161,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         prompt, _ = FakeClient.instances[0].queries[0]
         self.assertIn(EXECUTE_PROMPT_PREFIX, prompt)
         self.assertIn("遵循之前计划模式下生成的计划执行", prompt)
+        self.assertIn("不要输出 analysis_scheme", prompt)
+        self.assertIn(".bioagent/state.json", prompt)
+        self.assertIn(".bioagent/execution.log", prompt)
         self.assertIn("USER REQUEST:", prompt)
 
     async def test_existing_transcript_sends_latest_user_message_only(self):
@@ -200,6 +204,32 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options.permission_mode, "bypassPermissions")
         self.assertEqual(options.allowed_tools, [])
         self.assertEqual(options.disallowed_tools, [])
+        self.assertEqual(options.system_prompt, config.SYSTEM_PROMPT)
+
+    def test_system_prompt_contains_analysis_scheme_contract(self):
+        self.assertIn("analysis_scheme", config.SYSTEM_PROMPT)
+        self.assertIn("```analysis_scheme", config.SYSTEM_PROMPT)
+        self.assertIn('"ready_to_execute"', config.SYSTEM_PROMPT)
+        self.assertIn('"steps"', config.SYSTEM_PROMPT)
+        self.assertIn("Do not create run directories", config.SYSTEM_PROMPT)
+        self.assertIn(".bioagent/state.json", config.SYSTEM_PROMPT)
+        self.assertIn(".bioagent/execution.log", config.SYSTEM_PROMPT)
+
+    def test_gatekeeper_skill_contains_minimal_analysis_contract(self):
+        skill_path = (
+            Path(__file__).resolve().parents[1]
+            / ".claude"
+            / "skills"
+            / "bioinformatics-workflow-gatekeeper"
+            / "SKILL.md"
+        )
+        skill = skill_path.read_text(encoding="utf-8")
+
+        self.assertIn("analysis_scheme", skill)
+        self.assertIn("Plan mode must not create run directories", skill)
+        self.assertIn("Do not output `analysis_scheme` in execute mode", skill)
+        self.assertIn("${RUN_DIR}/.bioagent/state.json", skill)
+        self.assertIn("${RUN_DIR}/.bioagent/execution.log", skill)
 
 
 if __name__ == "__main__":

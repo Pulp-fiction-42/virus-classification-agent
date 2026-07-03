@@ -7,6 +7,7 @@ BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime
 - 引入 `/plan` 和 `/execute` 模式切换，并将 Open WebUI `chat_id` 直接映射到持久 Claude SDK session。
 - `plan` mode 默认只保留 permission mode，不额外注入 runtime prompt；`execute` mode 在用户请求前追加 `遵循之前计划模式下生成的计划执行`。
 - 固定 Snakemake workflow gatekeeper 改为一次确认后直接执行，取消 dry-run 和第二次确认。
+- `plan` mode 通过 `analysis_scheme` Markdown fenced block 为 `/analysis` 前端提供最小结构化方案卡片契约；`execute` mode 保持普通 Markdown 输出。
 
 ## 结构
 
@@ -40,7 +41,7 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。该 ID 直接作为 Claude
 
 - 会话开始时通过 `setting_sources=["project"]`、`skills="all"` 加载 `.claude/skills/`。
 - 默认 `/plan`：活动 SDK permission mode 为 `plan`，不额外注入 runtime prompt。
-- `/execute`：调用 `set_permission_mode("bypassPermissions")`，并在用户消息前额外注入 `遵循之前计划模式下生成的计划执行`。
+- `/execute`：调用 `set_permission_mode("bypassPermissions")`，并在用户消息前额外注入执行提示，要求按既有方案执行、保持 Markdown 输出、写入 `.bioagent/state.json` 和 `.bioagent/execution.log`。
 - `/plan` 和 `/execute` 命令由 adapter 拦截，不发送给 Claude，不污染对话上下文。
 - 固定 Snakemake 工作流的识别和一次确认后直接执行规则位于 `bioinformatics-workflow-gatekeeper` Skill。
 

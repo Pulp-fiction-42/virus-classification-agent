@@ -34,7 +34,7 @@ MiniMax Anthropic-compatible API
 - 为每个 chat ID 创建并复用一个常驻 `ClaudeSDKClient`。
 - 用每个 session 自己的 `asyncio.Lock` 串行同一聊天的请求。
 - 新 session 以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("plan")`，所以用户可见默认模式仍是 `plan`。
-- `/plan` 调用 `set_permission_mode("plan")`，且不额外拼 runtime prompt；`/execute` 调用 `set_permission_mode("bypassPermissions")`，并额外拼接 `遵循之前计划模式下生成的计划执行`。
+- `/plan` 调用 `set_permission_mode("plan")`，且不额外拼 runtime prompt；`/execute` 调用 `set_permission_mode("bypassPermissions")`，并额外拼接执行提示，要求按既有方案执行、保持 Markdown 输出、写入 `.bioagent/state.json` 和 `.bioagent/execution.log`。
 - 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
 - 构建统一的 `ClaudeAgentOptions`，加载项目 Skills 和 Claude Code preset tools。
 - 校验 transcript、SDK 执行结果和返回的 session ID。
@@ -47,7 +47,7 @@ MiniMax Anthropic-compatible API
 
 ### `.claude/skills/`
 
-Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 负责 workflow1-workflow6 的保守匹配、一次用户确认后的直接执行以及 Bash 执行边界。
+Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 负责 workflow1-workflow6 的保守匹配、plan 模式 `analysis_scheme` 卡片契约、一次用户确认后的直接执行以及 Bash 执行边界。
 
 ## 持久化
 
