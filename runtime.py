@@ -93,6 +93,7 @@ class ManagedSession:
     lock: asyncio.Lock
     last_used_at: float
     bootstrapped: bool
+    claude_session_id: str | None
 
 
 class SessionManager:
@@ -109,6 +110,8 @@ class SessionManager:
         self.project_root = project_root.resolve()
         self.config_dir = config_dir.resolve()
         self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.chat_map_dir = self.config_dir / "bioagent" / "chat-map"
+        self.chat_map_dir.mkdir(parents=True, exist_ok=True)
         self.client_factory = client_factory
         self.idle_timeout_seconds = idle_timeout_seconds
         self._sessions: dict[str, ManagedSession] = {}
@@ -138,7 +141,10 @@ class SessionManager:
         async with session.lock:
             prompt = self._prefixed_prompt(session.mode, self._prompt_for_session(messages, session))
             session.last_used_at = time.time()
-            await session.client.query(prompt, session_id=normalized_chat_id)
+            if session.claude_session_id:
+                await session.client.query(prompt, session_id=session.claude_session_id)
+            else:
+                await session.client.query(prompt)
 
             result_seen = False
             async for message in session.client.receive_response():
@@ -151,7 +157,7 @@ class SessionManager:
                         yield delta["text"]
                 elif isinstance(message, ResultMessage):
                     result_seen = True
-                    self._validate_result(normalized_chat_id, message)
+                    self._record_result(normalized_chat_id, session, message)
 
             if not result_seen:
                 raise SessionStateError("Claude Agent SDK ended without a ResultMessage")
@@ -205,8 +211,13 @@ class SessionManager:
             return session
 
     async def _create_session(self, chat_id: str) -> ManagedSession:
-        transcript = self.transcript_path(chat_id)
-        if transcript.exists():
+        claude_session_id = self._load_claude_session_id(chat_id)
+        if claude_session_id:
+            transcript = self.transcript_path(claude_session_id)
+            if not transcript.exists():
+                raise SessionStateError(
+                    f"Cannot resume missing Claude transcript for Open WebUI chat: {chat_id}"
+                )
             self._validate_transcript(transcript)
 
         # The SDK can only switch back to bypassPermissions if the subprocess
@@ -222,7 +233,8 @@ class SessionManager:
             mode=PLAN_MODE,
             lock=asyncio.Lock(),
             last_used_at=time.time(),
-            bootstrapped=transcript.exists(),
+            bootstrapped=bool(claude_session_id),
+            claude_session_id=claude_session_id,
         )
 
     def _build_options(self, *, permission_mode: str) -> ClaudeAgentOptions:
@@ -334,16 +346,66 @@ class SessionManager:
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise SessionStateError(f"Cannot resume corrupt transcript: {path}") from exc
 
-    @staticmethod
-    def _validate_result(expected_session_id: str, result: ResultMessage) -> None:
+    def _record_result(self, chat_id: str, session: ManagedSession, result: ResultMessage) -> None:
         if result.is_error:
             detail = result.result or "; ".join(result.errors or []) or result.subtype
             raise SessionStateError(f"Claude Agent SDK request failed: {detail}")
+
         result_session_id = getattr(result, "session_id", None)
-        if result_session_id and result_session_id != expected_session_id:
+        if not result_session_id:
+            return
+
+        if session.claude_session_id is None:
+            session.claude_session_id = result_session_id
+            self._save_claude_session_id(chat_id, result_session_id)
+            return
+
+        if result_session_id != session.claude_session_id:
             raise SessionStateError(
-                "Claude Agent SDK returned a session ID that does not match the Open WebUI chat ID"
+                "Claude Agent SDK returned a session ID that does not match the stored Claude session ID"
             )
+
+    def _chat_map_path(self, chat_id: str) -> Path:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", chat_id)
+        return self.chat_map_dir / f"{safe_name}.json"
+
+    def _load_claude_session_id(self, chat_id: str) -> str | None:
+        path = self._chat_map_path(chat_id)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SessionStateError(f"Cannot read Claude session mapping: {path}") from exc
+
+        if data.get("openwebui_chat_id") != chat_id:
+            raise SessionStateError(f"Claude session mapping does not match Open WebUI chat: {path}")
+        claude_session_id = data.get("claude_session_id")
+        if not isinstance(claude_session_id, str) or not claude_session_id:
+            raise SessionStateError(f"Claude session mapping is missing claude_session_id: {path}")
+        return claude_session_id
+
+    def _save_claude_session_id(self, chat_id: str, claude_session_id: str) -> None:
+        path = self._chat_map_path(chat_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        created_at = now
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(existing.get("created_at"), (int, float)):
+                    created_at = existing["created_at"]
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+        payload = {
+            "openwebui_chat_id": chat_id,
+            "claude_session_id": claude_session_id,
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
 
     @staticmethod
     async def _disconnect_session(session: ManagedSession) -> None:

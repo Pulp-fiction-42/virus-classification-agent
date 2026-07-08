@@ -55,11 +55,11 @@ class FakeClient:
     async def connect(self):
         self.connected = True
 
-    async def query(self, prompt, session_id="default"):
+    async def query(self, prompt, session_id=None):
         self.queries.append((prompt, session_id))
 
     async def receive_response(self):
-        session_id = self.queries[-1][1]
+        session_id = self.queries[-1][1] or "sdk-session-1"
         yield FakeStreamEvent(
             {
                 "type": "content_block_delta",
@@ -130,6 +130,21 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(FakeClient.instances), 1)
         self.assertEqual(len(FakeClient.instances[0].queries), 2)
 
+    async def test_first_turn_persists_claude_session_mapping(self):
+        [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
+
+        mapping = json.loads(self.manager._chat_map_path(self.chat_id).read_text(encoding="utf-8"))
+        self.assertEqual(mapping["openwebui_chat_id"], self.chat_id)
+        self.assertEqual(mapping["claude_session_id"], "sdk-session-1")
+        self.assertIsNone(FakeClient.instances[0].queries[0][1])
+
+    async def test_follow_up_uses_stored_claude_session_id(self):
+        [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
+        [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
+
+        self.assertIsNone(FakeClient.instances[0].queries[0][1])
+        self.assertEqual(FakeClient.instances[0].queries[1][1], "sdk-session-1")
+
     async def test_missing_or_invalid_chat_id_is_rejected(self):
         with self.assertRaises(InvalidSessionError):
             await self.manager.ensure_session(None)
@@ -137,7 +152,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             await self.manager.ensure_session("not-a-uuid")
 
     async def test_corrupt_transcript_is_rejected(self):
-        transcript = self.manager.transcript_path(self.chat_id)
+        claude_session_id = "sdk-corrupt-session"
+        self.manager._save_claude_session_id(self.chat_id, claude_session_id)
+        transcript = self.manager.transcript_path(claude_session_id)
         transcript.parent.mkdir(parents=True)
         transcript.write_text("not-json\n", encoding="utf-8")
 
@@ -150,7 +167,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         prompt, session_id = FakeClient.instances[0].queries[0]
         self.assertEqual(chunks, ["chunk"])
-        self.assertEqual(session_id, self.chat_id)
+        self.assertIsNone(session_id)
         self.assertEqual(prompt, "USER: first question\n\nASSISTANT: first answer\n\nUSER: follow-up question")
         self.assertNotIn("USER REQUEST:", prompt)
 
@@ -167,13 +184,16 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("USER REQUEST:", prompt)
 
     async def test_existing_transcript_sends_latest_user_message_only(self):
-        transcript = self.manager.transcript_path(self.chat_id)
+        claude_session_id = "sdk-existing-session"
+        self.manager._save_claude_session_id(self.chat_id, claude_session_id)
+        transcript = self.manager.transcript_path(claude_session_id)
         transcript.parent.mkdir(parents=True)
         transcript.write_text(json.dumps({"type": "user"}) + "\n", encoding="utf-8")
 
         [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
 
-        prompt, _ = FakeClient.instances[0].queries[0]
+        prompt, session_id = FakeClient.instances[0].queries[0]
+        self.assertEqual(session_id, claude_session_id)
         self.assertIn("follow-up question", prompt)
         self.assertNotIn("first answer", prompt)
 
