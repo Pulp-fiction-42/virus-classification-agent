@@ -59,7 +59,7 @@ class FakeClient:
         self.queries.append((prompt, session_id))
 
     async def receive_response(self):
-        session_id = self.queries[-1][1] or "sdk-session-1"
+        session_id = self.options.resume or "sdk-session-1"
         yield FakeStreamEvent(
             {
                 "type": "content_block_delta",
@@ -88,6 +88,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = SessionManager(
             root,
             root / ".claude" / "sessions",
+            sdk_config_dir=root / "sdk-runtime",
             client_factory=FakeClient,
             idle_timeout_seconds=60 * 60,
         )
@@ -104,6 +105,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.current_mode(self.chat_id), PLAN_MODE)
         self.assertEqual(FakeClient.instances[0].options.permission_mode, "bypassPermissions")
         self.assertEqual(FakeClient.instances[0].permission_modes, ["plan"])
+
+    def test_sdk_runtime_projects_link_targets_persistent_transcripts(self):
+        projects_link = self.manager.sdk_config_dir / "projects"
+
+        self.assertTrue(projects_link.is_symlink())
+        self.assertEqual(projects_link.resolve(), self.manager.projects_dir)
 
     async def test_plan_mode_calls_sdk_permission_mode(self):
         await self.manager.set_mode(self.chat_id, PLAN_MODE)
@@ -143,7 +150,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
 
         self.assertIsNone(FakeClient.instances[0].queries[0][1])
-        self.assertEqual(FakeClient.instances[0].queries[1][1], "sdk-session-1")
+        self.assertIsNone(FakeClient.instances[0].queries[1][1])
 
     async def test_missing_or_invalid_chat_id_is_rejected(self):
         with self.assertRaises(InvalidSessionError):
@@ -193,9 +200,39 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
 
         prompt, session_id = FakeClient.instances[0].queries[0]
-        self.assertEqual(session_id, claude_session_id)
+        self.assertIsNone(session_id)
+        self.assertEqual(FakeClient.instances[0].options.resume, claude_session_id)
         self.assertIn("follow-up question", prompt)
         self.assertNotIn("first answer", prompt)
+
+    async def test_recreated_manager_resumes_via_client_options(self):
+        [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
+        transcript = self.manager.transcript_path("sdk-session-1")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"type": "user"}) + "\n", encoding="utf-8")
+        await self.manager.close_all()
+
+        root = self.manager.project_root
+        recreated = SessionManager(
+            root,
+            self.manager.config_dir,
+            sdk_config_dir=self.manager.sdk_config_dir,
+            client_factory=FakeClient,
+            idle_timeout_seconds=60 * 60,
+        )
+        [chunk async for chunk in recreated.stream_turn(MESSAGES, self.chat_id)]
+
+        resumed_client = FakeClient.instances[-1]
+        self.assertEqual(resumed_client.options.resume, "sdk-session-1")
+        self.assertIsNone(resumed_client.queries[0][1])
+        await recreated.close_all()
+
+    async def test_ephemeral_turn_does_not_create_chat_mapping(self):
+        chunks = [chunk async for chunk in self.manager.stream_ephemeral_turn(MESSAGES)]
+
+        self.assertEqual(chunks, ["chunk"])
+        self.assertFalse(self.manager._chat_map_path(self.chat_id).exists())
+        self.assertTrue(FakeClient.instances[-1].disconnected)
 
     async def test_bootstrap_history_filters_mode_switch_messages(self):
         messages = [
@@ -222,6 +259,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options.setting_sources, ["project"])
         self.assertEqual(options.tools, {"type": "preset", "preset": "claude_code"})
         self.assertEqual(options.permission_mode, "bypassPermissions")
+        self.assertEqual(options.env["CLAUDE_CONFIG_DIR"], str(self.manager.sdk_config_dir))
         self.assertEqual(options.allowed_tools, [])
         self.assertEqual(options.disallowed_tools, [])
         self.assertEqual(options.system_prompt, config.SYSTEM_PROMPT)

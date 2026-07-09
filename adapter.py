@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,12 +17,14 @@ from runtime import EXECUTE_MODE, PLAN_MODE, InvalidSessionError, SessionManager
 
 app = FastAPI()
 sessions = SessionManager()
+log = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
     model: str = "BioAgent"
     messages: list[dict]
     stream: bool = True
+    metadata: dict[str, Any] | None = None
 
 
 def completion_id() -> str:
@@ -36,6 +40,24 @@ def sse(chunk: str, response_id: str) -> str:
         "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def sse_error(message: str) -> str:
+    payload = {
+        "error": {
+            "message": message,
+            "type": "bioagent_session_error",
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def background_task(req: ChatRequest, request: Request) -> str | None:
+    task = request.headers.get("X-OpenWebUI-Task")
+    if not task and req.metadata:
+        value = req.metadata.get("task")
+        task = value if isinstance(value, str) else None
+    return task.strip() if task and task.strip() else None
 
 
 def latest_user_text(messages: list[dict]) -> str:
@@ -94,10 +116,11 @@ async def list_models():
 @app.post("/chat/completions")
 async def chat(req: ChatRequest, request: Request):
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
+    task = background_task(req, request)
     command = latest_user_text(req.messages)
     response_id = completion_id()
 
-    if command in {"/plan", "/execute"}:
+    if not task and command in {"/plan", "/execute"}:
         mode = PLAN_MODE if command == "/plan" else EXECUTE_MODE
         try:
             await sessions.set_mode(chat_id, mode)
@@ -113,23 +136,38 @@ async def chat(req: ChatRequest, request: Request):
 
     if not req.stream:
         try:
-            content = "".join([chunk async for chunk in sessions.stream_turn(req.messages, chat_id)])
+            chunks = (
+                sessions.stream_ephemeral_turn(req.messages)
+                if task
+                else sessions.stream_turn(req.messages, chat_id)
+            )
+            content = "".join([chunk async for chunk in chunks])
         except SessionStateError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except InvalidSessionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return completion_response(content, response_id)
 
-    try:
-        await sessions.ensure_session(chat_id)
-    except InvalidSessionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except SessionStateError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not task:
+        try:
+            await sessions.ensure_session(chat_id)
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SessionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def stream():
-        async for chunk in sessions.stream_turn(req.messages, chat_id):
-            yield sse(chunk, response_id)
+        try:
+            chunks = (
+                sessions.stream_ephemeral_turn(req.messages)
+                if task
+                else sessions.stream_turn(req.messages, chat_id)
+            )
+            async for chunk in chunks:
+                yield sse(chunk, response_id)
+        except (InvalidSessionError, SessionStateError) as exc:
+            log.exception("BioAgent stream failed")
+            yield sse_error(str(exc))
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")

@@ -102,16 +102,21 @@ class SessionManager:
     def __init__(
         self,
         project_root: Path = config.PROJECT_ROOT,
-        config_dir: Path = config.CLAUDE_CONFIG_DIR,
+        config_dir: Path = config.CLAUDE_STATE_DIR,
         *,
+        sdk_config_dir: Path = config.CLAUDE_RUNTIME_CONFIG_DIR,
         client_factory: Callable[[ClaudeAgentOptions], Any] = ClaudeSDKClient,
         idle_timeout_seconds: float = config.SESSION_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_dir = config_dir.resolve()
         self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_dir = self.config_dir / "projects"
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.chat_map_dir = self.config_dir / "bioagent" / "chat-map"
         self.chat_map_dir.mkdir(parents=True, exist_ok=True)
+        self.sdk_config_dir = sdk_config_dir.resolve()
+        self._prepare_sdk_config_dir()
         self.client_factory = client_factory
         self.idle_timeout_seconds = idle_timeout_seconds
         self._sessions: dict[str, ManagedSession] = {}
@@ -119,7 +124,23 @@ class SessionManager:
 
         # SDK inspection helpers read this process variable, while the CLI
         # subprocess receives the same value through ClaudeAgentOptions.env.
-        os.environ["CLAUDE_CONFIG_DIR"] = str(self.config_dir)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.sdk_config_dir)
+
+    def _prepare_sdk_config_dir(self) -> None:
+        """Keep SDK-generated runtime files outside the persistent state tree."""
+        self.sdk_config_dir.mkdir(parents=True, exist_ok=True)
+        projects_link = self.sdk_config_dir / "projects"
+        if projects_link.is_symlink():
+            if projects_link.resolve() != self.projects_dir:
+                raise SessionStateError(
+                    f"Claude runtime projects link points to the wrong directory: {projects_link}"
+                )
+            return
+        if projects_link.exists():
+            raise SessionStateError(
+                f"Claude runtime projects path must be a symlink: {projects_link}"
+            )
+        projects_link.symlink_to(self.projects_dir, target_is_directory=True)
 
     async def set_mode(self, chat_id: str | None, mode: str) -> None:
         if mode not in {PLAN_MODE, EXECUTE_MODE}:
@@ -141,10 +162,7 @@ class SessionManager:
         async with session.lock:
             prompt = self._prefixed_prompt(session.mode, self._prompt_for_session(messages, session))
             session.last_used_at = time.time()
-            if session.claude_session_id:
-                await session.client.query(prompt, session_id=session.claude_session_id)
-            else:
-                await session.client.query(prompt)
+            await session.client.query(prompt)
 
             result_seen = False
             async for message in session.client.receive_response():
@@ -164,6 +182,35 @@ class SessionManager:
 
             session.bootstrapped = True
             session.last_used_at = time.time()
+
+    async def stream_ephemeral_turn(self, messages: list[dict]) -> AsyncIterator[str]:
+        """Run an Open WebUI background task without persistent chat state."""
+        options = self._build_options(permission_mode=SDK_PLAN_PERMISSION_MODE)
+        client = self.client_factory(options)
+        result_seen = False
+
+        try:
+            await client.connect()
+            await client.query(self._render_history(messages))
+
+            async for message in client.receive_response():
+                if isinstance(message, StreamEvent):
+                    event = message.event
+                    if event.get("type") != "content_block_delta":
+                        continue
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta" and delta.get("text"):
+                        yield delta["text"]
+                elif isinstance(message, ResultMessage):
+                    result_seen = True
+                    if message.is_error:
+                        detail = message.result or "; ".join(message.errors or []) or message.subtype
+                        raise SessionStateError(f"Claude Agent SDK request failed: {detail}")
+
+            if not result_seen:
+                raise SessionStateError("Claude Agent SDK ended without a ResultMessage")
+        finally:
+            await client.disconnect()
 
     async def ensure_session(self, chat_id: str | None) -> None:
         normalized_chat_id = self._validate_chat_id(chat_id)
@@ -196,7 +243,7 @@ class SessionManager:
 
     def transcript_path(self, session_id: str) -> Path:
         project_name = re.sub(r"[^A-Za-z0-9]", "-", str(self.project_root))
-        return self.config_dir / "projects" / project_name / f"{session_id}.jsonl"
+        return self.projects_dir / project_name / f"{session_id}.jsonl"
 
     async def _get_or_create_session(self, chat_id: str) -> ManagedSession:
         await self.close_idle_sessions()
@@ -224,7 +271,10 @@ class SessionManager:
         # was launched with that capability. We immediately set the active mode
         # to plan before accepting any user turn, so new chats still default to
         # read-only plan behavior.
-        options = self._build_options(permission_mode=SDK_EXECUTE_PERMISSION_MODE)
+        options = self._build_options(
+            permission_mode=SDK_EXECUTE_PERMISSION_MODE,
+            resume=claude_session_id,
+        )
         client = self.client_factory(options)
         await client.connect()
         await client.set_permission_mode(SDK_PLAN_PERMISSION_MODE)
@@ -237,11 +287,17 @@ class SessionManager:
             claude_session_id=claude_session_id,
         )
 
-    def _build_options(self, *, permission_mode: str) -> ClaudeAgentOptions:
+    def _build_options(
+        self,
+        *,
+        permission_mode: str,
+        resume: str | None = None,
+    ) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             system_prompt=config.SYSTEM_PROMPT,
             tools={"type": "preset", "preset": "claude_code"},
             permission_mode=permission_mode,
+            resume=resume,
             model=config.MODEL,
             include_partial_messages=True,
             cwd=self.project_root,
@@ -252,7 +308,7 @@ class SessionManager:
                 "ANTHROPIC_BASE_URL": config.ANTHROPIC_BASE_URL,
                 "ANTHROPIC_AUTH_TOKEN": config.MINIMAX_API_KEY,
                 "MINIMAX_API_KEY": config.MINIMAX_API_KEY,
-                "CLAUDE_CONFIG_DIR": str(self.config_dir),
+                "CLAUDE_CONFIG_DIR": str(self.sdk_config_dir),
             },
         )
 
