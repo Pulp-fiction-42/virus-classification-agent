@@ -7,4 +7,4 @@ __pycache__/
 .chat/
 .claude/sessions/
 python-agent-sdk-reference.md
-sync_from_bioagent.sh
+/start-*.sh

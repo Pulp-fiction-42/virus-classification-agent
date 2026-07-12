@@ -10,7 +10,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from runtime import EXECUTE_MODE, PLAN_MODE, InvalidSessionError, SessionManager, SessionStateError
+from runtime import (
+    EXECUTE_MODE,
+    PLAN_MODE,
+    InvalidSessionError,
+    OutputItemAdded,
+    SessionError,
+    SessionManager,
+    SessionStateError,
+    TextDelta,
+)
 
 
 app = FastAPI()
@@ -34,6 +43,30 @@ def sse(chunk: str, response_id: str) -> str:
         "created": int(time.time()),
         "model": "BioAgent",
         "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def output_item_sse(item: dict, response_id: str) -> str:
+    payload = {
+        "type": "response.output_item.added",
+        "response_id": response_id,
+        "output_index": 0,
+        "item": item,
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def error_sse(exc: Exception, response_id: str) -> str:
+    payload = {
+        "id": response_id,
+        "object": "error",
+        "created": int(time.time()),
+        "model": "BioAgent",
+        "error": {
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -113,11 +146,17 @@ async def chat(req: ChatRequest, request: Request):
 
     if not req.stream:
         try:
-            content = "".join([chunk async for chunk in sessions.stream_turn(req.messages, chat_id)])
-        except SessionStateError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            parts = []
+            async for event in sessions.stream_turn(req.messages, chat_id):
+                if isinstance(event, TextDelta):
+                    parts.append(event.text)
+            content = "".join(parts)
         except InvalidSessionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (SessionError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return completion_response(content, response_id)
 
     try:
@@ -128,8 +167,14 @@ async def chat(req: ChatRequest, request: Request):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def stream():
-        async for chunk in sessions.stream_turn(req.messages, chat_id):
-            yield sse(chunk, response_id)
+        try:
+            async for event in sessions.stream_turn(req.messages, chat_id):
+                if isinstance(event, TextDelta):
+                    yield sse(event.text, response_id)
+                elif isinstance(event, OutputItemAdded):
+                    yield output_item_sse(event.item, response_id)
+        except Exception as exc:
+            yield error_sse(exc, response_id)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
