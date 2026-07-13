@@ -12,7 +12,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from runtime import EXECUTE_MODE, PLAN_MODE, InvalidSessionError, SessionManager, SessionStateError
+from runtime import (
+    EXECUTE_MODE,
+    PLAN_MODE,
+    InvalidSessionError,
+    OutputItemAdded,
+    SessionError,
+    SessionManager,
+    SessionStateError,
+    TextDelta,
+)
 
 
 app = FastAPI()
@@ -42,12 +51,12 @@ def sse(chunk: str, response_id: str) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def sse_error(message: str) -> str:
+def output_item_sse(item: dict, response_id: str) -> str:
     payload = {
-        "error": {
-            "message": message,
-            "type": "bioagent_session_error",
-        }
+        "type": "response.output_item.added",
+        "response_id": response_id,
+        "output_index": 0,
+        "item": item,
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -58,6 +67,20 @@ def background_task(req: ChatRequest, request: Request) -> str | None:
         value = req.metadata.get("task")
         task = value if isinstance(value, str) else None
     return task.strip() if task and task.strip() else None
+
+
+def error_sse(exc: Exception, response_id: str) -> str:
+    payload = {
+        "id": response_id,
+        "object": "error",
+        "created": int(time.time()),
+        "model": "BioAgent",
+        "error": {
+            "message": str(exc) or exc.__class__.__name__,
+            "type": exc.__class__.__name__,
+        },
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def latest_user_text(messages: list[dict]) -> str:
@@ -136,16 +159,22 @@ async def chat(req: ChatRequest, request: Request):
 
     if not req.stream:
         try:
-            chunks = (
+            events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
                 else sessions.stream_turn(req.messages, chat_id)
             )
-            content = "".join([chunk async for chunk in chunks])
-        except SessionStateError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            parts = []
+            async for event in events:
+                if isinstance(event, TextDelta):
+                    parts.append(event.text)
+            content = "".join(parts)
         except InvalidSessionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (SessionError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return completion_response(content, response_id)
 
     if not task:
@@ -158,16 +187,19 @@ async def chat(req: ChatRequest, request: Request):
 
     async def stream():
         try:
-            chunks = (
+            events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
                 else sessions.stream_turn(req.messages, chat_id)
             )
-            async for chunk in chunks:
-                yield sse(chunk, response_id)
-        except (InvalidSessionError, SessionStateError) as exc:
+            async for event in events:
+                if isinstance(event, TextDelta):
+                    yield sse(event.text, response_id)
+                elif isinstance(event, OutputItemAdded):
+                    yield output_item_sse(event.item, response_id)
+        except Exception as exc:
             log.exception("BioAgent stream failed")
-            yield sse_error(str(exc))
+            yield error_sse(exc, response_id)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")

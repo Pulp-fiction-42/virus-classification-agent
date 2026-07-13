@@ -37,7 +37,6 @@ def request(flow):
 
 def response(flow):
     status = flow.response.status_code
-    path = flow.request.path.split("?")[0].rstrip("/")
     ct = flow.response.headers.get("content-type", "")
 
     if "event-stream" in ct:
