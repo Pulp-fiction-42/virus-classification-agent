@@ -84,6 +84,7 @@ EXECUTE_PROMPT_PREFIX = """当前是 execute 模式。遵循之前计划模式�
 
 执行回合只返回普通 Markdown 状态或结果说明；不要输出 analysis_plan fenced block，也不要输出任何卡片 JSON。
 runtime 已经创建 run_dir 和 .bioagent/state.json。必须使用注入的 run_id、run_dir、state_path、log_path 和 steps；不要创建第二个 run 目录。
+每次运行 Snakemake 都必须显式传入 --directory "<run_dir>/workflow"、--snakefile "<run_dir>/workflow/Snakefile" 和绝对 configfile 路径；不得只依赖 cd，否则会污染 agent 工作目录。
 每个阶段开始或结束时更新 state.json 中的 steps[].status 和 execution.current_step_id。
 步骤状态只使用 pending、running、completed、failed；execution 状态只使用 running、completed、failed。
 不要后台运行；命令结束前必须写入 execution.status、execution.ok、execution.returncode。"""

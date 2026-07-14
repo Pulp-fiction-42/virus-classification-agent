@@ -460,6 +460,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("analysis-20260709-120000-testabcd", prompt)
         self.assertIn(".bioagent/state.json", prompt)
         self.assertIn(".bioagent/execution.log", prompt)
+        self.assertIn('--directory "<run_dir>/workflow"', prompt)
+        self.assertIn('--snakefile "<run_dir>/workflow/Snakefile"', prompt)
         self.assertIn("USER REQUEST:", prompt)
 
     async def test_existing_transcript_sends_latest_user_message_only(self):
@@ -571,6 +573,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Never execute a stage omitted from the latest plan", skill)
         self.assertIn("${RUN_DIR}/.bioagent/state.json", skill)
         self.assertIn("${RUN_DIR}/.bioagent/execution.log", skill)
+        self.assertIn('--directory "${RUN_DIR}/workflow"', skill)
+        self.assertIn('--snakefile "${RUN_DIR}/workflow/Snakefile"', skill)
+        self.assertIn('--configfile "${RUN_DIR}/workflow/config/config.yaml"', skill)
+        self.assertNotIn('cd "${RUN_DIR}/workflow"', skill)
 
 
 if __name__ == "__main__":

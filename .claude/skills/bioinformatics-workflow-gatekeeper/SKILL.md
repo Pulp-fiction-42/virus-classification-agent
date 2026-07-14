@@ -86,6 +86,7 @@ Requirements:
 - The run root is controlled by `BIOAGENT_RUN_ROOT`.
 - Work only inside the runtime-injected run directory.
 - Copy the workflow source into `${RUN_DIR}/workflow` before running it.
+- Every Snakemake invocation must pass `--directory "${RUN_DIR}/workflow"`, `--snakefile "${RUN_DIR}/workflow/Snakefile"`, and an absolute `--configfile` path. Snakemake resolves CLI file arguments before switching directory, and an absolute Snakefile alone does not change its working directory; do not rely on a previous Bash tool call's `cd`.
 - The real Snakemake execution must only happen after explicit user confirmation and execute-mode context.
 - Runtime state has already been created at `${RUN_DIR}/.bioagent/state.json`; update it as each user-facing step starts or finishes. Step status is exactly `pending`, `running`, `completed`, or `failed`; execution status is exactly `running`, `completed`, or `failed`.
 - Snakemake stdout/stderr should be captured in `${RUN_DIR}/.bioagent/execution.log`.
@@ -119,8 +120,6 @@ rsync -a \
 For workflow1, prepare the run-local sample list and config inside `${RUN_DIR}/workflow`:
 
 ```bash
-cd "${RUN_DIR}/workflow"
-
 # If the user provided real samples, overwrite data/samples.txt with:
 # run_id sample_name /absolute/path/to/R1.fastq.gz /absolute/path/to/R2.fastq.gz
 #
@@ -128,8 +127,10 @@ cd "${RUN_DIR}/workflow"
 # workflow's existing example data/samples.txt.
 
 python - <<'PY'
+import os
 from pathlib import Path
-config = Path("config/config.yaml")
+workflow_dir = Path(os.environ["RUN_DIR"]) / "workflow"
+config = workflow_dir / "config/config.yaml"
 text = config.read_text()
 lines = []
 for line in text.splitlines():
@@ -146,8 +147,6 @@ PY
 Update the run-local state and launch Snakemake:
 
 ```bash
-cd "${RUN_DIR}/workflow"
-
 python - <<'PY'
 import json
 import os
@@ -163,7 +162,11 @@ path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
 PY
 
 set +e
-"${SNAKEMAKE}" --snakefile Snakefile --configfile config/config.yaml --cores 4 \
+"${SNAKEMAKE}" \
+  --directory "${RUN_DIR}/workflow" \
+  --snakefile "${RUN_DIR}/workflow/Snakefile" \
+  --configfile "${RUN_DIR}/workflow/config/config.yaml" \
+  --cores 4 \
   > "${LOG_PATH}" 2>&1
 EXEC_STATUS=$?
 set -e
