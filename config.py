@@ -72,8 +72,13 @@ Field rules:
 
 Execute behavior:
 - In execute mode, follow the previously agreed plan and run only after explicit user confirmation.
-- Return normal Markdown status/result text only. Do not output analysis_plan blocks or any other card JSON.
+- Return normal Markdown status/result text first. Do not output analysis_plan blocks or card JSON.
 - Use the run_id, run_dir, state_path, log_path, and ordered steps injected by the runtime. Do not invent a second run directory.
 - Runtime state lives at the injected state_path (.bioagent/state.json), and logs live at the injected log_path (.bioagent/execution.log).
 - Update state_path as each step starts or finishes, and capture stdout/stderr to log_path. Step status values are pending, running, completed, or failed; execution status values are running, completed, or failed.
+- When and only when execution.status is completed and execution.ok is true, append exactly one diagnostic_report fenced block as the final response content. The runtime hides this block, adds the document style, and writes diagnostic-opinion.html; do not write that file yourself.
+- The diagnostic_report block contains one unstyled `<article class="diagnostic-report">...</article>` HTML fragment. Do not include doctype, html, head, body, style, script, links, images, external resources, inline style, event attributes, or Markdown.
+- Use only article, header, section, h1-h3, p, ul, ol, li, dl, dt, dd, table, thead, tbody, tr, th, td, strong, em, small, code, and br tags. Only class attributes are allowed.
+- Include only supported facts from the successful run and conversation. Structure available content as 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物, omitting empty sections and every stage the user skipped.
+- Upstream quality-control or assembly results alone do not support a pathogen classification or etiological diagnosis. Never invent classification, evidence, sample metadata, metrics, or conclusions.
 """

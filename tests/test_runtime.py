@@ -47,6 +47,7 @@ class FakeClient:
     instances = []
     response_text_parts = ["chunk"]
     result_session_id = None
+    before_result = None
 
     def __init__(self, options):
         self.options = options
@@ -71,6 +72,8 @@ class FakeClient:
                     "delta": {"type": "text_delta", "text": text},
                 }
             )
+        if type(self).before_result:
+            type(self).before_result()
         yield FakeResultMessage(
             session_id=session_id, is_error=False, subtype="success"
         )
@@ -91,6 +94,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         FakeClient.instances = []
         FakeClient.response_text_parts = ["chunk"]
         FakeClient.result_session_id = None
+        FakeClient.before_result = None
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name) / "agent"
         root.mkdir()
@@ -139,6 +143,24 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         }
+
+    @staticmethod
+    def finish_run(plan, *, ok=True):
+        state_path = Path(plan["run"]["state_path"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for step in state["steps"]:
+            step["status"] = "completed" if ok else "failed"
+        state["execution"].update(
+            {
+                "status": "completed" if ok else "failed",
+                "ok": ok,
+                "returncode": 0 if ok else 1,
+                "current_step_id": None,
+            }
+        )
+        state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
 
     async def test_new_chat_defaults_to_plan_mode(self):
         await self.manager.ensure_session(self.chat_id)
@@ -464,6 +486,126 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('--snakefile "<run_dir>/workflow/Snakefile"', prompt)
         self.assertIn("USER REQUEST:", prompt)
 
+    async def test_successful_execute_writes_styled_diagnostic_report(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        FakeClient.before_result = lambda: self.finish_run(plan)
+        FakeClient.response_text_parts = [
+            "分析完成。\n``",
+            "`diagnostic_",
+            """report
+<article class="diagnostic-report">
+  <header><h1>诊断意见书</h1><p class="review-status">待专家审核</p></header>
+  <section><h2>实际分析范围</h2><ul><li>质控</li><li>分类</li></ul></section>
+  <section><h2>诊断意见</h2><p><strong>结果</strong>来自本次分析。</p></section>
+</article>
+```
+""",
+        ]
+
+        events = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+
+        visible = "".join(self.texts(events))
+        reports = [
+            event.item
+            for event in events
+            if isinstance(event, OutputItemAdded)
+            and event.item.get("type") == "diagnostic_report"
+        ]
+        report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
+        document = report_path.read_text(encoding="utf-8")
+        state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(visible.strip(), "分析完成。")
+        self.assertNotIn("diagnostic_report", visible)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["run"]["run_id"], plan["run"]["run_id"])
+        self.assertEqual(reports[0]["filename"], "diagnostic-opinion.html")
+        self.assertIn("<!doctype html>", document)
+        self.assertIn('<html lang="zh-CN">', document)
+        self.assertIn("@page", document)
+        self.assertIn('<article class="diagnostic-report">', document)
+        self.assertEqual(state["report"]["status"], "completed")
+        self.assertEqual(state["report"]["path"], str(report_path))
+
+    async def test_successful_execute_rejects_unsafe_report_fragment(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        FakeClient.before_result = lambda: self.finish_run(plan)
+        FakeClient.response_text_parts = [
+            """分析完成。
+```diagnostic_report
+<article class="diagnostic-report"><h1>诊断意见书</h1><script>alert(1)</script></article>
+```
+"""
+        ]
+
+        events = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+
+        state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
+        report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
+        self.assertIn("诊断意见书生成失败", "".join(self.texts(events)))
+        self.assertEqual(state["report"]["status"], "failed")
+        self.assertFalse(report_path.exists())
+        self.assertFalse(
+            any(
+                isinstance(event, OutputItemAdded)
+                and event.item.get("type") == "diagnostic_report"
+                for event in events
+            )
+        )
+
+    async def test_successful_execute_marks_missing_report_failed(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        FakeClient.before_result = lambda: self.finish_run(plan)
+        FakeClient.response_text_parts = ["分析完成，但没有报告控制块。"]
+
+        events = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+
+        state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
+        self.assertIn("诊断意见书生成失败", "".join(self.texts(events)))
+        self.assertEqual(state["report"]["status"], "failed")
+
+    async def test_failed_execute_discards_report_block(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        FakeClient.before_result = lambda: self.finish_run(plan, ok=False)
+        FakeClient.response_text_parts = [
+            """分析失败。
+```diagnostic_report
+<article class="diagnostic-report"><h1>不应生成</h1></article>
+```
+"""
+        ]
+
+        events = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+
+        visible = "".join(self.texts(events))
+        report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
+        self.assertEqual(visible.strip(), "分析失败。")
+        self.assertNotIn("不应生成", visible)
+        self.assertFalse(report_path.exists())
+        self.assertFalse(
+            any(
+                isinstance(event, OutputItemAdded)
+                and event.item.get("type") == "diagnostic_report"
+                for event in events
+            )
+        )
+
     async def test_existing_transcript_sends_latest_user_message_only(self):
         claude_session_id = "sdk-existing-session"
         self.manager._save_claude_session_id(self.chat_id, claude_session_id)
@@ -553,6 +695,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("final content in the response", config.SYSTEM_PROMPT)
         self.assertIn(".bioagent/state.json", config.SYSTEM_PROMPT)
         self.assertIn(".bioagent/execution.log", config.SYSTEM_PROMPT)
+        self.assertIn("diagnostic_report", config.SYSTEM_PROMPT)
+        self.assertIn('<article class="diagnostic-report">', config.SYSTEM_PROMPT)
+        self.assertIn("omitting empty sections", config.SYSTEM_PROMPT)
 
     def test_gatekeeper_skill_contains_minimal_analysis_contract(self):
         skill_path = (
@@ -577,6 +722,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('--snakefile "${RUN_DIR}/workflow/Snakefile"', skill)
         self.assertIn('--configfile "${RUN_DIR}/workflow/config/config.yaml"', skill)
         self.assertNotIn('cd "${RUN_DIR}/workflow"', skill)
+        self.assertIn("diagnostic_report", skill)
+        self.assertIn('<article class="diagnostic-report">', skill)
+        self.assertIn("Quality-control or assembly results alone", skill)
 
 
 if __name__ == "__main__":

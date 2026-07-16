@@ -11,14 +11,14 @@ Use this skill when a user asks for a bioinformatics analysis that may match one
 
 Only these workflows are in scope:
 
-| ID | Directory | Purpose |
-| --- | --- | --- |
-| workflow1 | workflow1_upstream | Upstream preprocessing for paired-end viral metagenomic reads: fastp QC, rRNA removal, sample merge, MEGAHIT assembly, contig renaming/filtering. |
-| workflow2 | workflow2_virusid | Virus identification workflow. |
-| workflow3 | workflow3_hostid | Host identification workflow. |
-| workflow4 | workflow4_kraken_bracken | Kraken/Bracken taxonomic profiling workflow. |
-| workflow5 | workflow5_virus_quantification | Virus quantification workflow. |
-| workflow6 | workflow6_virus_annotation | Virus annotation workflow. |
+| ID        | Directory                      | Purpose                                                                                                                                           |
+| --------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| workflow1 | workflow1_upstream             | Upstream preprocessing for paired-end viral metagenomic reads: fastp QC, rRNA removal, sample merge, MEGAHIT assembly, contig renaming/filtering. |
+| workflow2 | workflow2_virusid              | Virus identification workflow.                                                                                                                    |
+| workflow3 | workflow3_hostid               | Host identification workflow.                                                                                                                     |
+| workflow4 | workflow4_kraken_bracken       | Kraken/Bracken taxonomic profiling workflow.                                                                                                      |
+| workflow5 | workflow5_virus_quantification | Virus quantification workflow.                                                                                                                    |
+| workflow6 | workflow6_virus_annotation     | Virus annotation workflow.                                                                                                                        |
 
 Do not propose workflow7 or any other workflow. You may internally compose supported workflows in series when the user's request clearly requires multiple supported phases, but do not expose workflow IDs as the main user-facing plan.
 
@@ -76,7 +76,39 @@ Requirements:
 - After the user confirms the selected workflow, use the runtime-injected run_id and run_dir, copy the selected workflow source, prepare the run-local configuration, update state steps, and launch exactly the stages in the latest plan. Apply qualitative adjustments only to the run-local configuration.
 - Never execute a stage omitted from the latest plan. When the plan stops before a workflow's default final target, invoke Snakemake with the explicit output targets for the last selected stage instead of the default `all` target.
 - In execute mode, summarize the execution result for the user as Markdown, including the run directory, execution log, return code, and any obvious next steps. Do not output `analysis_plan` in execute mode.
+- After a successful execution summary, append the `diagnostic_report` control block described below. Failed or incomplete runs must not produce that block.
 - If the user rejects the proposed workflow, exit this skill and continue normal conversation.
+
+## Diagnostic report contract
+
+When `execution.status` is `completed` and `execution.ok` is `true`, finish the response with exactly one internal report block:
+
+````html
+```diagnostic_report
+<article class="diagnostic-report">
+  <header>
+    <h1>诊断意见书</h1>
+    <p class="review-status">待专家审核</p>
+  </header>
+  <section>
+    <h2>基本信息</h2>
+    <dl>
+      <dt>分析任务</dt>
+      <dd>病毒宏基因组上游分析</dd>
+    </dl>
+  </section>
+</article>
+```
+````
+
+Requirements:
+
+- The block contains one unstyled `<article class="diagnostic-report">` fragment, not a complete HTML document. The runtime hides it, applies the shared print style, and writes `diagnostic-opinion.html`; do not write that file yourself.
+- Use only `article`, `header`, `section`, `h1`-`h3`, `p`, `ul`, `ol`, `li`, `dl`, `dt`, `dd`, `table`, `thead`, `tbody`, `tr`, `th`, `td`, `strong`, `em`, `small`, `code`, and `br`. Only `class` attributes are allowed.
+- Do not include a doctype, `html`, `head`, `body`, `style`, `script`, links, images, external resources, inline styles, event attributes, Markdown, comments, or text outside the article.
+- Include the available sections 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物. Omit empty sections, unknown fields, and every analysis stage the user skipped.
+- Base every metric, finding, conclusion, and evidence path on the completed run or the current conversation. Quality-control or assembly results alone must not be presented as a pathogen classification or etiological diagnosis.
+- The fenced block is the final response content. Put the user-visible Markdown execution summary before it and write nothing after it.
 
 ## Tool boundaries
 
