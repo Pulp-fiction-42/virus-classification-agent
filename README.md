@@ -94,14 +94,26 @@ mcp_servers={
 
 ### 运维
 
-启动 TaxonAgent MCP Server（5090）：
+**启动 TaxonAgent MCP Server（5090）**：
 
 ```bash
-nohup /home/bgi-chao/miniconda3/bin/python3.13 /home/bgi-chao/taxonagent_mcp.py \
-  > /home/bgi-chao/taxonagent_mcp.log 2>&1 &
+# 前台运行（开发调试）
+conda activate taxonagent
+python ~/projects/taxonagent/mcp/taxonagent_mcp.py
+
+# 后台运行（生产）
+nohup conda run -n taxonagent \
+  python ~/projects/taxonagent/mcp/taxonagent_mcp.py \
+  > ~/projects/taxonagent/mcp/server.log 2>&1 &
+
+# 查看日志
+tail -f ~/projects/taxonagent/mcp/server.log
+
+# 停止
+pkill -f taxonagent_mcp.py
 ```
 
-重启 BioAgent Adapter（cyclone）：
+**重启 BioAgent Adapter（cyclone）**：
 
 ```bash
 pkill -f "uvicorn adapter:app"
@@ -109,6 +121,9 @@ cd /data/bioagent/agent
 BIOAGENT_RUN_ROOT=/data/runs \
 nohup /data/user/liufangzhou/tools/miniconda3/bin/conda run -n adapter \
   uvicorn adapter:app --host 127.0.0.1 --port 8001 > /tmp/bioagent_adapter.log 2>&1 &
+
+# 验证
+curl http://127.0.0.1:8001/v1/models
 ```
 
 ---
