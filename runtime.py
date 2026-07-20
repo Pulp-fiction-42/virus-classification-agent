@@ -655,7 +655,13 @@ class SessionManager:
         return ClaudeAgentOptions(
             system_prompt=config.SYSTEM_PROMPT,
             tools={"type": "preset", "preset": "claude_code"},
-            allowed_tools=["Read", "Glob", "Grep"],
+            allowed_tools=["Read", "Glob", "Grep", "mcp__taxonagent__*"],
+            mcp_servers={
+                "taxonagent": {
+                    "type": "http",
+                    "url": config.TAXONAGENT_MCP_URL,
+                },
+            },
             permission_mode=permission_mode,
             resume=resume,
             model=config.MODEL,
