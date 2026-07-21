@@ -678,10 +678,27 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             options.env["CLAUDE_CONFIG_DIR"], str(self.manager.sdk_config_dir)
         )
-        self.assertEqual(options.allowed_tools, ["Read", "Glob", "Grep"])
+        self.assertEqual(
+            options.allowed_tools,
+            ["Read", "Glob", "Grep", "mcp__taxonagent__*"],
+        )
         self.assertEqual(options.disallowed_tools, [])
         self.assertEqual(options.system_prompt, config.SYSTEM_PROMPT)
         self.assertEqual(options.env["BIOAGENT_RUN_ROOT"], str(self.run_root))
+
+    async def test_sdk_options_register_taxonagent_mcp_server(self):
+        await self.manager.ensure_session(self.chat_id)
+        options = FakeClient.instances[0].options
+
+        self.assertEqual(
+            options.mcp_servers,
+            {
+                "taxonagent": {
+                    "type": "http",
+                    "url": config.TAXONAGENT_MCP_URL,
+                }
+            },
+        )
 
     def test_system_prompt_contains_analysis_plan_contract(self):
         legacy_contract = "analysis" + "_scheme"
@@ -698,6 +715,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("diagnostic_report", config.SYSTEM_PROMPT)
         self.assertIn('<article class="diagnostic-report">', config.SYSTEM_PROMPT)
         self.assertIn("omitting empty sections", config.SYSTEM_PROMPT)
+        self.assertIn("ICTV virus taxonomy", config.SYSTEM_PROMPT)
+        self.assertIn("ictv_family_info", config.SYSTEM_PROMPT)
 
     def test_gatekeeper_skill_contains_minimal_analysis_contract(self):
         skill_path = (

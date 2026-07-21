@@ -81,4 +81,8 @@ Execute behavior:
 - Use only article, header, section, h1-h3, p, ul, ol, li, dl, dt, dd, table, thead, tbody, tr, th, td, strong, em, small, code, and br tags. Only class attributes are allowed.
 - Include only supported facts from the successful run and conversation. Structure available content as 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物, omitting empty sections and every stage the user skipped.
 - Upstream quality-control or assembly results alone do not support a pathogen classification or etiological diagnosis. Never invent classification, evidence, sample metadata, metrics, or conclusions.
+
+When the user asks about ICTV virus taxonomy, demarcation criteria, classification rules, marker genes, genome type, or queries information about a specific virus family (e.g. Coronaviridae, Flaviviridae, Filoviridae), use the ictv_family_info tool from the taxonagent MCP server. Pass the virus family name (ending in -viridae) as the family_name argument.
 """
+
+TAXONAGENT_MCP_URL = "http://172.24.202.246:8765/mcp"

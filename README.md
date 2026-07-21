@@ -8,20 +8,25 @@ BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime
 - `plan` mode 使用 `dontAsk` permission mode，并注入 BioAgent 方案协议，避免进入 Claude Code Plan/ExitPlanMode；`execute` mode 在用户请求前追加 `遵循之前计划模式下生成的计划执行`。
 - 固定 Snakemake workflow gatekeeper 改为一次确认后直接执行，取消 dry-run 和第二次确认。
 - `plan` mode 通过内部 `analysis_plan` control block 生成隐藏结构化 output item；`execute` mode 使用同一个 run reservation 写入标准 `.bioagent/state.json`，成功后将 agent 生成的语义化 HTML fragment 套用统一样式并写入 `diagnostic-opinion.html`。
+- 集成 TaxonAgent MCP Server；遇到 ICTV 病毒分类、划界标准、marker gene 或 genome type 查询时，runtime 可自动调用 `ictv_family_info`。
 
 ## 结构
 
 ```text
-agent_sdk/
+agent/
 ├── adapter.py       # HTTP/OpenAI SSE 协议适配
-├── runtime.py       # SDK 配置、会话恢复和结果流
-├── config.py        # 模型、密钥、路径等静态配置
+├── runtime.py       # SDK 配置、会话恢复、结果流与 MCP 注册
+├── config.py        # 模型、密钥、路径与 MCP endpoint 等静态配置
 ├── .claude/
 │   ├── skills/      # 项目级 Agent Skills
 │   └── sessions/    # chat-map 与 SDK JSONL transcript，不提交 Git
 ├── tests/
-└── tools/watch.py   # 可选的消息监控脚本
+├── tools/watch.py   # 可选的消息监控脚本
+├── taxonagent_mcp_integration.md
+└── e2e_test_result_20260719.md
 ```
+
+TaxonAgent MCP Server 的实现位于 5090 上独立的 `taxonagent` 项目，不属于本目录。
 
 ## 会话模型
 
@@ -29,7 +34,7 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map
 
 1. adapter 为每个 `chat_id` 保留一个常驻 `ClaudeSDKClient`。
 2. 同一 `chat_id` 的请求复用同一个 client，并通过会话锁串行写入 SDK stream。
-3. 新建 client 时以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段只预先允许 `Read`、`Glob`、`Grep`。
+3. 新建 client 时以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段预先允许 `Read`、`Glob`、`Grep` 与 TaxonAgent MCP 工具。
 4. 恢复时在 `ClaudeAgentOptions(resume=claude_session_id)` 中加载 transcript，每轮只调用 `client.query(prompt)`。
 5. 新会话第一轮完成后保存 SDK 返回的真实 session ID；后续只发送最新用户消息。
 6. SDK transcript 保存在 `.claude/sessions/projects/<project>/<claude_session_id>.jsonl`。
@@ -45,6 +50,41 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map
 - 成功执行的最终回复以隐藏 `diagnostic_report` block 携带无样式 HTML fragment；runtime 验证允许的语义标签、生成 A4 HTML 文件，并向 Open WebUI 发送报告 output item。失败执行不生成报告。
 - `/plan` 和 `/execute` 命令由 adapter 拦截，不发送给 Claude，不污染对话上下文。
 - 固定 Snakemake 工作流的识别和一次确认后直接执行规则位于 `bioinformatics-workflow-gatekeeper` Skill。
+- ICTV 相关问题通过 MCP Streamable HTTP 调用 TaxonAgent，工具权限为 `mcp__taxonagent__*`。
+
+## TaxonAgent MCP 集成
+
+```text
+用户问题（Open WebUI）
+  ↓
+BioAgent Adapter（cyclone:8001）
+  ↓  识别 ICTV 意图并调用 MCP tool
+TaxonAgent MCP Server（5090:8765/mcp）
+  ↓  ictv_family_info(family_name)
+TaxonAgent 核心（ICTV knowledge graph + Ollama glm4）
+```
+
+`runtime.py` 通过 `ClaudeAgentOptions.mcp_servers` 注册名为 `taxonagent` 的 HTTP server；endpoint 由 `config.TAXONAGENT_MCP_URL` 定义为 `http://172.24.202.246:8765/mcp`。System Prompt 指示模型在查询 ICTV taxonomy、demarcation criteria、classification rules、marker genes、genome type 或特定病毒科时调用 `ictv_family_info(family_name)`。
+
+初始实现细节与既有端到端结果分别见 [TaxonAgent MCP 初始集成记录](taxonagent_mcp_integration.md) 和 [2026-07-19 测试报告](e2e_test_result_20260719.md)。集成记录中的旧部署路径仅供追溯，当前启动方式以本 README 为准。
+
+### 启动 TaxonAgent MCP Server
+
+在 5090 的专用 terminal 中执行：
+
+```bash
+ssh 5090
+conda activate taxonagent
+python ~/projects/taxonagent/mcp/taxonagent_mcp.py
+```
+
+Server 启动后监听 `0.0.0.0:8765`，MCP endpoint 为 `/mcp`。BioAgent adapter 必须能从 cyclone 访问 `172.24.202.246:8765`。
+
+### 已知限制
+
+- 当前只暴露 `ictv_family_info` 一个工具。
+- 首次调用通常需要 150–250 秒，因为 5090 上的 Ollama glm4 推理没有缓存。
+- MCP Server 目前需手动启动，尚未配置 systemd 守护。
 
 ## 用户命令
 
@@ -56,14 +96,15 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map
 ## cyclone 部署
 
 ```text
-Agent:       /data/bioagent/agent
-Open WebUI:  /data/bioagent/open-webui
-Sessions:    /data/bioagent/agent/.claude/sessions
-Workflows:   /data/user/guojindan/Projects/Workflows
-Runs:        ${BIOAGENT_RUN_ROOT:-/data/runs}
+Agent:          /data/bioagent/agent
+Open WebUI:     /data/bioagent/open-webui
+Sessions:       /data/bioagent/agent/.claude/sessions
+Workflows:      /data/user/guojindan/Projects/Workflows
+Runs:           ${BIOAGENT_RUN_ROOT:-/data/runs}
+TaxonAgent MCP: http://172.24.202.246:8765/mcp
 ```
 
-服务由用户级 systemd 管理：
+BioAgent 与 Open WebUI 服务由用户级 systemd 管理：
 
 ```bash
 systemctl --user restart bioagent-adapter open-webui-backend
