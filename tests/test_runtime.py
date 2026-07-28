@@ -14,6 +14,7 @@ from runtime import (
     PLAN_MODE,
     EXECUTE_PROMPT_PREFIX,
     PLAN_PROMPT_PREFIX,
+    AgentTraceRecorder,
     InvalidSessionError,
     OutputItemAdded,
     SessionManager,
@@ -137,12 +138,67 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "step_1", "label": "质控", "tool": "fastp", "rules": ["fastp"]},
                 {
                     "id": "step_2",
-                    "label": "分类",
-                    "tool": "Kraken2",
-                    "rules": ["classify", "summarize"],
+                    "label": "去 rRNA",
+                    "tool": "Bowtie2",
+                    "rules": ["bowtie2"],
                 },
             ],
+            "execution_spec": {
+                "adapter": "workflow1",
+                "entry_rule": "fastp",
+                "exit_rule": "bowtie2",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "raw_paired_reads",
+                        "data": {
+                            "runs": [
+                                {
+                                    "run_id": "run",
+                                    "sample_id": "sample",
+                                    "read1": "/data/input_r1.fastq.gz",
+                                    "read2": "/data/input_r2.fastq.gz",
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
         }
+
+    def test_agent_trace_records_tool_calls_and_redacts_secrets(self):
+        path = Path(self.temp_dir.name) / "agent-trace.jsonl"
+        recorder = AgentTraceRecorder(path)
+        recorder.consume(
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "tool-1", "name": "Bash"},
+            }
+        )
+        recorder.consume(
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json.dumps(
+                        {
+                            "command": 'WEBUI_SECRET_KEY=hidden curl -H "Authorization: Bearer abc"',
+                            "api_key": "also-hidden",
+                        }
+                    ),
+                },
+            }
+        )
+        recorder.consume({"type": "content_block_stop", "index": 1})
+
+        event = json.loads(path.read_text(encoding="utf-8"))
+        serialized = json.dumps(event)
+        self.assertEqual(event["tool"], "Bash")
+        self.assertNotIn("hidden", serialized)
+        self.assertNotIn("abc", serialized)
+        self.assertGreaterEqual(serialized.count("[REDACTED]"), 3)
 
     @staticmethod
     def finish_run(plan, *, ok=True):
@@ -283,8 +339,23 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
   "ready_to_execute": true,
   "steps": [
     {"label": "质控", "tool": "fastp", "rules": ["fastp"]},
-    {"label": "分类", "tool": "Kraken2", "rules": ["classify", "summarize"]}
+    {"label": "去 rRNA", "tool": "Bowtie2", "rules": ["bowtie2"]}
   ],
+  "execution_spec": {
+    "adapter": "workflow1",
+    "entry_rule": "fastp",
+    "exit_rule": "bowtie2",
+    "inputs": [{
+      "id": "primary",
+      "type": "raw_paired_reads",
+      "data": {"runs": [{
+        "run_id": "run",
+        "sample_id": "sample",
+        "read1": "/data/input_r1.fastq.gz",
+        "read2": "/data/input_r2.fastq.gz"
+      }]}
+    }]
+  },
   "resource_estimate": {
     "eta": "约 1 小时",
     "compute": "4 核",
@@ -308,9 +379,13 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["type"], "analysis_plan")
         self.assertEqual(item["title"], "测序质控与分类方案")
         self.assertTrue(item["ready_to_execute"])
-        self.assertEqual([step["label"] for step in item["steps"]], ["质控", "分类"])
+        self.assertEqual(
+            [step["label"] for step in item["steps"]],
+            ["质控", "去 rRNA"],
+        )
         self.assertEqual(item["steps"][0]["rules"], ["fastp"])
-        self.assertEqual(item["steps"][1]["rules"], ["classify", "summarize"])
+        self.assertEqual(item["steps"][1]["rules"], ["bowtie2"])
+        self.assertEqual(item["execution_spec"]["exit_rule"], "bowtie2")
         self.assertTrue(item["run"]["run_dir"].startswith(str(self.run_root)))
         self.assertFalse(Path(item["run"]["state_path"]).exists())
         saved = json.loads(
@@ -419,6 +494,48 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(FakeClient.instances[0].queries, [])
 
+    async def test_execute_rejects_legacy_plan_without_execution_spec(self):
+        plan = self.ready_plan()
+        plan.pop("execution_spec")
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+
+        events = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+
+        self.assertEqual(
+            self.texts(events),
+            ["当前方案缺少有效执行区段，请在 plan 模式重新生成方案。"],
+        )
+        self.assertFalse(Path(plan["run"]["state_path"]).exists())
+        self.assertEqual(FakeClient.instances[0].queries, [])
+
+    def test_invalid_typed_input_makes_generated_plan_not_executable(self):
+        raw_plan = {
+            "title": "错误输入",
+            "ready_to_execute": True,
+            "steps": [{"label": "样本合并", "rules": ["merge"]}],
+            "execution_spec": {
+                "adapter": "workflow1",
+                "entry_rule": "merge",
+                "exit_rule": "merge",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "raw_paired_reads",
+                        "data": {"runs": []},
+                    }
+                ],
+            },
+        }
+
+        plan = self.manager._build_analysis_plan(raw_plan)
+
+        self.assertIsNotNone(plan)
+        self.assertFalse(plan["ready_to_execute"])
+        self.assertNotIn("execution_spec", plan)
+
     async def test_execute_creates_state_and_marks_missing_terminal_state_failed(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
@@ -428,14 +545,20 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
         self.assertEqual(state["run_id"], plan["run"]["run_id"])
+        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["openwebui_chat_id"], self.chat_id)
+        self.assertEqual(state["plan"]["title"], plan["title"])
         self.assertEqual(
             [step["status"] for step in state["steps"]], ["pending", "pending"]
         )
         self.assertEqual(state["steps"][0]["rules"], ["fastp"])
-        self.assertEqual(state["steps"][1]["rules"], ["classify", "summarize"])
+        self.assertEqual(state["steps"][1]["rules"], ["bowtie2"])
+        self.assertEqual(state["execution_spec"], plan["execution_spec"])
         self.assertEqual(state["execution"]["status"], "failed")
         self.assertIs(state["execution"]["ok"], False)
         self.assertEqual(state["execution"]["returncode"], -1)
+        self.assertTrue(state["technical_report"]["available"])
+        self.assertEqual(state["technical_report"]["status"], "ready")
 
     async def test_execute_create_state_error_is_clear(self):
         blocked_root = Path(self.temp_dir.name) / "blocked-run-root"
@@ -482,8 +605,13 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("analysis-20260709-120000-testabcd", prompt)
         self.assertIn(".bioagent/state.json", prompt)
         self.assertIn(".bioagent/execution.log", prompt)
-        self.assertIn('--directory "<run_dir>/workflow"', prompt)
-        self.assertIn('--snakefile "<run_dir>/workflow/Snakefile"', prompt)
+        self.assertIn("RUNTIME RUNNER COMMAND:", prompt)
+        self.assertIn(
+            f'--state "{self.ready_plan()["run"]["state_path"]}"',
+            prompt,
+        )
+        self.assertIn("analysis_runner.py", prompt)
+        self.assertIn("不得直接调用 Snakemake", prompt)
         self.assertIn("USER REQUEST:", prompt)
 
     async def test_successful_execute_writes_styled_diagnostic_report(self):
@@ -707,6 +835,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("```analysis_plan", config.SYSTEM_PROMPT)
         self.assertIn('"ready_to_execute"', config.SYSTEM_PROMPT)
         self.assertIn('"steps"', config.SYSTEM_PROMPT)
+        self.assertIn('"execution_spec"', config.SYSTEM_PROMPT)
+        self.assertIn('"entry_rule"', config.SYSTEM_PROMPT)
+        self.assertIn('"exit_rule"', config.SYSTEM_PROMPT)
         self.assertIn("Do not create run directories", config.SYSTEM_PROMPT)
         self.assertIn("parameter defaults never block execution", config.SYSTEM_PROMPT)
         self.assertIn("final content in the response", config.SYSTEM_PROMPT)
@@ -735,12 +866,15 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Do not output `analysis_plan` in execute mode", skill)
         self.assertIn("technical choices are not user requirements", skill)
         self.assertIn("Never execute a stage omitted from the latest plan", skill)
+        self.assertIn("execution_spec", skill)
+        self.assertIn("one contiguous segment", skill)
+        self.assertIn("clean_paired_reads", skill)
         self.assertIn("${RUN_DIR}/.bioagent/state.json", skill)
         self.assertIn("${RUN_DIR}/.bioagent/execution.log", skill)
-        self.assertIn('--directory "${RUN_DIR}/workflow"', skill)
-        self.assertIn('--snakefile "${RUN_DIR}/workflow/Snakefile"', skill)
-        self.assertIn('--configfile "${RUN_DIR}/workflow/config/config.yaml"', skill)
-        self.assertNotIn('cd "${RUN_DIR}/workflow"', skill)
+        self.assertIn("RUNTIME RUNNER COMMAND", skill)
+        self.assertIn("analysis_runner.py", skill)
+        self.assertIn("Do not edit it manually", skill)
+        self.assertNotIn("rsync -a", skill)
         self.assertIn("diagnostic_report", skill)
         self.assertIn('<article class="diagnostic-report">', skill)
         self.assertIn("Quality-control or assembly results alone", skill)

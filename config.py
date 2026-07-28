@@ -54,6 +54,27 @@ Final block format and JSON contract:
     {"label": "组装", "tool": "MEGAHIT", "rules": ["megahit"]},
     {"label": "重命名过滤", "rules": ["rename_filter"]}
   ],
+  "execution_spec": {
+    "adapter": "workflow1",
+    "entry_rule": "fastp",
+    "exit_rule": "rename_filter",
+    "inputs": [
+      {
+        "id": "primary",
+        "type": "raw_paired_reads",
+        "data": {
+          "runs": [
+            {
+              "run_id": "sample-run",
+              "sample_id": "sample",
+              "read1": "/absolute/path/R1.fastq.gz",
+              "read2": "/absolute/path/R2.fastq.gz"
+            }
+          ]
+        }
+      }
+    ]
+  },
   "resource_estimate": {
     "eta": "约 1-2 小时",
     "compute": "4-12 核，约 20 GB 内存",
@@ -68,14 +89,18 @@ Field rules:
 - steps is required and ordered by the user-understandable analysis flow.
 - each step needs label; tool is optional and should be omitted when uncertain.
 - rules is optional internal metadata listing the Snakemake rule names represented by the user-facing step. Include it for every matched fixed workflow step; one step may contain multiple rules.
+- execution_spec is required before a plan can be executed. The only currently executable adapter is workflow1.
+- workflow1 entry_rule and exit_rule delimit one contiguous segment of fastp, bowtie2, merge, megahit, rename_filter. The flattened steps[].rules must exactly equal that segment.
+- workflow1 entry input types are raw_paired_reads for fastp, fastp_paired_reads for bowtie2, clean_paired_reads for merge, merged_paired_reads for megahit, and contigs_fasta for rename_filter.
+- Typed input data is adapter-specific. Paired-read records use absolute read1/read2 paths; contigs_fasta records use an absolute path. Never invent a path.
 - resource_estimate is optional; uncertain fields may be null or reasonable estimates.
 
 Execute behavior:
 - In execute mode, follow the previously agreed plan and run only after explicit user confirmation.
 - Return normal Markdown status/result text first. Do not output analysis_plan blocks or card JSON.
 - Use the run_id, run_dir, state_path, log_path, and ordered steps injected by the runtime. Do not invent a second run directory.
-- Runtime state lives at the injected state_path (.bioagent/state.json), and logs live at the injected log_path (.bioagent/execution.log).
-- Update state_path as each step starts or finishes, and capture stdout/stderr to log_path. Step status values are pending, running, completed, or failed; execution status values are running, completed, or failed.
+- Execute the runtime-provided RUNTIME RUNNER COMMAND exactly once through Bash. Do not add arguments, copy workflows, write configuration, invoke Snakemake directly, or edit .bioagent/state.json manually.
+- The runner owns step timing, status, .bioagent/execution.log, resource telemetry, sequence metrics, and terminal execution fields.
 - When and only when execution.status is completed and execution.ok is true, append exactly one diagnostic_report fenced block as the final response content. The runtime hides this block, adds the document style, and writes diagnostic-opinion.html; do not write that file yourself.
 - The diagnostic_report block contains one unstyled `<article class="diagnostic-report">...</article>` HTML fragment. Do not include doctype, html, head, body, style, script, links, images, external resources, inline style, event attributes, or Markdown.
 - Use only article, header, section, h1-h3, p, ul, ol, li, dl, dt, dd, table, thead, tbody, tr, th, td, strong, em, small, code, and br tags. Only class attributes are allowed.

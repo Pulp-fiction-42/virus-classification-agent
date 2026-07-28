@@ -22,6 +22,11 @@ Only these workflows are in scope:
 
 Do not propose workflow7 or any other workflow. You may internally compose supported workflows in series when the user's request clearly requires multiple supported phases, but do not expose workflow IDs as the main user-facing plan.
 
+The deterministic execution adapter currently implements one contiguous
+workflow1 segment only. Plans for workflow2-workflow6 or composed workflows may
+be discussed, but must remain `ready_to_execute: false` until their adapters
+exist.
+
 ## Core rule
 
 This skill uses conversational confirmation gates, not Claude Agent SDK lifecycle hooks.
@@ -45,6 +50,27 @@ In plan mode, produce a concrete analysis plan and append exactly one internal `
     {"label": "组装", "tool": "MEGAHIT", "rules": ["megahit"]},
     {"label": "重命名过滤", "rules": ["rename_filter"]}
   ],
+  "execution_spec": {
+    "adapter": "workflow1",
+    "entry_rule": "fastp",
+    "exit_rule": "rename_filter",
+    "inputs": [
+      {
+        "id": "primary",
+        "type": "raw_paired_reads",
+        "data": {
+          "runs": [
+            {
+              "run_id": "sample-run",
+              "sample_id": "sample",
+              "read1": "/absolute/path/R1.fastq.gz",
+              "read2": "/absolute/path/R2.fastq.gz"
+            }
+          ]
+        }
+      }
+    ]
+  },
   "resource_estimate": {
     "eta": "约 1-2 小时",
     "compute": "4-12 核，约 20 GB 内存",
@@ -62,6 +88,10 @@ Requirements:
 - `steps` are user-understandable flow steps, not workflow names.
 - `tool` is optional; omit it when uncertain.
 - `rules` is internal progress metadata. For every fixed Snakemake workflow step, list the exact rule names represented by that user-facing step; inspect that workflow's Snakefile when necessary. One step may contain multiple rules.
+- `execution_spec` is required for an executable plan. Its adapter owns input validation, run-local configuration, prerequisite materialization, and concrete targets.
+- The workflow1 adapter accepts one contiguous segment delimited by `entry_rule` and `exit_rule`. The flattened `steps[].rules` must exactly equal that segment; the segment may start at any workflow1 rule.
+- Workflow1 entry types are `raw_paired_reads` for fastp, `fastp_paired_reads` for bowtie2, `clean_paired_reads` for merge, `merged_paired_reads` for megahit, and `contigs_fasta` for rename_filter.
+- Typed input data is adapter-specific and every file path must be absolute. Never invent file paths.
 - Use the selected workflow's existing tool flags, databases, presets, and thresholds as defaults. These technical choices are not user requirements and must not make an otherwise executable plan unready.
 - Set `ready_to_execute` to `true` once the supported analysis goal, input files, and required sample relationships are clear. Set it to `false` only when one of those user-level facts is missing or ambiguous, and ask for that information in plain language before the fenced block.
 - If the user adjusts requirements in natural language, translate the request into the run-local workflow configuration and output a complete updated scheme, not a partial diff. Reflect qualitative changes in the step labels and remove omitted stages from the step list.
@@ -73,7 +103,7 @@ Requirements:
 - Match conservatively. Suggest a workflow only when the user's request clearly fits workflow1-workflow6.
 - Explain the concrete analysis flow briefly. Keep workflow IDs as internal implementation details unless the user explicitly asks about them.
 - Before the user confirmation, do not call any workflow tool, do not create a run directory, do not write configuration files, and do not run Snakemake.
-- After the user confirms the selected workflow, use the runtime-injected run_id and run_dir, copy the selected workflow source, prepare the run-local configuration, update state steps, and launch exactly the stages in the latest plan. Apply qualitative adjustments only to the run-local configuration.
+- After the user confirms the selected workflow, execute the runtime-provided runner command exactly once. The runner prepares the workflow and launches exactly the segment in the latest plan.
 - Never execute a stage omitted from the latest plan. When the plan stops before a workflow's default final target, invoke Snakemake with the explicit output targets for the last selected stage instead of the default `all` target.
 - In execute mode, summarize the execution result for the user as Markdown, including the run directory, execution log, return code, and any obvious next steps. Do not output `analysis_plan` in execute mode.
 - After a successful execution summary, append the `diagnostic_report` control block described below. Failed or incomplete runs must not produce that block.
@@ -112,127 +142,28 @@ Requirements:
 
 ## Tool boundaries
 
-- Use the Bash tool directly for Snakemake workflow preparation and execution.
+- Use the Bash tool only to run the exact `RUNTIME RUNNER COMMAND`.
 - Do not use MCP custom tools for this workflow path.
 - Do not edit the source workflow directories under `/data/user/guojindan/Projects/Workflows`.
 - The run root is controlled by `BIOAGENT_RUN_ROOT`.
 - Work only inside the runtime-injected run directory.
-- Copy the workflow source into `${RUN_DIR}/workflow` before running it.
-- Every Snakemake invocation must pass `--directory "${RUN_DIR}/workflow"`, `--snakefile "${RUN_DIR}/workflow/Snakefile"`, and an absolute `--configfile` path. Snakemake resolves CLI file arguments before switching directory, and an absolute Snakefile alone does not change its working directory; do not rely on a previous Bash tool call's `cd`.
+- Do not copy workflows, write sample/config files, materialize inputs, choose targets, or add runner arguments. The workflow adapter owns those actions.
 - The real Snakemake execution must only happen after explicit user confirmation and execute-mode context.
-- Runtime state has already been created at `${RUN_DIR}/.bioagent/state.json`; update it as each user-facing step starts or finishes. Step status is exactly `pending`, `running`, `completed`, or `failed`; execution status is exactly `running`, `completed`, or `failed`.
-- Snakemake stdout/stderr should be captured in `${RUN_DIR}/.bioagent/execution.log`.
-- Do not run Snakemake in the background. Before the Bash command exits, write terminal `execution.status`, `execution.ok`, and `execution.returncode`.
+- Runtime state has already been created at `${RUN_DIR}/.bioagent/state.json`. Do not edit it manually; the runner owns step timing, status, telemetry, logs, and terminal execution fields.
+- Do not redirect Snakemake stdout/stderr yourself. The runner writes `${RUN_DIR}/.bioagent/execution.log` and streams the same output to the caller.
+- Do not run the runner or Snakemake in the background.
 
 ## Bash execution pattern
 
-Use this structure only after the user confirmation. Replace placeholders before running.
+Use only the command injected by the runtime after user confirmation:
 
 ```bash
-set -euo pipefail
-
-export WORKFLOW_ID="workflow1"
-export WORKFLOW_SRC="/data/user/guojindan/Projects/Workflows/workflow1_upstream"
-export SNAKEMAKE="/data/user/guojindan/softwares/xvirmin/bin/snakemake"
-export RUN_ID="<runtime injected run_id>"
-export RUN_DIR="<runtime injected run_dir>"
-export STATE_PATH="${RUN_DIR}/.bioagent/state.json"
-export LOG_PATH="${RUN_DIR}/.bioagent/execution.log"
-
-mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/results" "${RUN_DIR}/.bioagent"
-rsync -a \
-  --exclude .git \
-  --exclude .snakemake \
-  --exclude logs \
-  --exclude results \
-  --exclude example \
-  "${WORKFLOW_SRC}/" "${RUN_DIR}/workflow/"
-```
-
-For workflow1, prepare the run-local sample list and config inside `${RUN_DIR}/workflow`:
-
-```bash
-# If the user provided real samples, overwrite data/samples.txt with:
-# run_id sample_name /absolute/path/to/R1.fastq.gz /absolute/path/to/R2.fastq.gz
-#
-# If this is only a workflow1 test and the user did not provide data, keep the
-# workflow's existing example data/samples.txt.
-
-python - <<'PY'
-import os
-from pathlib import Path
-workflow_dir = Path(os.environ["RUN_DIR"]) / "workflow"
-config = workflow_dir / "config/config.yaml"
-text = config.read_text()
-lines = []
-for line in text.splitlines():
-    if line.startswith("sample_list:"):
-        lines.append('sample_list: "data/samples.txt"')
-    elif line.startswith("output_dir:"):
-        lines.append('output_dir: "../results"')
-    else:
-        lines.append(line)
-config.write_text("\n".join(lines) + "\n")
-PY
-```
-
-Update the run-local state and launch Snakemake:
-
-```bash
-python - <<'PY'
-import json
-import os
-from pathlib import Path
-path = Path(os.environ["STATE_PATH"])
-state = json.loads(path.read_text())
-state["workflow_id"] = os.environ["WORKFLOW_ID"]
-state["workflow_dir"] = f'{os.environ["RUN_DIR"]}/workflow'
-state["results_dir"] = f'{os.environ["RUN_DIR"]}/results'
-state["execution"]["current_step_id"] = state["steps"][0]["id"]
-state["steps"][0]["status"] = "running"
-path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-PY
-
-set +e
-"${SNAKEMAKE}" \
-  --directory "${RUN_DIR}/workflow" \
-  --snakefile "${RUN_DIR}/workflow/Snakefile" \
-  --configfile "${RUN_DIR}/workflow/config/config.yaml" \
-  --cores 4 \
-  > "${LOG_PATH}" 2>&1
-EXEC_STATUS=$?
-set -e
-
-python - <<PY
-import json
-from pathlib import Path
-state_path = Path("${STATE_PATH}")
-state = json.loads(state_path.read_text())
-ok = ${EXEC_STATUS} == 0
-for step in state.get("steps", []):
-    if step.get("status") == "running":
-        step["status"] = "completed" if ok else "failed"
-    elif ok and step.get("status") == "pending":
-        step["status"] = "completed"
-state["execution"]["status"] = "completed" if ok else "failed"
-state["execution"]["ok"] = ok
-state["execution"]["returncode"] = ${EXEC_STATUS}
-state["execution"]["current_step_id"] = None
-state["execution"]["log"] = "${LOG_PATH}"
-state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-PY
-
-cat "${LOG_PATH}"
-exit "${EXEC_STATUS}"
+python "/data/user/liufangzhou/projects/bioagent/agent/analysis_runner.py" --state "<runtime injected state_path>"
 ```
 
 ## Input expectations
 
-For workflow1, collect paired-end sample information when the user provides real data:
-
-- `run_id`
-- `sample_name`
-- absolute path to R1 FASTQ
-- absolute path to R2 FASTQ
-
-If required input details are missing, ask the user for them before preparing a run.
+Collect the adapter-specific input required by `entry_rule`. For paired reads,
+record the run/sample relationship and absolute R1/R2 paths. For
+`contigs_fasta`, record each sample ID and absolute contig path. If required
+input details are missing, ask the user before producing a ready plan.

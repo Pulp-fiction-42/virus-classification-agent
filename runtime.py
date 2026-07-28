@@ -70,6 +70,11 @@ except (
 
 
 import config
+from workflow_adapters import (
+    ExecutionSpecError,
+    normalize_execution_spec,
+    validate_plan_rules,
+)
 
 
 PLAN_MODE = "plan"
@@ -90,10 +95,9 @@ EXECUTE_PROMPT_PREFIX = """当前是 execute 模式。遵循之前计划模式�
 
 执行回合先返回普通 Markdown 状态或结果说明；不要输出 analysis_plan fenced block，也不要输出任何卡片 JSON。
 runtime 已经创建 run_dir 和 .bioagent/state.json。必须使用注入的 run_id、run_dir、state_path、log_path 和 steps；不要创建第二个 run 目录。
-每次运行 Snakemake 都必须显式传入 --directory "<run_dir>/workflow"、--snakefile "<run_dir>/workflow/Snakefile" 和绝对 configfile 路径；不得只依赖 cd，否则会污染 agent 工作目录。
-每个阶段开始或结束时更新 state.json 中的 steps[].status 和 execution.current_step_id。
-步骤状态只使用 pending、running、completed、failed；execution 状态只使用 running、completed、failed。
-不要后台运行；命令结束前必须写入 execution.status、execution.ok、execution.returncode。
+必须通过 Bash 原样执行下方 RUNTIME RUNNER COMMAND 一次；不得增加参数、准备 workflow、修改配置、不得直接调用 Snakemake 或手工更新 state.json。
+analysis_runner.py 根据 state 中已验证的 execution_spec 准备 run-local workflow、输入、目标、telemetry 和终态。
+不要后台运行；runner 会统一记录日志、benchmark、文件指标及执行终态。
 只有执行成功时，必须在回复最后追加一个 diagnostic_report fenced block，内容是无样式的 <article class="diagnostic-report"> HTML fragment；失败时不得输出该控制块。"""
 
 DIAGNOSTIC_REPORT_STYLES = """
@@ -380,6 +384,99 @@ class ManagedSession:
     claude_session_id: str | None
 
 
+class AgentTraceRecorder:
+    """Persist redacted SDK tool calls without retaining model reasoning."""
+
+    secret_key = re.compile(
+        r"(authorization|api[_-]?key|auth[_-]?token|secret|password)",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
+        self.blocks: dict[int, dict[str, Any]] = {}
+
+    @classmethod
+    def _redact(cls, value: Any, key: str = "") -> Any:
+        if cls.secret_key.search(key):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {
+                item_key: cls._redact(item, item_key)
+                for item_key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._redact(item) for item in value]
+        if isinstance(value, str):
+            value = re.sub(
+                r"(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]+",
+                r"\1 [REDACTED]",
+                value,
+            )
+            value = re.sub(
+                r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*)="
+                r"([^\s\"']+)",
+                lambda match: f"{match.group(1)}=[REDACTED]",
+                value,
+            )
+            return re.sub(
+                r"(?i)(api[_-]?key|auth[_-]?token|secret|password)"
+                r"(\s*[:=]\s*|\s+)([^\s\"']+)",
+                lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+                value,
+            )
+        return value
+
+    def consume(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        index = event.get("index")
+        if not isinstance(index, int):
+            return
+        if event_type == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                self.blocks[index] = {
+                    "timestamp": time.time(),
+                    "tool_use_id": block.get("id"),
+                    "tool": block.get("name"),
+                    "input": block.get("input") or {},
+                    "partial_json": "",
+                }
+            return
+        current = self.blocks.get(index)
+        if not current:
+            return
+        if event_type == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "input_json_delta":
+                current["partial_json"] += delta.get("partial_json") or ""
+            return
+        if event_type != "content_block_stop":
+            return
+
+        if current["partial_json"]:
+            try:
+                current["input"] = json.loads(current["partial_json"])
+            except json.JSONDecodeError:
+                current["input"] = {"raw": current["partial_json"]}
+        current.pop("partial_json", None)
+        self._append(self._redact(current))
+        self.blocks.pop(index, None)
+
+    def finish(self) -> None:
+        for index in list(self.blocks):
+            current = self.blocks.pop(index)
+            current.pop("partial_json", None)
+            current["incomplete"] = True
+            self._append(self._redact(current))
+
+    def _append(self, payload: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as trace:
+            trace.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 class SessionManager:
     """Keeps one ClaudeSDKClient per Open WebUI chat ID."""
 
@@ -450,12 +547,28 @@ class SessionManager:
         async with session.lock:
             user_prompt = self._prompt_for_session(messages, session)
             plan = None
+            trace = None
             if session.mode == EXECUTE_MODE:
                 plan = self._load_analysis_plan(normalized_chat_id)
                 if not plan or plan.get("ready_to_execute") is not True:
                     yield TextDelta("请先生成可执行分析方案，再确认启动分析。")
                     return
-                self._write_initial_run_state(plan)
+                try:
+                    execution_spec = normalize_execution_spec(
+                        plan.get("execution_spec")
+                    )
+                    validate_plan_rules(execution_spec, plan.get("steps") or [])
+                except ExecutionSpecError:
+                    yield TextDelta(
+                        "当前方案缺少有效执行区段，请在 plan 模式重新生成方案。"
+                    )
+                    return
+                plan["execution_spec"] = execution_spec
+                self._write_initial_run_state(plan, normalized_chat_id)
+                run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
+                trace = AgentTraceRecorder(
+                    Path(str(run.get("run_dir"))) / ".bioagent" / "agent-trace.jsonl"
+                )
 
             try:
                 prompt = self._prefixed_prompt(session.mode, user_prompt, plan)
@@ -471,6 +584,8 @@ class SessionManager:
                 async for message in session.client.receive_response():
                     if isinstance(message, StreamEvent):
                         event = message.event
+                        if trace:
+                            trace.consume(event)
                         if event.get("type") != "content_block_delta":
                             continue
                         delta = event.get("delta", {})
@@ -489,6 +604,9 @@ class SessionManager:
                 if plan:
                     self._fail_missing_terminal_state(plan)
                 raise
+            finally:
+                if trace:
+                    trace.finish()
 
             visible_parts, hidden_text = control_filter.finish()
             for visible_text in visible_parts:
@@ -691,8 +809,14 @@ class SessionManager:
         if mode == PLAN_MODE:
             return f"{PLAN_PROMPT_PREFIX}\n\nUSER REQUEST:\n{prompt}"
         plan_json = json.dumps(plan, ensure_ascii=False, indent=2) if plan else "{}"
+        run = plan.get("run") if isinstance((plan or {}).get("run"), dict) else {}
+        runner_command = (
+            f"python {json.dumps(str(config.PROJECT_ROOT / 'analysis_runner.py'))} "
+            f"--state {json.dumps(str(run.get('state_path', '')))}"
+        )
         return (
             f"{EXECUTE_PROMPT_PREFIX}\n\n"
+            f"RUNTIME RUNNER COMMAND:\n```bash\n{runner_command}\n```\n\n"
             f"RUNTIME ANALYSIS PLAN:\n```json\n{plan_json}\n```\n\n"
             f"USER REQUEST:\n{prompt}"
         )
@@ -872,6 +996,13 @@ class SessionManager:
         if not steps:
             return None
 
+        execution_spec = None
+        try:
+            execution_spec = normalize_execution_spec(raw_plan.get("execution_spec"))
+            validate_plan_rules(execution_spec, steps)
+        except ExecutionSpecError:
+            pass
+
         run_id = self._new_run_id()
         run_dir = self.analysis_run_root / run_id
         resource_estimate = raw_plan.get("resource_estimate")
@@ -882,7 +1013,10 @@ class SessionManager:
             "title": raw_plan.get("title")
             if isinstance(raw_plan.get("title"), str)
             else "分析方案",
-            "ready_to_execute": raw_plan.get("ready_to_execute") is not False,
+            "ready_to_execute": (
+                raw_plan.get("ready_to_execute") is not False
+                and execution_spec is not None
+            ),
             "run": {
                 "run_id": run_id,
                 "run_dir": str(run_dir),
@@ -891,6 +1025,8 @@ class SessionManager:
             },
             "steps": steps,
         }
+        if execution_spec is not None:
+            plan["execution_spec"] = execution_spec
         if isinstance(resource_estimate, dict):
             plan["resource_estimate"] = {
                 "eta": resource_estimate.get("eta"),
@@ -928,7 +1064,7 @@ class SessionManager:
         }
         self._write_json_atomic(self._analysis_plan_path(chat_id), payload)
 
-    def _write_initial_run_state(self, plan: dict[str, Any]) -> None:
+    def _write_initial_run_state(self, plan: dict[str, Any], chat_id: str) -> None:
         run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
         run_dir = Path(str(run.get("run_dir", ""))).resolve()
         if not self._is_under_analysis_root(run_dir):
@@ -944,11 +1080,20 @@ class SessionManager:
                 f"分析日志不在 BIOAGENT_RUN_ROOT 内：{log_path}；root={self.analysis_run_root}"
             )
 
+        try:
+            execution_spec = normalize_execution_spec(plan.get("execution_spec"))
+            validate_plan_rules(execution_spec, plan.get("steps") or [])
+        except ExecutionSpecError as exc:
+            raise SessionStateError(f"分析方案执行区段无效：{exc}") from exc
+
         state = {
-            "version": 1,
+            "version": 2,
             "run_id": run.get("run_id"),
             "run_dir": str(run_dir),
+            "openwebui_chat_id": chat_id,
             "title": plan.get("title"),
+            "plan": plan,
+            "execution_spec": execution_spec,
             "steps": [
                 {
                     "id": step["id"],
@@ -968,6 +1113,13 @@ class SessionManager:
                 "returncode": None,
                 "current_step_id": None,
                 "log": str(log_path),
+            },
+            "technical_report": {
+                "status": "collecting",
+                "available": False,
+                "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
+                "telemetry_version": 2,
+                "agent_trace": str(run_dir / ".bioagent" / "agent-trace.jsonl"),
             },
         }
         try:
@@ -992,9 +1144,11 @@ class SessionManager:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             state = {
-                "version": 1,
+                "version": 2,
                 "run_id": run.get("run_id"),
                 "run_dir": run.get("run_dir"),
+                "openwebui_chat_id": plan.get("openwebui_chat_id"),
+                "plan": plan,
                 "steps": plan.get("steps", []),
                 "execution": {},
             }
@@ -1009,6 +1163,9 @@ class SessionManager:
             execution["ok"] = False
             execution["returncode"] = -1
             execution["error"] = "Agent turn ended without terminal execution state"
+            execution["finished_at"] = (
+                datetime.now().astimezone().isoformat(timespec="seconds")
+            )
 
         steps = state.get("steps")
         if isinstance(steps, list):
@@ -1017,6 +1174,40 @@ class SessionManager:
                     step["status"] = "failed"
                     break
 
+        state["technical_report"] = {
+            **(
+                state.get("technical_report")
+                if isinstance(state.get("technical_report"), dict)
+                else {}
+            ),
+            "status": "ready",
+            "available": True,
+            "telemetry_version": 2,
+        }
+
+        report_meta = state["technical_report"]
+        telemetry_path = Path(
+            str(report_meta.get("telemetry") or state_path.parent / "telemetry.json")
+        )
+        if self._is_under_analysis_root(telemetry_path) and not telemetry_path.exists():
+            self._write_json_atomic(
+                telemetry_path,
+                {
+                    "version": 2,
+                    "run_id": state.get("run_id"),
+                    "chat_id": state.get("openwebui_chat_id"),
+                    "status": "failed",
+                    "returncode": -1,
+                    "finished_at": execution.get("finished_at"),
+                    "error": execution.get("error"),
+                    "stages": [],
+                    "commands": [],
+                    "software": [],
+                    "sequence_metrics": [],
+                    "fastp": [],
+                    "manifest": {"files": [], "omitted": 0},
+                },
+            )
         self._write_json_atomic(state_path, state)
 
     def _run_succeeded(self, plan: dict[str, Any]) -> bool:
