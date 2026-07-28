@@ -7,7 +7,7 @@ BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime
 - 引入 `/plan` 和 `/execute` 模式切换，并为 Open WebUI `chat_id` 保存持久 Claude SDK session 映射。
 - `plan` mode 使用 `dontAsk` permission mode，并注入 BioAgent 方案协议，避免进入 Claude Code Plan/ExitPlanMode；`execute` mode 在用户请求前追加 `遵循之前计划模式下生成的计划执行`。
 - 固定 Snakemake workflow gatekeeper 改为一次确认后直接执行，取消 dry-run 和第二次确认。
-- `plan` mode 通过内部 `analysis_plan` control block 生成隐藏结构化 output item；`execute` mode 使用同一个 run reservation 写入标准 `.bioagent/state.json`，成功后将 agent 生成的语义化 HTML fragment 套用统一样式并写入 `diagnostic-opinion.html`。
+- `plan` mode 通过内部 `analysis_plan` control block 生成隐藏结构化 output item；`execute` mode 使用同一个 run reservation 写入标准 `.bioagent/state.json`，成功后由 runner 保存结构化交付指标，供 Open WebUI 后端确定性生成诊断意见书。
 - 集成 TaxonAgent MCP Server；遇到 ICTV 病毒分类、划界标准、marker gene 或 genome type 查询时，runtime 可自动调用 `ictv_family_info`。
 
 ## 结构
@@ -47,7 +47,7 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map
 - 会话开始时通过 `setting_sources=["project"]`、`skills="all"` 加载 `.claude/skills/`。
 - 默认 `/plan`：活动 SDK permission mode 为 `dontAsk`，并注入只输出 BioAgent `analysis_plan`、禁止 EnterPlanMode/ExitPlanMode 和 plan 文件的 runtime prompt。
 - `/execute`：调用 `set_permission_mode("bypassPermissions")`，并在用户消息前额外注入执行提示和 runtime 分配的 run reservation，要求按既有方案执行、保持 Markdown 输出、更新 `.bioagent/state.json` 和 `.bioagent/execution.log`。
-- 成功执行的最终回复以隐藏 `diagnostic_report` block 携带无样式 HTML fragment；runtime 验证允许的语义标签、生成 A4 HTML 文件，并向 Open WebUI 发送报告 output item。失败执行不生成报告。
+- 成功执行由 runner 写入版本化交付指标与报告可用状态；Open WebUI 根据 run 状态提供唯一的任务区下载入口，并由后端按需确定性生成自包含 HTML。runtime 不发送报告 output item，模型不撰写报告，失败执行不提供交付报告。
 - `/plan` 和 `/execute` 命令由 adapter 拦截，不发送给 Claude，不污染对话上下文。
 - 固定 Snakemake 工作流的识别和一次确认后直接执行规则位于 `bioinformatics-workflow-gatekeeper` Skill。
 - ICTV 相关问题通过 MCP Streamable HTTP 调用 TaxonAgent，工具权限为 `mcp__taxonagent__*`。

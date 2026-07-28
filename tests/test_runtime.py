@@ -214,6 +214,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "current_step_id": None,
             }
         )
+        state["report"] = {
+            "status": "ready" if ok else "unavailable",
+            "available": ok,
+            "schema_version": 1,
+            "telemetry": str(state_path.parent / "telemetry.json"),
+        }
         state_path.write_text(
             json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
@@ -614,73 +620,54 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不得直接调用 Snakemake", prompt)
         self.assertIn("USER REQUEST:", prompt)
 
-    async def test_successful_execute_writes_styled_diagnostic_report(self):
+    async def test_successful_execute_leaves_report_available_via_state(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
         await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
         FakeClient.before_result = lambda: self.finish_run(plan)
-        FakeClient.response_text_parts = [
-            "分析完成。\n``",
-            "`diagnostic_",
-            """report
-<article class="diagnostic-report">
-  <header><h1>诊断意见书</h1><p class="review-status">待专家审核</p></header>
-  <section><h2>实际分析范围</h2><ul><li>质控</li><li>分类</li></ul></section>
-  <section><h2>诊断意见</h2><p><strong>结果</strong>来自本次分析。</p></section>
-</article>
-```
-""",
-        ]
+        FakeClient.response_text_parts = ["分析完成，没有 HTML 控制块。"]
 
         events = [
             event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
         ]
 
         visible = "".join(self.texts(events))
-        reports = [
-            event.item
-            for event in events
-            if isinstance(event, OutputItemAdded)
-            and event.item.get("type") == "diagnostic_report"
-        ]
         report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
-        document = report_path.read_text(encoding="utf-8")
         state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
 
-        self.assertEqual(visible.strip(), "分析完成。")
-        self.assertNotIn("diagnostic_report", visible)
-        self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0]["run"]["run_id"], plan["run"]["run_id"])
-        self.assertEqual(reports[0]["filename"], "diagnostic-opinion.html")
-        self.assertIn("<!doctype html>", document)
-        self.assertIn('<html lang="zh-CN">', document)
-        self.assertIn("@page", document)
-        self.assertIn('<article class="diagnostic-report">', document)
-        self.assertEqual(state["report"]["status"], "completed")
-        self.assertEqual(state["report"]["path"], str(report_path))
+        self.assertEqual(visible.strip(), "分析完成，没有 HTML 控制块。")
+        self.assertFalse(
+            any(
+                isinstance(event, OutputItemAdded)
+                and event.item.get("type") == "diagnostic_report"
+                for event in events
+            )
+        )
+        self.assertFalse(report_path.exists())
+        self.assertEqual(state["report"]["status"], "ready")
+        self.assertTrue(state["report"]["available"])
 
-    async def test_successful_execute_rejects_unsafe_report_fragment(self):
+    async def test_successful_execute_does_not_surface_report_state_in_chat(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
         await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-        FakeClient.before_result = lambda: self.finish_run(plan)
-        FakeClient.response_text_parts = [
-            """分析完成。
-```diagnostic_report
-<article class="diagnostic-report"><h1>诊断意见书</h1><script>alert(1)</script></article>
-```
-"""
-        ]
+        FakeClient.before_result = lambda: self.finish_run(plan, ok=True)
+        FakeClient.response_text_parts = ["分析完成。"]
+
+        def finish_without_report():
+            self.finish_run(plan, ok=True)
+            state_path = Path(plan["run"]["state_path"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["report"]["available"] = False
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        FakeClient.before_result = finish_without_report
 
         events = [
             event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
         ]
 
-        state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
-        report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
-        self.assertIn("诊断意见书生成失败", "".join(self.texts(events)))
-        self.assertEqual(state["report"]["status"], "failed")
-        self.assertFalse(report_path.exists())
+        self.assertEqual("".join(self.texts(events)).strip(), "分析完成。")
         self.assertFalse(
             any(
                 isinstance(event, OutputItemAdded)
@@ -689,33 +676,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_successful_execute_marks_missing_report_failed(self):
-        plan = self.ready_plan()
-        self.manager._save_analysis_plan(self.chat_id, plan)
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-        FakeClient.before_result = lambda: self.finish_run(plan)
-        FakeClient.response_text_parts = ["分析完成，但没有报告控制块。"]
-
-        events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
-        ]
-
-        state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
-        self.assertIn("诊断意见书生成失败", "".join(self.texts(events)))
-        self.assertEqual(state["report"]["status"], "failed")
-
-    async def test_failed_execute_discards_report_block(self):
+    async def test_failed_execute_does_not_emit_report(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
         await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
         FakeClient.before_result = lambda: self.finish_run(plan, ok=False)
-        FakeClient.response_text_parts = [
-            """分析失败。
-```diagnostic_report
-<article class="diagnostic-report"><h1>不应生成</h1></article>
-```
-"""
-        ]
+        FakeClient.response_text_parts = ["分析失败。"]
 
         events = [
             event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
@@ -724,7 +690,6 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         visible = "".join(self.texts(events))
         report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
         self.assertEqual(visible.strip(), "分析失败。")
-        self.assertNotIn("不应生成", visible)
         self.assertFalse(report_path.exists())
         self.assertFalse(
             any(
@@ -843,9 +808,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("final content in the response", config.SYSTEM_PROMPT)
         self.assertIn(".bioagent/state.json", config.SYSTEM_PROMPT)
         self.assertIn(".bioagent/execution.log", config.SYSTEM_PROMPT)
-        self.assertIn("diagnostic_report", config.SYSTEM_PROMPT)
-        self.assertIn('<article class="diagnostic-report">', config.SYSTEM_PROMPT)
-        self.assertIn("omitting empty sections", config.SYSTEM_PROMPT)
+        self.assertNotIn("```diagnostic_report", config.SYSTEM_PROMPT)
+        self.assertIn(
+            "deterministically renders the diagnostic report", config.SYSTEM_PROMPT
+        )
         self.assertIn("ICTV virus taxonomy", config.SYSTEM_PROMPT)
         self.assertIn("ictv_family_info", config.SYSTEM_PROMPT)
 
@@ -875,8 +841,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("analysis_runner.py", skill)
         self.assertIn("Do not edit it manually", skill)
         self.assertNotIn("rsync -a", skill)
-        self.assertIn("diagnostic_report", skill)
-        self.assertIn('<article class="diagnostic-report">', skill)
+        self.assertNotIn("```diagnostic_report", skill)
+        self.assertIn("generates the diagnostic report deterministically", skill)
         self.assertIn("Quality-control or assembly results alone", skill)
 
 

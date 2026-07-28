@@ -16,6 +16,7 @@ from typing import Any
 from workflow_adapters import (
     AdapterSettings,
     PreparedExecution,
+    WORKFLOW1_RULES,
     prepare_execution,
 )
 
@@ -142,6 +143,16 @@ def _instrument_workflow1(workflow_dir: Path, benchmark_dir: Path) -> None:
                 ]
             )
             current_has_benchmark = True
+        if (
+            current_rule == "bowtie2"
+            and "{params.sw}" in line
+            and "-x {params.dbs}" in line
+            and "bowtie2-summary.txt" not in line
+        ):
+            line = line.replace(
+                "|\\",
+                "2> {params.wd}/bowtie2-summary.txt |\\",
+            )
         output.append(line)
 
     rules_path.write_text("\n".join(output) + "\n", encoding="utf-8")
@@ -368,6 +379,463 @@ def _parse_fastp(run_dir: Path) -> list[dict[str, Any]]:
                 }
             )
     return reports
+
+
+def _combine_sequence_records(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not records:
+        return None
+
+    read_values = [
+        float(record["num_seqs"])
+        for record in records
+        if isinstance(record.get("num_seqs"), (int, float))
+    ]
+    base_values = [
+        float(record["sum_len"])
+        for record in records
+        if isinstance(record.get("sum_len"), (int, float))
+    ]
+    reads = sum(read_values)
+    bases = sum(base_values)
+
+    combined: dict[str, Any] = {
+        "files": [record.get("file") for record in records if record.get("file")],
+    }
+    if read_values:
+        combined["reads"] = int(reads) if reads.is_integer() else reads
+    if base_values:
+        combined["bases"] = int(bases) if bases.is_integer() else bases
+    if read_values and base_values and reads:
+        combined["mean_length"] = bases / reads
+
+    for key in ("q20_percent", "q30_percent", "gc_percent", "avg_quality"):
+        weighted = [
+            (float(record[key]), float(record["sum_len"]))
+            for record in records
+            if isinstance(record.get(key), (int, float))
+            and isinstance(record.get("sum_len"), (int, float))
+        ]
+        weight = sum(item[1] for item in weighted)
+        if weight:
+            combined[key] = (
+                sum(value * item_weight for value, item_weight in weighted) / weight
+            )
+
+    for key, function in (("min_length", min), ("max_length", max)):
+        source_key = "min_len" if key == "min_length" else "max_len"
+        values = [
+            float(record[source_key])
+            for record in records
+            if isinstance(record.get(source_key), (int, float))
+        ]
+        if values:
+            combined[key] = function(values)
+    return combined
+
+
+def _combine_fastp_reports(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    summaries = [
+        report.get("summary")
+        for report in reports
+        if isinstance(report.get("summary"), dict)
+    ]
+    if not summaries:
+        return None
+
+    def combine_side(side: str) -> dict[str, Any]:
+        records = [
+            summary.get(side)
+            for summary in summaries
+            if isinstance(summary.get(side), dict)
+        ]
+        read_values = [
+            float(record["total_reads"])
+            for record in records
+            if isinstance(record.get("total_reads"), (int, float))
+        ]
+        base_values = [
+            float(record["total_bases"])
+            for record in records
+            if isinstance(record.get("total_bases"), (int, float))
+        ]
+        reads = sum(read_values)
+        bases = sum(base_values)
+        combined: dict[str, Any] = {}
+        if read_values:
+            combined["reads"] = int(reads) if reads.is_integer() else reads
+        if base_values:
+            combined["bases"] = int(bases) if bases.is_integer() else bases
+        if read_values and base_values and reads:
+            combined["mean_length"] = bases / reads
+        for rate_key, count_key in (
+            ("q20_percent", "q20_bases"),
+            ("q30_percent", "q30_bases"),
+        ):
+            has_count = any(
+                isinstance(record.get(count_key), (int, float)) for record in records
+            )
+            count = sum(
+                float(record[count_key])
+                for record in records
+                if isinstance(record.get(count_key), (int, float))
+            )
+            if bases and has_count:
+                combined[rate_key] = count / bases * 100
+            else:
+                weighted = [
+                    (
+                        float(record[rate_key.removesuffix("_percent") + "_rate"]),
+                        float(record["total_bases"]),
+                    )
+                    for record in records
+                    if isinstance(
+                        record.get(rate_key.removesuffix("_percent") + "_rate"),
+                        (int, float),
+                    )
+                    and isinstance(record.get("total_bases"), (int, float))
+                ]
+                weight = sum(item[1] for item in weighted)
+                if weight:
+                    combined[rate_key] = (
+                        sum(rate * item_weight for rate, item_weight in weighted)
+                        / weight
+                        * 100
+                    )
+        weighted_gc = [
+            (float(record["gc_content"]), float(record["total_bases"]))
+            for record in records
+            if isinstance(record.get("gc_content"), (int, float))
+            and isinstance(record.get("total_bases"), (int, float))
+        ]
+        gc_weight = sum(item[1] for item in weighted_gc)
+        if gc_weight:
+            combined["gc_percent"] = (
+                sum(value * item_weight for value, item_weight in weighted_gc)
+                / gc_weight
+                * 100
+            )
+        return combined
+
+    before = combine_side("before_filtering")
+    after = combine_side("after_filtering")
+    filtering: dict[str, int | float] = {}
+    for report in reports:
+        values = report.get("filtering_result")
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if isinstance(value, (int, float)):
+                filtering[key] = filtering.get(key, 0) + value
+
+    duplication_values = []
+    for report, summary in zip(reports, summaries, strict=False):
+        duplication = report.get("duplication")
+        before_filtering = summary.get("before_filtering")
+        if (
+            isinstance(duplication, dict)
+            and isinstance(duplication.get("rate"), (int, float))
+            and isinstance(before_filtering, dict)
+            and isinstance(before_filtering.get("total_reads"), (int, float))
+        ):
+            duplication_values.append(
+                (
+                    float(duplication["rate"]),
+                    float(before_filtering["total_reads"]),
+                )
+            )
+    duplication_weight = sum(item[1] for item in duplication_values)
+    result: dict[str, Any] = {
+        "before": before,
+        "after": after,
+        "filtering": filtering,
+        "reports": [report.get("path") for report in reports if report.get("path")],
+    }
+    if before.get("reads"):
+        result["reads_retained_percent"] = (
+            float(after.get("reads") or 0) / float(before["reads"]) * 100
+        )
+    if before.get("bases"):
+        result["bases_retained_percent"] = (
+            float(after.get("bases") or 0) / float(before["bases"]) * 100
+        )
+    if duplication_weight:
+        result["duplication_percent"] = (
+            sum(rate * weight for rate, weight in duplication_values)
+            / duplication_weight
+            * 100
+        )
+    return result
+
+
+def _bowtie_alignment_by_run(run_dir: Path) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for path in run_dir.glob("results/filter/*/bowtie2-summary.txt"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        matches = re.findall(r"([0-9.]+)% overall alignment rate", text)
+        if matches:
+            values[path.parent.name] = float(matches[-1])
+    return values
+
+
+def _workflow1_report_data(
+    state: dict[str, Any],
+    run_dir: Path,
+    sequence_metrics: list[dict[str, Any]],
+    fastp_reports: list[dict[str, Any]],
+    rrna_alignment_percents: list[float] | None = None,
+) -> dict[str, Any]:
+    spec = state.get("execution_spec") or {}
+    entry_rule = spec.get("entry_rule")
+    exit_rule = spec.get("exit_rule")
+    selected = list(WORKFLOW1_RULES)[
+        WORKFLOW1_RULES.index(entry_rule) : WORKFLOW1_RULES.index(exit_rule) + 1
+    ]
+    data = (spec.get("inputs") or [{}])[0].get("data") or {}
+    records = data.get("runs") or data.get("samples") or []
+    records = [record for record in records if isinstance(record, dict)]
+    step_status = {
+        rule: step.get("status", "pending")
+        for step in state.get("steps", [])
+        if isinstance(step, dict)
+        for rule in step.get("rules") or []
+    }
+    provided_rule = {
+        "bowtie2": "fastp",
+        "merge": "bowtie2",
+        "megahit": "merge",
+        "rename_filter": "megahit",
+    }.get(entry_rule)
+    stages = []
+    for rule in WORKFLOW1_RULES:
+        if rule in selected:
+            status = step_status.get(rule, "pending")
+        elif rule == provided_rule:
+            status = "provided"
+        else:
+            status = "not_selected"
+        stages.append({"rule": rule, "status": status})
+
+    metrics_by_file = {
+        str(Path(str(record.get("file"))).resolve()): record
+        for record in sequence_metrics
+        if record.get("file")
+    }
+
+    def metric(path: str | Path) -> dict[str, Any] | None:
+        return metrics_by_file.get(str(Path(path).resolve()))
+
+    fastp_by_run: dict[str, list[dict[str, Any]]] = {}
+    for report in fastp_reports:
+        path = report.get("path")
+        if path:
+            fastp_by_run.setdefault(Path(str(path)).parent.name, []).append(report)
+    alignment_by_run = _bowtie_alignment_by_run(run_dir)
+    all_run_ids = [
+        str(record.get("run_id")) for record in records if record.get("run_id")
+    ]
+    if rrna_alignment_percents and len(rrna_alignment_percents) == len(all_run_ids):
+        for run_id, value in zip(
+            all_run_ids,
+            rrna_alignment_percents,
+            strict=True,
+        ):
+            alignment_by_run.setdefault(run_id, float(value))
+
+    sample_records: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        sample_id = record.get("sample_id")
+        if isinstance(sample_id, str):
+            sample_records.setdefault(sample_id, []).append(record)
+
+    samples = []
+    for sample_id, inputs in sample_records.items():
+        run_ids = [str(record.get("run_id") or sample_id) for record in inputs]
+        input_metrics = [
+            value
+            for record in inputs
+            for path_key in ("read1", "read2", "path")
+            if record.get(path_key)
+            if (value := metric(record[path_key]))
+        ]
+        sample: dict[str, Any] = {
+            "sample_id": sample_id,
+            "run_ids": run_ids,
+            "input": {
+                "type": ((spec.get("inputs") or [{}])[0]).get("type"),
+                "stage": {
+                    "fastp": "raw",
+                    "bowtie2": "post_fastp",
+                    "merge": "post_rrna",
+                    "megahit": "merged_reads",
+                    "rename_filter": "assembly",
+                }.get(entry_rule),
+                "metrics": _combine_sequence_records(input_metrics),
+            },
+        }
+
+        if "fastp" in selected:
+            sample["fastp"] = _combine_fastp_reports(
+                [
+                    report
+                    for run_id in run_ids
+                    for report in fastp_by_run.get(run_id, [])
+                ]
+            )
+
+        if "bowtie2" in selected:
+            before_by_run: dict[str, list[dict[str, Any]]] = {}
+            for run_id in run_ids:
+                run_records = [
+                    value
+                    for mate in (1, 2)
+                    if (
+                        value := metric(
+                            run_dir
+                            / "results"
+                            / "filter"
+                            / run_id
+                            / f"01_fastp_r{mate}.fq.gz"
+                        )
+                    )
+                ]
+                if entry_rule == "bowtie2" and not run_records:
+                    run_records = [
+                        value
+                        for record in inputs
+                        if str(record.get("run_id") or sample_id) == run_id
+                        for path_key in ("read1", "read2", "path")
+                        if record.get(path_key)
+                        if (value := metric(record[path_key]))
+                    ]
+                before_by_run[run_id] = run_records
+            before_records = [
+                value
+                for records_for_run in before_by_run.values()
+                for value in records_for_run
+            ]
+            after_records = [
+                value
+                for run_id in run_ids
+                for mate in (1, 2)
+                if (
+                    value := metric(
+                        run_dir
+                        / "results"
+                        / "filter"
+                        / run_id
+                        / f"cleanreads_r{mate}.fq.gz"
+                    )
+                )
+            ]
+            before = _combine_sequence_records(before_records)
+            after = _combine_sequence_records(after_records)
+            rrna: dict[str, Any] = {"before": before, "after": after}
+            if before and before.get("reads"):
+                rrna["reads_retained_percent"] = (
+                    float((after or {}).get("reads") or 0)
+                    / float(before["reads"])
+                    * 100
+                )
+            if before and before.get("bases"):
+                rrna["bases_retained_percent"] = (
+                    float((after or {}).get("bases") or 0)
+                    / float(before["bases"])
+                    * 100
+                )
+            alignments = []
+            for run_id in run_ids:
+                if run_id not in alignment_by_run:
+                    continue
+                alignment: dict[str, Any] = {
+                    "run_id": run_id,
+                    "alignment_percent": alignment_by_run[run_id],
+                }
+                run_before = _combine_sequence_records(before_by_run[run_id])
+                if run_before and isinstance(run_before.get("reads"), (int, float)):
+                    alignment["input_reads"] = run_before["reads"]
+                alignments.append(alignment)
+            if alignments:
+                rrna["alignments"] = alignments
+                weighted = [
+                    (item["alignment_percent"], item["input_reads"])
+                    for item in alignments
+                    if isinstance(item.get("input_reads"), (int, float))
+                    and item["input_reads"] > 0
+                ]
+                if weighted:
+                    rrna["alignment_percent"] = sum(
+                        value * weight for value, weight in weighted
+                    ) / sum(weight for _, weight in weighted)
+                elif len(alignments) == 1:
+                    rrna["alignment_percent"] = alignments[0]["alignment_percent"]
+            sample["rrna"] = rrna
+
+        if "merge" in selected:
+            sample["merge"] = _combine_sequence_records(
+                [
+                    value
+                    for mate in (1, 2)
+                    if (
+                        value := metric(
+                            run_dir
+                            / "results"
+                            / "merge"
+                            / sample_id
+                            / f"cleanreads_r{mate}.fq"
+                        )
+                    )
+                ]
+            )
+
+        if "megahit" in selected:
+            sample["assembly"] = _combine_sequence_records(
+                [
+                    value
+                    for path in (
+                        run_dir
+                        / "results"
+                        / "assembly"
+                        / sample_id
+                        / f"{sample_id}.contigs.fa",
+                    )
+                    if (value := metric(path))
+                ]
+            )
+            assembly_record = metric(
+                run_dir / "results" / "assembly" / sample_id / f"{sample_id}.contigs.fa"
+            )
+            if sample.get("assembly") and assembly_record:
+                for key in ("n50", "q1", "median", "q3"):
+                    if assembly_record.get(key) is not None:
+                        sample["assembly"][key] = assembly_record[key]
+
+        if "rename_filter" in selected:
+            final_records = [
+                record
+                for record in sequence_metrics
+                if Path(str(record.get("file", ""))).name
+                == f"{sample_id}.contigs.1kb.renamed.fa"
+            ]
+            sample["final_filter"] = _combine_sequence_records(final_records)
+            final_record = final_records[0] if final_records else None
+            if sample.get("final_filter") and final_record:
+                for key in ("n50", "q1", "median", "q3"):
+                    if final_record.get(key) is not None:
+                        sample["final_filter"][key] = final_record[key]
+
+        samples.append(sample)
+
+    return {
+        "schema_version": 1,
+        "workflow": "workflow1",
+        "entry_rule": entry_rule,
+        "exit_rule": exit_rule,
+        "stages": stages,
+        "samples": samples,
+    }
 
 
 def _software_versions(
@@ -786,6 +1254,16 @@ def run(args: argparse.Namespace) -> int:
                 ]
             )
         )
+        rrna_alignment_by_run = _bowtie_alignment_by_run(run_dir)
+        if rrna_alignment_by_run:
+            telemetry["rrna_alignments"] = [
+                {
+                    "run_id": run_id,
+                    "alignment_percent": alignment_percent,
+                }
+                for run_id, alignment_percent in rrna_alignment_by_run.items()
+            ]
+            telemetry["rrna_alignment_percents"] = list(rrna_alignment_by_run.values())
         for stage in telemetry["stages"]:
             if returncode == 0:
                 stage["status"] = "completed"
@@ -822,8 +1300,6 @@ def run(args: argparse.Namespace) -> int:
             bioagent_dir / "output-manifest.json",
             {"version": 1, **telemetry["manifest"]},
         )
-        _write_json_atomic(telemetry_path, telemetry)
-
         completed_rules = {
             job.get("rule_name") for job in benchmarks if job.get("rule_name")
         }
@@ -878,6 +1354,20 @@ def run(args: argparse.Namespace) -> int:
             "telemetry": str(telemetry_path),
             "telemetry_version": 2,
         }
+        state["report"] = {
+            "status": "ready" if returncode == 0 else "unavailable",
+            "available": returncode == 0,
+            "schema_version": 1,
+            "telemetry": str(telemetry_path),
+        }
+        telemetry["delivery_report"] = _workflow1_report_data(
+            state,
+            run_dir,
+            telemetry["sequence_metrics"],
+            telemetry["fastp"],
+            telemetry["rrna_alignment_percents"],
+        )
+        _write_json_atomic(telemetry_path, telemetry)
         _write_json_atomic(state_path, state)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)

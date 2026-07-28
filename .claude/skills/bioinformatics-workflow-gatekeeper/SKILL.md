@@ -106,39 +106,14 @@ Requirements:
 - After the user confirms the selected workflow, execute the runtime-provided runner command exactly once. The runner prepares the workflow and launches exactly the segment in the latest plan.
 - Never execute a stage omitted from the latest plan. When the plan stops before a workflow's default final target, invoke Snakemake with the explicit output targets for the last selected stage instead of the default `all` target.
 - In execute mode, summarize the execution result for the user as Markdown, including the run directory, execution log, return code, and any obvious next steps. Do not output `analysis_plan` in execute mode.
-- After a successful execution summary, append the `diagnostic_report` control block described below. Failed or incomplete runs must not produce that block.
+- After execution, return only the concise Markdown execution summary described below. The application generates the diagnostic report deterministically from runner telemetry.
 - If the user rejects the proposed workflow, exit this skill and continue normal conversation.
 
-## Diagnostic report contract
+## Diagnostic report boundary
 
-When `execution.status` is `completed` and `execution.ok` is `true`, finish the response with exactly one internal report block:
-
-````html
-```diagnostic_report
-<article class="diagnostic-report">
-  <header>
-    <h1>诊断意见书</h1>
-    <p class="review-status">待专家审核</p>
-  </header>
-  <section>
-    <h2>基本信息</h2>
-    <dl>
-      <dt>分析任务</dt>
-      <dd>病毒宏基因组上游分析</dd>
-    </dl>
-  </section>
-</article>
-```
-````
-
-Requirements:
-
-- The block contains one unstyled `<article class="diagnostic-report">` fragment, not a complete HTML document. The runtime hides it, applies the shared print style, and writes `diagnostic-opinion.html`; do not write that file yourself.
-- Use only `article`, `header`, `section`, `h1`-`h3`, `p`, `ul`, `ol`, `li`, `dl`, `dt`, `dd`, `table`, `thead`, `tbody`, `tr`, `th`, `td`, `strong`, `em`, `small`, `code`, and `br`. Only `class` attributes are allowed.
-- Do not include a doctype, `html`, `head`, `body`, `style`, `script`, links, images, external resources, inline styles, event attributes, Markdown, comments, or text outside the article.
-- Include the available sections 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物. Omit empty sections, unknown fields, and every analysis stage the user skipped.
-- Base every metric, finding, conclusion, and evidence path on the completed run or the current conversation. Quality-control or assembly results alone must not be presented as a pathogen classification or etiological diagnosis.
-- The fenced block is the final response content. Put the user-visible Markdown execution summary before it and write nothing after it.
+- Do not create or write a diagnostic report, HTML fragment, fenced control block, chart, or report file.
+- The runner records versioned structured metrics, and the application renders the user-facing report without model-authored content.
+- Base the visible Markdown execution summary only on the terminal state and actual run output. Quality-control or assembly results alone must not be presented as a pathogen classification or etiological diagnosis.
 
 ## Tool boundaries
 

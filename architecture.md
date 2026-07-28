@@ -35,7 +35,7 @@ MiniMax Anthropic-compatible API
 - 用每个 session 自己的 `asyncio.Lock` 串行同一聊天的请求。
 - 新 session 以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段只预先允许只读的 `Read`、`Glob`、`Grep`。
 - `/plan` 调用 `set_permission_mode("dontAsk")`，并注入 BioAgent `analysis_plan` 协议以避开 Claude Code Plan/ExitPlanMode；`/execute` 调用 `set_permission_mode("bypassPermissions")`，并额外拼接执行提示和 runtime 分配的 run reservation，要求按既有方案执行、保持 Markdown 输出、更新 `.bioagent/state.json` 和 `.bioagent/execution.log`。
-- 成功的 execute 回合会拦截末尾 `diagnostic_report` HTML fragment，验证语义标签后由 runtime 统一补全样式和文档结构，写入 run 目录并发送持久化报告 output item。
+- 成功 run 由固定 runner 写入版本化交付指标与报告可用状态；runtime 不发送报告 output item，Open WebUI 从 run 状态提供下载入口，后端按需确定性渲染诊断意见书，不接收模型生成的 HTML。
 - 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
 - 构建统一的 `ClaudeAgentOptions`，加载项目 Skills 和 Claude Code preset tools。
 - 校验 transcript、SDK 执行结果和返回的 session ID。
@@ -48,7 +48,7 @@ MiniMax Anthropic-compatible API
 
 ### `.claude/skills/`
 
-Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 负责 workflow1-workflow6 的保守匹配、plan 模式 `analysis_plan` 内部控制块、一次用户确认后的直接执行、诊断意见书内容边界以及 Bash 执行边界。
+Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 负责 workflow1-workflow6 的保守匹配、plan 模式 `analysis_plan` 内部控制块、一次用户确认后的直接执行以及 Bash 执行边界；诊断意见书不由模型撰写。
 
 ## 持久化
 

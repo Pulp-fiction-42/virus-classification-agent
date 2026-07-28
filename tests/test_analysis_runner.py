@@ -18,9 +18,11 @@ from analysis_runner import (
     _parse_log,
     _parse_seqkit_table,
     _upstream_metrics,
+    _workflow1_report_data,
     redact_text,
     run,
 )
+from workflow_adapters import WORKFLOW1_RULES
 
 
 class AnalysisRunnerTests(unittest.TestCase):
@@ -178,6 +180,12 @@ rule fastp:
     shell:
         "{params.sk} stat -j 2 input.fastq"
 
+rule bowtie2:
+    output: "rrna.fastq"
+    shell:
+        "{params.sw} {params.pm} -x {params.dbs} |\\
+        samtools fastq"
+
 rule megahit:
     output: "contigs.fa"
     shell:
@@ -193,6 +201,7 @@ rule megahit:
         self.assertIn("stats -a -T -j 1", content)
         self.assertIn("fastp.{run_index}.jsonl", content)
         self.assertIn("megahit.{sample_index}.jsonl", content)
+        self.assertIn("2> {params.wd}/bowtie2-summary.txt", content)
 
     def test_parses_seqkit_quartiles_and_benchmark_jobs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -341,6 +350,24 @@ rule megahit:
                 self.assertIn("--benchmark-extended", telemetry["runner_command"])
                 self.assertIn("--printshellcmds", telemetry["runner_command"])
                 self.assertTrue(state["technical_report"]["available"])
+                self.assertEqual(state["report"]["available"], exit_code == 0)
+                self.assertEqual(state["report"]["schema_version"], 1)
+                self.assertEqual(
+                    telemetry["delivery_report"]["schema_version"],
+                    1,
+                )
+                selected_stage_statuses = [
+                    stage["status"]
+                    for stage in telemetry["delivery_report"]["stages"]
+                    if stage["rule"] in {"fastp", "bowtie2", "merge"}
+                ]
+                if exit_code == 0:
+                    self.assertEqual(
+                        selected_stage_statuses,
+                        ["completed", "completed", "completed"],
+                    )
+                else:
+                    self.assertEqual(selected_stage_statuses[0], "failed")
                 self.assertIn("agent_trace", state["technical_report"])
                 self.assertIn(
                     "partial output", (bioagent / "execution.log").read_text()
@@ -412,6 +439,7 @@ rule megahit:
         self.assertEqual(result, 1)
         self.assertEqual(state["execution"]["status"], "failed")
         self.assertTrue(state["technical_report"]["available"])
+        self.assertFalse(state["report"]["available"])
         self.assertIn("does not exist", telemetry["error"])
 
     def test_sigterm_preserves_cancelled_partial_telemetry(self):
@@ -459,6 +487,208 @@ rule megahit:
         self.assertEqual(state["execution"]["status"], "failed")
         self.assertEqual(telemetry["status"], "cancelled")
         self.assertTrue(state["technical_report"]["available"])
+        self.assertFalse(state["report"]["available"])
+
+    def test_delivery_report_aggregates_runs_and_preserves_rrna_alignment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            records = [
+                {
+                    "run_id": run_id,
+                    "sample_id": "sample",
+                    "read1": str(run_dir / "inputs" / f"{run_id}_r1.fq.gz"),
+                    "read2": str(run_dir / "inputs" / f"{run_id}_r2.fq.gz"),
+                }
+                for run_id in ("lane1", "lane2")
+            ]
+            state = {
+                "execution_spec": {
+                    "adapter": "workflow1",
+                    "entry_rule": "fastp",
+                    "exit_rule": "bowtie2",
+                    "inputs": [
+                        {
+                            "id": "primary",
+                            "type": "raw_paired_reads",
+                            "data": {"runs": records},
+                        }
+                    ],
+                },
+                "steps": [
+                    {"rules": ["fastp"], "status": "completed"},
+                    {"rules": ["bowtie2"], "status": "completed"},
+                ],
+            }
+            sequence_metrics = []
+            for lane_index, record in enumerate(records, start=1):
+                for mate in (1, 2):
+                    sequence_metrics.extend(
+                        [
+                            {
+                                "file": record[f"read{mate}"],
+                                "num_seqs": 100,
+                                "sum_len": 15_000,
+                                "q30_percent": 90 + lane_index,
+                            },
+                            {
+                                "file": str(
+                                    run_dir
+                                    / "results"
+                                    / "filter"
+                                    / record["run_id"]
+                                    / f"01_fastp_r{mate}.fq.gz"
+                                ),
+                                "num_seqs": 90,
+                                "sum_len": 13_500,
+                            },
+                            {
+                                "file": str(
+                                    run_dir
+                                    / "results"
+                                    / "filter"
+                                    / record["run_id"]
+                                    / f"cleanreads_r{mate}.fq.gz"
+                                ),
+                                "num_seqs": 80,
+                                "sum_len": 12_000,
+                            },
+                        ]
+                    )
+                summary = (
+                    run_dir
+                    / "results"
+                    / "filter"
+                    / record["run_id"]
+                    / "bowtie2-summary.txt"
+                )
+                summary.parent.mkdir(parents=True, exist_ok=True)
+                summary.write_text(
+                    f"{lane_index}.00% overall alignment rate\n",
+                    encoding="utf-8",
+                )
+            fastp_reports = [
+                {
+                    "path": str(
+                        run_dir
+                        / "results"
+                        / "filter"
+                        / record["run_id"]
+                        / "01_fastp.json"
+                    ),
+                    "summary": {
+                        "before_filtering": {
+                            "total_reads": 200,
+                            "total_bases": 30_000,
+                            "q30_bases": 27_000,
+                        },
+                        "after_filtering": {
+                            "total_reads": 180,
+                            "total_bases": 27_000,
+                            "q30_bases": 25_650,
+                        },
+                    },
+                    "filtering_result": {"low_quality_reads": 10},
+                    "duplication": {"rate": 0.1},
+                }
+                for record in records
+            ]
+
+            report = _workflow1_report_data(
+                state,
+                run_dir,
+                sequence_metrics,
+                fastp_reports,
+            )
+
+        sample = report["samples"][0]
+        self.assertEqual(sample["input"]["metrics"]["reads"], 400)
+        self.assertEqual(sample["fastp"]["before"]["reads"], 400)
+        self.assertEqual(sample["fastp"]["after"]["reads"], 360)
+        self.assertEqual(sample["fastp"]["reads_retained_percent"], 90)
+        self.assertEqual(sample["fastp"]["before"]["q30_percent"], 90)
+        self.assertEqual(sample["fastp"]["filtering"]["low_quality_reads"], 20)
+        self.assertEqual(sample["rrna"]["after"]["reads"], 320)
+        self.assertEqual(
+            sample["rrna"]["alignments"],
+            [
+                {
+                    "run_id": "lane1",
+                    "alignment_percent": 1.0,
+                    "input_reads": 180,
+                },
+                {
+                    "run_id": "lane2",
+                    "alignment_percent": 2.0,
+                    "input_reads": 180,
+                },
+            ],
+        )
+        self.assertEqual(sample["rrna"]["alignment_percent"], 1.5)
+
+    def test_delivery_report_marks_each_workflow_entry_stage(self):
+        cases = {
+            "fastp": ("raw_paired_reads", "runs", "raw", None),
+            "bowtie2": ("fastp_paired_reads", "runs", "post_fastp", "fastp"),
+            "merge": ("clean_paired_reads", "runs", "post_rrna", "bowtie2"),
+            "megahit": (
+                "merged_paired_reads",
+                "samples",
+                "merged_reads",
+                "merge",
+            ),
+            "rename_filter": (
+                "contigs_fasta",
+                "samples",
+                "assembly",
+                "megahit",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for entry_rule, (
+                input_type,
+                collection,
+                input_stage,
+                provided_rule,
+            ) in cases.items():
+                fields = {"sample_id": "sample"}
+                if collection == "runs":
+                    fields["run_id"] = "run"
+                if entry_rule == "rename_filter":
+                    fields["path"] = str(root / "contigs.fa")
+                else:
+                    fields["read1"] = str(root / "r1.fq")
+                    fields["read2"] = str(root / "r2.fq")
+                selected = WORKFLOW1_RULES[WORKFLOW1_RULES.index(entry_rule) :]
+                state = {
+                    "execution_spec": {
+                        "adapter": "workflow1",
+                        "entry_rule": entry_rule,
+                        "exit_rule": WORKFLOW1_RULES[-1],
+                        "inputs": [
+                            {
+                                "id": "primary",
+                                "type": input_type,
+                                "data": {collection: [fields]},
+                            }
+                        ],
+                    },
+                    "steps": [
+                        {"rules": [rule], "status": "completed"} for rule in selected
+                    ],
+                }
+
+                report = _workflow1_report_data(state, root, [], [])
+                statuses = {
+                    stage["rule"]: stage["status"] for stage in report["stages"]
+                }
+
+                self.assertEqual(
+                    report["samples"][0]["input"]["stage"],
+                    input_stage,
+                )
+                if provided_rule:
+                    self.assertEqual(statuses[provided_rule], "provided")
 
 
 if __name__ == "__main__":

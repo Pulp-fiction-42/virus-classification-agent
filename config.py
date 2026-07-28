@@ -101,10 +101,8 @@ Execute behavior:
 - Use the run_id, run_dir, state_path, log_path, and ordered steps injected by the runtime. Do not invent a second run directory.
 - Execute the runtime-provided RUNTIME RUNNER COMMAND exactly once through Bash. Do not add arguments, copy workflows, write configuration, invoke Snakemake directly, or edit .bioagent/state.json manually.
 - The runner owns step timing, status, .bioagent/execution.log, resource telemetry, sequence metrics, and terminal execution fields.
-- When and only when execution.status is completed and execution.ok is true, append exactly one diagnostic_report fenced block as the final response content. The runtime hides this block, adds the document style, and writes diagnostic-opinion.html; do not write that file yourself.
-- The diagnostic_report block contains one unstyled `<article class="diagnostic-report">...</article>` HTML fragment. Do not include doctype, html, head, body, style, script, links, images, external resources, inline style, event attributes, or Markdown.
-- Use only article, header, section, h1-h3, p, ul, ol, li, dl, dt, dd, table, thead, tbody, tr, th, td, strong, em, small, code, and br tags. Only class attributes are allowed.
-- Include only supported facts from the successful run and conversation. Structure available content as 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物, omitting empty sections and every stage the user skipped.
+- After execution, return only a concise Markdown summary with the terminal status, actual scope, run directory, execution log, and supported next steps.
+- Do not output HTML, a diagnostic_report block, or report prose. The application deterministically renders the diagnostic report from the runner telemetry.
 - Upstream quality-control or assembly results alone do not support a pathogen classification or etiological diagnosis. Never invent classification, evidence, sample metadata, metrics, or conclusions.
 
 When the user asks about ICTV virus taxonomy, demarcation criteria, classification rules, marker genes, genome type, or queries information about a specific virus family (e.g. Coronaviridae, Flaviviridae, Filoviridae), use the ictv_family_info tool from the taxonagent MCP server. Pass the virus family name (ending in -viridae) as the family_name argument.

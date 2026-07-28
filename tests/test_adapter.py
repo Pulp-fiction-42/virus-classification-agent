@@ -43,9 +43,6 @@ class FakeSessions:
             )
         yield TextDelta("persistent")
         yield OutputItemAdded({"type": "analysis_plan", "id": "plan-test"})
-        yield OutputItemAdded(
-            {"type": "diagnostic_report", "id": "diagnostic-report-test"}
-        )
 
     async def stream_ephemeral_turn(self, messages):
         self.ephemeral_calls.append(messages)
@@ -111,7 +108,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         body = await response_text(response)
         self.assertIn("persistent", body)
         self.assertIn('"type": "response.output_item.added"', body)
-        self.assertIn('"type": "diagnostic_report"', body)
+        self.assertIn('"type": "analysis_plan"', body)
+        self.assertNotIn('"type": "diagnostic_report"', body)
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
         self.assertEqual(fake.ephemeral_calls, [])
