@@ -16,6 +16,7 @@ from runtime import (
     PLAN_PROMPT_PREFIX,
     AgentTraceRecorder,
     InvalidSessionError,
+    MarkdownTextStream,
     OutputItemAdded,
     SessionManager,
     SessionStateError,
@@ -47,6 +48,7 @@ class FakeResultMessage:
 class FakeClient:
     instances = []
     response_text_parts = ["chunk"]
+    response_events = None
     result_session_id = None
     before_result = None
 
@@ -66,13 +68,17 @@ class FakeClient:
 
     async def receive_response(self):
         session_id = self.result_session_id or self.options.resume or "sdk-session-1"
-        for text in self.response_text_parts:
-            yield FakeStreamEvent(
-                {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": text},
-                }
-            )
+        if self.response_events is not None:
+            for event in self.response_events:
+                yield FakeStreamEvent(event)
+        else:
+            for text in self.response_text_parts:
+                yield FakeStreamEvent(
+                    {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": text},
+                    }
+                )
         if type(self).before_result:
             type(self).before_result()
         yield FakeResultMessage(
@@ -94,6 +100,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.ResultMessage = FakeResultMessage
         FakeClient.instances = []
         FakeClient.response_text_parts = ["chunk"]
+        FakeClient.response_events = None
         FakeClient.result_session_id = None
         FakeClient.before_result = None
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -165,6 +172,118 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 ],
             },
         }
+
+    @staticmethod
+    def assistant_text_events(*messages: list[str]) -> list[dict]:
+        events = []
+        for parts in messages:
+            events.append(
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant"},
+                }
+            )
+            for text in parts:
+                events.append(
+                    {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": text},
+                    }
+                )
+            events.append({"type": "message_stop"})
+        return events
+
+    @staticmethod
+    def normalized_text(events: list[dict]) -> str:
+        stream = MarkdownTextStream()
+        return "".join(filter(None, (stream.push(event) for event in events)))
+
+    def test_markdown_text_stream_separates_tool_surrounded_messages(self):
+        events = [
+            {
+                "type": "message_start",
+                "message": {"role": "assistant"},
+            },
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "已确认"},
+            },
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "启动分析。"},
+            },
+            {
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Bash"},
+            },
+            {"type": "message_stop"},
+            {
+                "type": "message_start",
+                "message": {"role": "assistant"},
+            },
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "总结结果"},
+            },
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "## 执行摘要"},
+            },
+        ]
+
+        self.assertEqual(
+            self.normalized_text(events),
+            "已确认启动分析。\n\n## 执行摘要",
+        )
+
+    def test_markdown_text_stream_preserves_existing_boundary_newlines(self):
+        cases = [
+            ("第一段。", "第二段。", "第一段。\n\n第二段。"),
+            ("第一段。\n", "\n第二段。", "第一段。\n\n第二段。"),
+            ("第一段。\n\n", "第二段。", "第一段。\n\n第二段。"),
+            ("第一段。", "\n\n第二段。", "第一段。\n\n第二段。"),
+        ]
+
+        for first, second, expected in cases:
+            with self.subTest(first=first, second=second):
+                events = self.assistant_text_events([first], [second])
+                self.assertEqual(self.normalized_text(events), expected)
+
+    def test_markdown_text_stream_handles_tool_only_and_multiple_messages(self):
+        events = self.assistant_text_events(
+            [],
+            ["第一段。"],
+            [],
+            ["第二段。"],
+            ["第三", "段。"],
+        )
+
+        self.assertEqual(
+            self.normalized_text(events),
+            "第一段。\n\n第二段。\n\n第三段。",
+        )
+
+    async def test_persistent_and_ephemeral_streams_share_markdown_boundaries(self):
+        FakeClient.response_events = self.assistant_text_events(
+            ["开始检查。"],
+            ["## 检查完成"],
+        )
+
+        persistent = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+        ephemeral = [
+            event async for event in self.manager.stream_ephemeral_turn(MESSAGES)
+        ]
+
+        self.assertEqual(
+            "".join(self.texts(persistent)),
+            "开始检查。\n\n## 检查完成",
+        )
+        self.assertEqual(
+            "".join(self.texts(ephemeral)),
+            "开始检查。\n\n## 检查完成",
+        )
 
     def test_agent_trace_records_tool_calls_and_redacts_secrets(self):
         path = Path(self.temp_dir.name) / "agent-trace.jsonl"
@@ -426,6 +545,36 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("analysis_plan", text)
         self.assertEqual(len(output_items), 1)
         self.assertEqual(output_items[0]["title"], "拆分控制块")
+
+    async def test_message_boundary_before_plan_block_stays_hidden(self):
+        FakeClient.response_events = self.assistant_text_events(
+            ["方案如下。"],
+            [
+                "```analysis",
+                """_plan
+{
+  "version": 1,
+  "title": "跨回合控制块",
+  "ready_to_execute": false,
+  "steps": [{"label": "等待输入"}]
+}
+```
+""",
+            ],
+        )
+
+        events = [
+            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+        ]
+        text = "".join(self.texts(events))
+        output_items = [
+            event.item for event in events if isinstance(event, OutputItemAdded)
+        ]
+
+        self.assertEqual(text.strip(), "方案如下。")
+        self.assertNotIn("analysis_plan", text)
+        self.assertEqual(len(output_items), 1)
+        self.assertEqual(output_items[0]["title"], "跨回合控制块")
 
     async def test_text_after_plan_block_is_preserved_without_leaking_control_block(
         self,

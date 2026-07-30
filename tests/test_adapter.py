@@ -26,8 +26,14 @@ async def response_text(response) -> str:
 
 
 class FakeSessions:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        text_parts: list[str] | None = None,
+    ) -> None:
         self.fail = fail
+        self.text_parts = text_parts or ["persistent"]
         self.persistent_calls = []
         self.ephemeral_calls = []
         self.ensure_calls = []
@@ -41,7 +47,8 @@ class FakeSessions:
             raise SessionStateError(
                 "无法创建分析运行目录：/tmp/run，请检查 BIOAGENT_RUN_ROOT 写权限"
             )
-        yield TextDelta("persistent")
+        for text in self.text_parts:
+            yield TextDelta(text)
         yield OutputItemAdded({"type": "analysis_plan", "id": "plan-test"})
 
     async def stream_ephemeral_turn(self, messages):
@@ -113,6 +120,38 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
         self.assertEqual(fake.ephemeral_calls, [])
+
+    async def test_streaming_and_non_streaming_preserve_markdown_boundaries(self):
+        fake = FakeSessions(text_parts=["开始检查。", "\n\n## 检查完成"])
+        adapter.sessions = fake
+        chat_id = "11111111-1111-1111-1111-111111111111"
+        messages = [{"role": "user", "content": "check"}]
+
+        streaming_response = await adapter.chat(
+            ChatRequest(messages=messages),
+            request_with_headers(x_openwebui_chat_id=chat_id),
+        )
+        streaming_body = await response_text(streaming_response)
+        streamed_text = "".join(
+            json.loads(line.removeprefix("data: "))["choices"][0]["delta"].get(
+                "content", ""
+            )
+            for line in streaming_body.splitlines()
+            if line.startswith("data: {")
+            and '"object": "chat.completion.chunk"' in line
+        )
+
+        non_streaming_response = await adapter.chat(
+            ChatRequest(messages=messages, stream=False),
+            request_with_headers(x_openwebui_chat_id=chat_id),
+        )
+        non_streamed_text = json.loads(non_streaming_response.body)["choices"][0][
+            "message"
+        ]["content"]
+
+        expected = "开始检查。\n\n## 检查完成"
+        self.assertEqual(streamed_text, expected)
+        self.assertEqual(non_streamed_text, expected)
 
     async def test_stream_failure_returns_openai_error_and_done(self):
         adapter.sessions = FakeSessions(fail=True)

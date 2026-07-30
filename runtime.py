@@ -159,6 +159,43 @@ class TrailingControlBlockFilter:
         return visible, ""
 
 
+class MarkdownTextStream:
+    """Preserve Markdown paragraph boundaries between assistant messages."""
+
+    def __init__(self) -> None:
+        self.has_text = False
+        self.pending_message_boundary = False
+        self.trailing_newlines = 0
+
+    def push(self, event: dict[str, Any]) -> str | None:
+        if event.get("type") == "message_start":
+            self.pending_message_boundary = self.has_text
+            return None
+
+        if event.get("type") != "content_block_delta":
+            return None
+
+        delta = event.get("delta") or {}
+        if delta.get("type") != "text_delta" or not delta.get("text"):
+            return None
+
+        text = delta["text"]
+        if self.pending_message_boundary:
+            leading_newlines = len(text) - len(text.lstrip("\n"))
+            missing_newlines = max(0, 2 - self.trailing_newlines - leading_newlines)
+            text = "\n" * missing_newlines + text
+            self.pending_message_boundary = False
+
+        self.has_text = True
+        text_without_newlines = text.rstrip("\n")
+        if text_without_newlines:
+            self.trailing_newlines = len(text) - len(text_without_newlines)
+        else:
+            self.trailing_newlines += len(text)
+        self.trailing_newlines = min(2, self.trailing_newlines)
+        return text
+
+
 @dataclass
 class ManagedSession:
     client: Any
@@ -366,20 +403,20 @@ class SessionManager:
                     if session.mode == PLAN_MODE
                     else None
                 )
+                text_stream = MarkdownTextStream()
                 async for message in session.client.receive_response():
                     if isinstance(message, StreamEvent):
                         event = message.event
                         if trace:
                             trace.consume(event)
-                        if event.get("type") != "content_block_delta":
+                        text = text_stream.push(event)
+                        if not text:
                             continue
-                        delta = event.get("delta", {})
-                        if delta.get("type") == "text_delta" and delta.get("text"):
-                            if control_filter:
-                                for visible_text in control_filter.push(delta["text"]):
-                                    yield TextDelta(visible_text)
-                            else:
-                                yield TextDelta(delta["text"])
+                        if control_filter:
+                            for visible_text in control_filter.push(text):
+                                yield TextDelta(visible_text)
+                        else:
+                            yield TextDelta(text)
                     elif isinstance(message, ResultMessage):
                         result_seen = True
                         self._record_result(normalized_chat_id, session, message)
@@ -425,14 +462,12 @@ class SessionManager:
             await client.connect()
             await client.query(self._render_history(messages))
 
+            text_stream = MarkdownTextStream()
             async for message in client.receive_response():
                 if isinstance(message, StreamEvent):
-                    event = message.event
-                    if event.get("type") != "content_block_delta":
-                        continue
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta" and delta.get("text"):
-                        yield TextDelta(delta["text"])
+                    text = text_stream.push(message.event)
+                    if text:
+                        yield TextDelta(text)
                 elif isinstance(message, ResultMessage):
                     result_seen = True
                     if message.is_error:
