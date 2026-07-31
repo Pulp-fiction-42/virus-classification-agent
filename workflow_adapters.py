@@ -36,6 +36,38 @@ WORKFLOW1_INPUTS = {
     ),
     "rename_filter": ("contigs_fasta", "samples", ("sample_id", "path")),
 }
+WORKFLOW2_PREPROCESS_RULES = (
+    "rename_contigs",
+    "get_orfs",
+    "merge_orfs",
+    "merge_contigs",
+)
+WORKFLOW2_CANDIDATE_RULES = {
+    "RNA": ("rna_virusidentification",),
+    "DNA": ("dna_virusidentification",),
+    "RNA+DNA": ("rna_virusidentification", "dna_virusidentification"),
+}
+WORKFLOW2_FETCH_RULES = (
+    "coverage_calc",
+    "fetch_contigs",
+    "fetch_proteins",
+)
+WORKFLOW2_EVIDENCE_RULES = (
+    "mmseqs_nuclclust",
+    "fetch_nuclrep_prot",
+    "mmseqs_aaclust",
+    "cluster_summarize",
+    "checkv",
+    "megablast_nt",
+    "blastx_nr",
+    "blastx_vhdb",
+    "hmmsearch_rdrpscan",
+    "parse_blastresult",
+)
+WORKFLOW2_SUMMARY_RULES = (
+    "summarize_tables",
+    "summarize_sequences",
+)
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -46,6 +78,7 @@ class ExecutionSpecError(ValueError):
 @dataclass(frozen=True)
 class AdapterSettings:
     workflow1_source: Path
+    workflow2_source: Path
     snakemake: str
     seqkit: str
     cores: int
@@ -57,6 +90,12 @@ class AdapterSettings:
                 os.getenv(
                     "BIOAGENT_WORKFLOW1_SOURCE",
                     "/data/user/guojindan/Projects/Workflows/workflow1_upstream",
+                )
+            ),
+            workflow2_source=Path(
+                os.getenv(
+                    "BIOAGENT_WORKFLOW2_SOURCE",
+                    "/data/user/guojindan/Projects/Workflows/workflow2_virusid_2026db",
                 )
             ),
             snakemake=os.getenv(
@@ -72,10 +111,19 @@ class AdapterSettings:
 
 
 @dataclass(frozen=True)
-class PreparedExecution:
+class PreparedPhase:
+    id: str
     workflow_id: str
     workflow_dir: Path
+    results_dir: Path
     command: list[str]
+    selected_rules: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedExecution:
+    workflow_id: str
+    phases: tuple[PreparedPhase, ...]
     seqkit: str
     selected_rules: tuple[str, ...]
 
@@ -92,30 +140,16 @@ def _absolute_path(value: Any, field: str) -> str:
     return value
 
 
-def normalize_execution_spec(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ExecutionSpecError("missing execution_spec")
-    if raw.get("adapter") != "workflow1":
-        raise ExecutionSpecError("unsupported workflow adapter")
-
-    entry_rule = raw.get("entry_rule")
-    exit_rule = raw.get("exit_rule")
-    if entry_rule not in WORKFLOW1_RULES or exit_rule not in WORKFLOW1_RULES:
-        raise ExecutionSpecError("unsupported workflow1 rule boundary")
-    if WORKFLOW1_RULES.index(entry_rule) > WORKFLOW1_RULES.index(exit_rule):
-        raise ExecutionSpecError("entry_rule must not follow exit_rule")
-
-    inputs = raw.get("inputs")
-    if not isinstance(inputs, list) or len(inputs) != 1:
-        raise ExecutionSpecError("workflow1 requires exactly one typed input")
-    raw_input = inputs[0]
-    if not isinstance(raw_input, dict):
-        raise ExecutionSpecError("execution input must be an object")
-
+def _normalize_records(
+    raw_input: dict[str, Any],
+    *,
+    expected_type: str,
+    collection_name: str,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
     input_id = _required_id(raw_input.get("id"), "input.id")
-    expected_type, collection_name, fields = WORKFLOW1_INPUTS[entry_rule]
     if raw_input.get("type") != expected_type:
-        raise ExecutionSpecError(f"{entry_rule} requires input type {expected_type}")
+        raise ExecutionSpecError(f"execution input must have type {expected_type}")
     data = raw_input.get("data")
     records = data.get(collection_name) if isinstance(data, dict) else None
     if not isinstance(records, list) or not records:
@@ -143,23 +177,122 @@ def normalize_execution_spec(raw: Any) -> dict[str, Any]:
         normalized_records.append(normalized)
 
     return {
-        "adapter": "workflow1",
-        "entry_rule": entry_rule,
-        "exit_rule": exit_rule,
-        "inputs": [
-            {
-                "id": input_id,
-                "type": expected_type,
-                "data": {collection_name: normalized_records},
-            }
-        ],
+        "id": input_id,
+        "type": expected_type,
+        "data": {collection_name: normalized_records},
     }
 
 
+def _normalize_workflow1(raw: dict[str, Any]) -> dict[str, Any]:
+    entry_rule = raw.get("entry_rule")
+    exit_rule = raw.get("exit_rule")
+    if entry_rule not in WORKFLOW1_RULES or exit_rule not in WORKFLOW1_RULES:
+        raise ExecutionSpecError("unsupported workflow1 rule boundary")
+    if WORKFLOW1_RULES.index(entry_rule) > WORKFLOW1_RULES.index(exit_rule):
+        raise ExecutionSpecError("entry_rule must not follow exit_rule")
+
+    inputs = raw.get("inputs")
+    if not isinstance(inputs, list) or len(inputs) != 1:
+        raise ExecutionSpecError("workflow1 requires exactly one typed input")
+    raw_input = inputs[0]
+    if not isinstance(raw_input, dict):
+        raise ExecutionSpecError("execution input must be an object")
+    expected_type, collection_name, fields = WORKFLOW1_INPUTS[entry_rule]
+    normalized_input = _normalize_records(
+        raw_input,
+        expected_type=expected_type,
+        collection_name=collection_name,
+        fields=fields,
+    )
+    return {
+        "adapter": "workflow1",
+        "entry_rule": entry_rule,
+        "exit_rule": exit_rule,
+        "inputs": [normalized_input],
+    }
+
+
+def _normalize_virus_classification(raw: dict[str, Any]) -> dict[str, Any]:
+    viral_type = raw.get("viral_type", "RNA+DNA")
+    if viral_type not in WORKFLOW2_CANDIDATE_RULES:
+        raise ExecutionSpecError("viral_type must be RNA, DNA, or RNA+DNA")
+    inputs = raw.get("inputs")
+    if not isinstance(inputs, list) or len(inputs) != 1:
+        raise ExecutionSpecError(
+            "virus_classification requires exactly one typed input"
+        )
+    raw_input = inputs[0]
+    if not isinstance(raw_input, dict):
+        raise ExecutionSpecError("execution input must be an object")
+
+    input_type = raw_input.get("type")
+    if input_type == "raw_paired_reads":
+        normalized_input = _normalize_records(
+            raw_input,
+            expected_type="raw_paired_reads",
+            collection_name="runs",
+            fields=("run_id", "sample_id", "read1", "read2"),
+        )
+    elif input_type == "contigs_fasta":
+        normalized_input = _normalize_records(
+            raw_input,
+            expected_type="contigs_fasta",
+            collection_name="samples",
+            fields=("sample_id", "path"),
+        )
+    else:
+        raise ExecutionSpecError(
+            "virus_classification requires raw_paired_reads or contigs_fasta"
+        )
+    return {
+        "adapter": "virus_classification",
+        "viral_type": viral_type,
+        "inputs": [normalized_input],
+    }
+
+
+def normalize_execution_spec(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ExecutionSpecError("missing execution_spec")
+    adapter = raw.get("adapter")
+    if adapter == "workflow1":
+        return _normalize_workflow1(raw)
+    if adapter == "virus_classification":
+        return _normalize_virus_classification(raw)
+    raise ExecutionSpecError("unsupported workflow adapter")
+
+
+def _workflow2_rules(
+    viral_type: str, *, rename_contigs: bool = True
+) -> tuple[str, ...]:
+    return (
+        *(
+            WORKFLOW2_PREPROCESS_RULES
+            if rename_contigs
+            else WORKFLOW2_PREPROCESS_RULES[1:]
+        ),
+        *WORKFLOW2_CANDIDATE_RULES[viral_type],
+        *WORKFLOW2_FETCH_RULES,
+        *WORKFLOW2_EVIDENCE_RULES,
+        *WORKFLOW2_SUMMARY_RULES,
+    )
+
+
 def selected_rules(spec: dict[str, Any]) -> tuple[str, ...]:
-    entry_index = WORKFLOW1_RULES.index(spec["entry_rule"])
-    exit_index = WORKFLOW1_RULES.index(spec["exit_rule"])
-    return WORKFLOW1_RULES[entry_index : exit_index + 1]
+    if spec["adapter"] == "workflow1":
+        entry_index = WORKFLOW1_RULES.index(spec["entry_rule"])
+        exit_index = WORKFLOW1_RULES.index(spec["exit_rule"])
+        return WORKFLOW1_RULES[entry_index : exit_index + 1]
+    upstream = (
+        WORKFLOW1_RULES if spec["inputs"][0]["type"] == "raw_paired_reads" else ()
+    )
+    return (
+        *upstream,
+        *_workflow2_rules(
+            spec["viral_type"],
+            rename_contigs=spec["inputs"][0]["type"] == "contigs_fasta",
+        ),
+    )
 
 
 def validate_plan_rules(
@@ -174,7 +307,7 @@ def validate_plan_rules(
     expected = selected_rules(spec)
     if planned_rules != expected:
         raise ExecutionSpecError(
-            "steps[].rules must exactly match the selected workflow segment"
+            "steps[].rules must exactly match the selected execution flow"
         )
     return expected
 
@@ -193,6 +326,7 @@ def _copy_workflow(source: Path, destination: Path) -> None:
             "logs",
             "results",
             "example",
+            "test",
             "__pycache__",
         ),
     )
@@ -200,7 +334,12 @@ def _copy_workflow(source: Path, destination: Path) -> None:
 
 def _input_records(spec: dict[str, Any]) -> list[dict[str, str]]:
     data = spec["inputs"][0]["data"]
-    collection_name = WORKFLOW1_INPUTS[spec["entry_rule"]][1]
+    if spec["adapter"] == "workflow1":
+        collection_name = WORKFLOW1_INPUTS[spec["entry_rule"]][1]
+    else:
+        collection_name = (
+            "runs" if spec["inputs"][0]["type"] == "raw_paired_reads" else "samples"
+        )
     return data[collection_name]
 
 
@@ -218,9 +357,10 @@ def _link(source: Path, destination: Path) -> None:
 
 def _placeholder(results_dir: Path, destination: Path) -> None:
     source = (
-        results_dir.parent
+        results_dir.parent.parent
         / ".bioagent"
         / "staged-inputs"
+        / results_dir.name
         / destination.relative_to(results_dir)
     )
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -248,14 +388,8 @@ def _prepare_workflow1_inputs(
             sample_lines.append(f"{run_id} {sample_id} {read1} {read2}")
             if entry_rule == "bowtie2":
                 root = results_dir / "filter" / run_id
-                _link(
-                    read1,
-                    root / "01_fastp_r1.fq.gz",
-                )
-                _link(
-                    read2,
-                    root / "01_fastp_r2.fq.gz",
-                )
+                _link(read1, root / "01_fastp_r1.fq.gz")
+                _link(read2, root / "01_fastp_r2.fq.gz")
                 for name in (
                     "01_fastp_r1.fq.stat.txt",
                     "01_fastp_r2.fq.stat.txt",
@@ -265,14 +399,8 @@ def _prepare_workflow1_inputs(
                     _placeholder(results_dir, root / name)
             elif entry_rule == "merge":
                 root = results_dir / "filter" / run_id
-                _link(
-                    read1,
-                    root / "cleanreads_r1.fq.gz",
-                )
-                _link(
-                    read2,
-                    root / "cleanreads_r2.fq.gz",
-                )
+                _link(read1, root / "cleanreads_r1.fq.gz")
+                _link(read2, root / "cleanreads_r2.fq.gz")
                 _placeholder(results_dir, root / "cleanreads_r1.fq.stat.txt")
                 _placeholder(results_dir, root / "cleanreads_r2.fq.stat.txt")
     elif entry_rule == "megahit":
@@ -283,15 +411,9 @@ def _prepare_workflow1_inputs(
             run_ids.append(sample_id)
             sample_ids.append(sample_id)
             sample_lines.append(f"{sample_id} {sample_id} {read1} {read2}")
-            _link(
-                read1,
-                results_dir / "merge" / sample_id / "cleanreads_r1.fq",
-            )
-            _link(
-                read2,
-                results_dir / "merge" / sample_id / "cleanreads_r2.fq",
-            )
             root = results_dir / "merge" / sample_id
+            _link(read1, root / "cleanreads_r1.fq")
+            _link(read2, root / "cleanreads_r2.fq")
             _placeholder(results_dir, root / "cleanreads_r1.fq.stat.txt")
             _placeholder(results_dir, root / "cleanreads_r2.fq.stat.txt")
     else:
@@ -301,13 +423,11 @@ def _prepare_workflow1_inputs(
             run_ids.append(sample_id)
             sample_ids.append(sample_id)
             sample_lines.append(f"{sample_id} {sample_id} {contigs} {contigs}")
-            _link(
-                contigs,
-                results_dir / "assembly" / sample_id / f"{sample_id}.contigs.fa",
-            )
+            root = results_dir / "assembly" / sample_id
+            _link(contigs, root / f"{sample_id}.contigs.fa")
             _placeholder(
                 results_dir,
-                results_dir / "assembly" / sample_id / f"{sample_id}.contigs.stat.txt",
+                root / f"{sample_id}.contigs.stat.txt",
             )
 
     samples_path = workflow_dir / "data" / "samples.txt"
@@ -389,33 +509,16 @@ def _workflow1_targets(
     return [str(path) for path in targets]
 
 
-def prepare_execution(
-    state: dict[str, Any],
-    settings: AdapterSettings | None = None,
-) -> PreparedExecution:
-    settings = settings or AdapterSettings.from_env()
-    spec = normalize_execution_spec(state.get("execution_spec"))
-    validate_plan_rules(spec, state.get("steps") or [])
-
-    run_dir = Path(state["run_dir"]).resolve()
-    workflow_dir = run_dir / "workflow"
-    results_dir = run_dir / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _copy_workflow(settings.workflow1_source, workflow_dir)
-    run_ids, sample_ids = _prepare_workflow1_inputs(
-        spec,
-        workflow_dir,
-        results_dir,
-    )
-    config_path = _rewrite_workflow1_config(workflow_dir, results_dir)
-    targets = _workflow1_targets(
-        spec["exit_rule"],
-        results_dir,
-        run_ids,
-        sample_ids,
-    )
-    command = [
+def _snakemake_command(
+    settings: AdapterSettings,
+    *,
+    run_dir: Path,
+    phase_id: str,
+    workflow_dir: Path,
+    config_path: Path,
+    targets: list[str],
+) -> list[str]:
+    return [
         settings.snakemake,
         "--directory",
         str(workflow_dir),
@@ -426,15 +529,203 @@ def prepare_execution(
         "--cores",
         str(settings.cores),
         "--runtime-source-cache-path",
-        str(run_dir / ".bioagent" / "snakemake-source-cache"),
+        str(run_dir / ".bioagent" / "snakemake-source-cache" / phase_id),
         "--printshellcmds",
         "--benchmark-extended",
         *targets,
     ]
-    return PreparedExecution(
+
+
+def _prepare_workflow1_phase(
+    spec: dict[str, Any],
+    settings: AdapterSettings,
+    run_dir: Path,
+    *,
+    phase_id: str = "upstream",
+) -> tuple[PreparedPhase, list[str]]:
+    workflow_dir = run_dir / "workflows" / phase_id
+    results_dir = run_dir / "results" / phase_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _copy_workflow(settings.workflow1_source, workflow_dir)
+    run_ids, sample_ids = _prepare_workflow1_inputs(spec, workflow_dir, results_dir)
+    config_path = _rewrite_workflow1_config(workflow_dir, results_dir)
+    targets = _workflow1_targets(
+        spec["exit_rule"],
+        results_dir,
+        run_ids,
+        sample_ids,
+    )
+    phase = PreparedPhase(
+        id=phase_id,
         workflow_id="workflow1",
         workflow_dir=workflow_dir,
-        command=command,
-        seqkit=settings.seqkit,
+        results_dir=results_dir,
+        command=_snakemake_command(
+            settings,
+            run_dir=run_dir,
+            phase_id=phase_id,
+            workflow_dir=workflow_dir,
+            config_path=config_path,
+            targets=targets,
+        ),
         selected_rules=selected_rules(spec),
+    )
+    return phase, sample_ids
+
+
+def _rewrite_workflow2_config(
+    workflow_dir: Path,
+    results_dir: Path,
+    *,
+    viral_type: str,
+    rename_contigs: bool,
+) -> Path:
+    config_path = workflow_dir / "config" / "config.yaml"
+    replacements = {
+        "input_list:": f'input_list: "{workflow_dir / "data" / "contigs_list.txt"}"',
+        "wdir:": f'wdir: "{results_dir}"',
+        "SEARCH_VIRALTYPE:": f'SEARCH_VIRALTYPE: "{viral_type}"',
+        "RNA_SEARCHMODE:": 'RNA_SEARCHMODE: "fast"',
+        "ITERATION_TIME:": "ITERATION_TIME: 5",
+        "RENAME_CONTIGS:": f"RENAME_CONTIGS: {str(rename_contigs).lower()}",
+    }
+    script_names = {
+        "iterhmmsearch": "iterativehmmsearch.py",
+        "coverage_summarize": "parse_iterhmmresult.py",
+        "cluster_summarize": "cluster_summarize.py",
+        "blast_summarize": "parse_blastresult.py",
+        "table_summarize": "table_summarize.py",
+    }
+    lines = []
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        replacement = next(
+            (value for key, value in replacements.items() if line.startswith(key)),
+            None,
+        )
+        if replacement is not None:
+            lines.append(replacement)
+            continue
+        key = stripped.split(":", 1)[0] if ":" in stripped else ""
+        if key in script_names:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(
+                f'{indent}{key}: "{workflow_dir / "scripts" / script_names[key]}"'
+            )
+        else:
+            lines.append(line)
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config_path
+
+
+def _prepare_workflow2_phase(
+    spec: dict[str, Any],
+    settings: AdapterSettings,
+    run_dir: Path,
+    *,
+    upstream_results: Path | None = None,
+    upstream_sample_ids: list[str] | None = None,
+) -> PreparedPhase:
+    phase_id = "classification"
+    workflow_dir = run_dir / "workflows" / phase_id
+    results_dir = run_dir / "results" / phase_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _copy_workflow(settings.workflow2_source, workflow_dir)
+
+    input_path = workflow_dir / "data" / "contigs_list.txt"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    if upstream_results is not None:
+        sample_ids = upstream_sample_ids or []
+        lines = [
+            str(
+                upstream_results
+                / "assembly"
+                / sample_id
+                / f"{sample_id}.contigs.1kb.renamed.fa"
+            )
+            for sample_id in sample_ids
+        ]
+        rename_contigs = False
+    else:
+        lines = [
+            f"{record['sample_id']} {_source(record['path'])}"
+            for record in _input_records(spec)
+        ]
+        rename_contigs = True
+    input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    config_path = _rewrite_workflow2_config(
+        workflow_dir,
+        results_dir,
+        viral_type=spec["viral_type"],
+        rename_contigs=rename_contigs,
+    )
+    targets = [
+        str(results_dir / "summary" / "sequences" / "rep_vert_viruses.fna"),
+        str(results_dir / "summary" / "sequences" / "vert_viruses.fna"),
+    ]
+    return PreparedPhase(
+        id=phase_id,
+        workflow_id="workflow2",
+        workflow_dir=workflow_dir,
+        results_dir=results_dir,
+        command=_snakemake_command(
+            settings,
+            run_dir=run_dir,
+            phase_id=phase_id,
+            workflow_dir=workflow_dir,
+            config_path=config_path,
+            targets=targets,
+        ),
+        selected_rules=_workflow2_rules(
+            spec["viral_type"],
+            rename_contigs=rename_contigs,
+        ),
+    )
+
+
+def prepare_execution(
+    state: dict[str, Any],
+    settings: AdapterSettings | None = None,
+) -> PreparedExecution:
+    settings = settings or AdapterSettings.from_env()
+    spec = normalize_execution_spec(state.get("execution_spec"))
+    expected_rules = validate_plan_rules(spec, state.get("steps") or [])
+    run_dir = Path(state["run_dir"]).resolve()
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    if spec["adapter"] == "workflow1":
+        phase, _sample_ids = _prepare_workflow1_phase(spec, settings, run_dir)
+        phases = (phase,)
+        workflow_id = "workflow1"
+    elif spec["inputs"][0]["type"] == "raw_paired_reads":
+        upstream_spec = {
+            "adapter": "workflow1",
+            "entry_rule": "fastp",
+            "exit_rule": "rename_filter",
+            "inputs": spec["inputs"],
+        }
+        upstream, sample_ids = _prepare_workflow1_phase(
+            upstream_spec,
+            settings,
+            run_dir,
+        )
+        classification = _prepare_workflow2_phase(
+            spec,
+            settings,
+            run_dir,
+            upstream_results=upstream.results_dir,
+            upstream_sample_ids=sample_ids,
+        )
+        phases = (upstream, classification)
+        workflow_id = "virus_classification"
+    else:
+        phases = (_prepare_workflow2_phase(spec, settings, run_dir),)
+        workflow_id = "virus_classification"
+
+    return PreparedExecution(
+        workflow_id=workflow_id,
+        phases=phases,
+        seqkit=settings.seqkit,
+        selected_rules=expected_rules,
     )

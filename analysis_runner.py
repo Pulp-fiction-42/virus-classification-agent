@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
 import re
 import shlex
 import signal
@@ -16,6 +18,7 @@ from typing import Any
 from workflow_adapters import (
     AdapterSettings,
     PreparedExecution,
+    PreparedPhase,
     WORKFLOW1_RULES,
     prepare_execution,
 )
@@ -104,8 +107,8 @@ def redact_value(value: Any, key: str = "") -> Any:
 
 def _read_state(path: Path) -> dict[str, Any]:
     state = json.loads(path.read_text(encoding="utf-8"))
-    if state.get("version") != 2:
-        raise ValueError("analysis runner requires state version 2")
+    if state.get("version") != 3:
+        raise ValueError("analysis runner requires state version 3")
     return state
 
 
@@ -158,20 +161,150 @@ def _instrument_workflow1(workflow_dir: Path, benchmark_dir: Path) -> None:
     rules_path.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
+def _instrument_workflow2(workflow_dir: Path, benchmark_dir: Path) -> None:
+    wildcard_rules = {"rename_contigs": "part", "get_orfs": "part"}
+    for rules_path in sorted((workflow_dir / "rules").glob("*.smk")):
+        lines = rules_path.read_text(encoding="utf-8").splitlines()
+        output: list[str] = []
+        current_rule: str | None = None
+        current_has_benchmark = False
+        for line in lines:
+            if match := re.match(r"^rule\s+([A-Za-z0-9_]+):", line):
+                current_rule = match.group(1)
+                current_has_benchmark = False
+            elif current_rule and line.lstrip().startswith("benchmark:"):
+                current_has_benchmark = True
+            if (
+                current_rule
+                and line.lstrip().startswith("shell:")
+                and not current_has_benchmark
+            ):
+                wildcard = wildcard_rules.get(current_rule)
+                suffix = f".{{{wildcard}}}" if wildcard else ""
+                output.extend(
+                    [
+                        f"{line[: len(line) - len(line.lstrip())]}benchmark:",
+                        (
+                            f'{line[: len(line) - len(line.lstrip())]}    "'
+                            f"{benchmark_dir / f'{current_rule}{suffix}.jsonl'}"
+                            '"'
+                        ),
+                    ]
+                )
+                current_has_benchmark = True
+            output.append(line)
+        rules_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+    iterative_path = workflow_dir / "scripts" / "iterativehmmsearch.py"
+    iterative_text = iterative_path.read_text(encoding="utf-8")
+    helper_marker = "\ndef iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):\n"
+    helper = """
+def finish_empty_search(wdir, current_iteration, iteration_num):
+    for iteration in range(current_iteration + 1, iteration_num + 1):
+        iteration_dir = os.path.join(wdir, 'Iteration_%d' % iteration)
+        os.makedirs(iteration_dir, exist_ok=True)
+        open(os.path.join(iteration_dir, 'hmmsearch.domtblout'), 'a').close()
+
+
+def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
+"""
+    if helper_marker not in iterative_text:
+        raise ValueError("workflow2 iterative search could not be instrumented")
+    iterative_text = iterative_text.replace(helper_marker, "\n" + helper, 1)
+
+    hit_marker = (
+        "        sys.stderr.write(curtime()+'[INFO] hmmsearch done, %s sequences "
+        "hit (Time Elapsed: %.3fs)\\n' % (num_hitseq, _t3-_t2))\n"
+    )
+    hit_exit = (
+        hit_marker
+        + """
+        if int(num_hitseq) == 0:
+            finish_empty_search(wdir, i, iteration_num)
+            sys.stderr.write(curtime()+'[INFO] No sequences hit; search finished with an empty result\\n')
+            return
+"""
+    )
+    if hit_marker not in iterative_text:
+        raise ValueError("workflow2 empty HMM result could not be instrumented")
+    iterative_text = iterative_text.replace(hit_marker, hit_exit, 1)
+
+    filtered_marker = (
+        '        sys.stderr.write(curtime()+"[INFO] %d sequences covered >%d%% '
+        'RdRp motif region (Time Elapsed: %.3fs)\\n" % '
+        "(num_filtered, int(100*motifcov), _t5-_t4))\n"
+    )
+    filtered_exit = (
+        filtered_marker
+        + """
+        if num_filtered == 0:
+            finish_empty_search(wdir, i, iteration_num)
+            sys.stderr.write(curtime()+'[INFO] No sequences passed motif coverage; search finished with an empty result\\n')
+            return
+"""
+    )
+    if filtered_marker not in iterative_text:
+        raise ValueError("workflow2 empty motif result could not be instrumented")
+    iterative_text = iterative_text.replace(filtered_marker, filtered_exit, 1)
+    iterative_path.write_text(iterative_text, encoding="utf-8")
+
+    script_path = workflow_dir / "scripts" / "table_summarize.py"
+    script_path.write_text(
+        script_path.read_text(encoding="utf-8")
+        + """
+
+truepos_viruses.to_csv('summary/tables/virus_candidates.csv', index=False)
+truepos_viruses.sort_values('qlen', ascending=False).drop_duplicates(
+    'clusid', keep='first'
+).to_csv('summary/tables/virus_representatives.csv', index=False)
+truepos_vert_viruses.to_csv(
+    'summary/tables/vertebrate_virus_candidates.csv', index=False
+)
+truepos_vert_viruses_rep.to_csv(
+    'summary/tables/vertebrate_virus_representatives.csv', index=False
+)
+""",
+        encoding="utf-8",
+    )
+
+    summarize_path = workflow_dir / "rules" / "summarize.smk"
+    summarize_text = summarize_path.read_text(encoding="utf-8")
+    marker = "\t\tvertvirus_seqid = os.path.join("
+    addition = (
+        "\t\tvirus_candidates_csv = os.path.join(config['wdir'], "
+        "'summary/tables/virus_candidates.csv'),\n"
+        "\t\tvirus_representatives_csv = os.path.join(config['wdir'], "
+        "'summary/tables/virus_representatives.csv'),\n"
+        "\t\tvertebrate_candidates_csv = os.path.join(config['wdir'], "
+        "'summary/tables/vertebrate_virus_candidates.csv'),\n"
+        "\t\tvertebrate_representatives_csv = os.path.join(config['wdir'], "
+        "'summary/tables/vertebrate_virus_representatives.csv'),\n"
+    )
+    index = summarize_text.find(marker)
+    if index < 0:
+        raise ValueError("workflow2 summarize outputs could not be instrumented")
+    summarize_text = summarize_text[:index] + addition + summarize_text[index:]
+    summarize_path.write_text(summarize_text, encoding="utf-8")
+
+
 def _sample_paths(workflow_dir: Path) -> list[Path]:
-    samples_path = workflow_dir / "data" / "samples.txt"
-    if not samples_path.is_file():
-        return []
     paths: list[Path] = []
-    for raw_line in samples_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+    for samples_path in (
+        workflow_dir / "data" / "samples.txt",
+        workflow_dir / "data" / "contigs_list.txt",
+    ):
+        if not samples_path.is_file():
             continue
-        fields = line.split()
-        for value in fields[-2:]:
-            path = Path(value)
-            if path.is_absolute() and path.is_file() and path not in paths:
-                paths.append(path)
+        for raw_line in samples_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            values = fields[-2:] if samples_path.name == "samples.txt" else fields[-1:]
+            for value in values:
+                path = Path(value)
+                if path.is_absolute() and path.is_file() and path not in paths:
+                    paths.append(path)
     return paths
 
 
@@ -254,24 +387,37 @@ def _parse_seqkit_table(path: Path, source: str) -> list[dict[str, Any]]:
     return records
 
 
-def _parse_benchmarks(benchmark_dir: Path) -> list[dict[str, Any]]:
+def _parse_benchmarks(
+    benchmark_dir: Path, phase: str | None = None
+) -> list[dict[str, Any]]:
+    def normalize(value: Any) -> Any:
+        if value == "NA":
+            return None
+        if isinstance(value, dict):
+            return {key: normalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
     jobs = []
     for path in sorted(benchmark_dir.glob("*.jsonl")):
         try:
             for line in path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
-                record = redact_value(json.loads(line))
+                record = redact_value(normalize(json.loads(line)))
                 if not isinstance(record, dict):
                     continue
                 record["benchmark_file"] = str(path)
+                if phase:
+                    record["phase"] = phase
                 jobs.append(record)
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
     return jobs
 
 
-def _parse_log(log_path: Path) -> dict[str, Any]:
+def _parse_log(log_path: Path, phase: str | None = None) -> dict[str, Any]:
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -302,12 +448,20 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
                 "rule": pending_rule,
                 "started_at": current_timestamp,
                 "status": "running",
+                **({"phase": phase} if phase else {}),
             }
             jobs.append(pending_job)
             continue
         if pending_job and (match := re.match(r"jobid:\s*(\d+)", line)):
             pending_job["job_id"] = match.group(1)
             jobs_by_id[match.group(1)] = pending_job
+            continue
+        if pending_job and (match := re.match(r"(input|output):\s*(.*)", line)):
+            pending_job[f"{match.group(1)}s"] = [
+                redact_text(value.strip())
+                for value in match.group(2).split(",")
+                if value.strip()
+            ]
             continue
         if match := FINISHED_RE.search(line):
             job = jobs_by_id.get(match.group(1))
@@ -341,15 +495,31 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
                     "samtools",
                     "seqkit",
                     "megahit",
+                    "diamond",
+                    "mmseqs",
+                    "blastn",
+                    "blastx",
+                    "checkv",
+                    "hmmsearch",
+                    "getorf",
+                    "python",
                     "gunzip",
                     "sed ",
                 )
             )
-            and ("--" in line or "|" in line or line.startswith(("/", "cat ", "sed ")))
+            and (
+                "--" in line
+                or "|" in line
+                or line.startswith(("/", "cat ", "sed ", "cd ", "export "))
+            )
         ):
             command = redact_text(line)
             if command not in commands:
                 commands.append(command)
+            if pending_job:
+                pending_job.setdefault("commands", [])
+                if command not in pending_job["commands"]:
+                    pending_job["commands"].append(command)
 
     return {
         "jobs": jobs,
@@ -569,7 +739,7 @@ def _combine_fastp_reports(reports: list[dict[str, Any]]) -> dict[str, Any] | No
 
 def _bowtie_alignment_by_run(run_dir: Path) -> dict[str, float]:
     values: dict[str, float] = {}
-    for path in run_dir.glob("results/filter/*/bowtie2-summary.txt"):
+    for path in run_dir.glob("results/**/filter/*/bowtie2-summary.txt"):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -588,8 +758,19 @@ def _workflow1_report_data(
     rrna_alignment_percents: list[float] | None = None,
 ) -> dict[str, Any]:
     spec = state.get("execution_spec") or {}
+    if (
+        spec.get("adapter") == "virus_classification"
+        and ((spec.get("inputs") or [{}])[0]).get("type") == "raw_paired_reads"
+    ):
+        spec = {
+            "adapter": "workflow1",
+            "entry_rule": "fastp",
+            "exit_rule": "rename_filter",
+            "inputs": spec.get("inputs"),
+        }
     entry_rule = spec.get("entry_rule")
     exit_rule = spec.get("exit_rule")
+    upstream_results = run_dir / "results" / "upstream"
     selected = list(WORKFLOW1_RULES)[
         WORKFLOW1_RULES.index(entry_rule) : WORKFLOW1_RULES.index(exit_rule) + 1
     ]
@@ -693,8 +874,7 @@ def _workflow1_report_data(
                     for mate in (1, 2)
                     if (
                         value := metric(
-                            run_dir
-                            / "results"
+                            upstream_results
                             / "filter"
                             / run_id
                             / f"01_fastp_r{mate}.fq.gz"
@@ -722,8 +902,7 @@ def _workflow1_report_data(
                 for mate in (1, 2)
                 if (
                     value := metric(
-                        run_dir
-                        / "results"
+                        upstream_results
                         / "filter"
                         / run_id
                         / f"cleanreads_r{mate}.fq.gz"
@@ -780,8 +959,7 @@ def _workflow1_report_data(
                     for mate in (1, 2)
                     if (
                         value := metric(
-                            run_dir
-                            / "results"
+                            upstream_results
                             / "merge"
                             / sample_id
                             / f"cleanreads_r{mate}.fq"
@@ -795,8 +973,7 @@ def _workflow1_report_data(
                 [
                     value
                     for path in (
-                        run_dir
-                        / "results"
+                        upstream_results
                         / "assembly"
                         / sample_id
                         / f"{sample_id}.contigs.fa",
@@ -805,7 +982,7 @@ def _workflow1_report_data(
                 ]
             )
             assembly_record = metric(
-                run_dir / "results" / "assembly" / sample_id / f"{sample_id}.contigs.fa"
+                upstream_results / "assembly" / sample_id / f"{sample_id}.contigs.fa"
             )
             if sample.get("assembly") and assembly_record:
                 for key in ("n50", "q1", "median", "q3"):
@@ -835,6 +1012,158 @@ def _workflow1_report_data(
         "exit_rule": exit_rule,
         "stages": stages,
         "samples": samples,
+    }
+
+
+CLASSIFICATION_FIELDS = (
+    "qseqid",
+    "qlen",
+    "viral_type",
+    "checkv_quality",
+    "miuvig_quality",
+    "completeness",
+    "contamination",
+    "clusid",
+    "rdrpscan_svorder",
+    "nr_svorder",
+    "nr_svfamily",
+    "nr_svgenus",
+    "nr_sscinames",
+    "nr_besthit",
+    "nr_pident",
+    "nr_vote_vfamily",
+    "approval_rate",
+    "vhdb_svorder",
+    "vhdb_svfamily",
+    "vhdb_svname",
+)
+
+
+def _csv_value(value: str) -> Any:
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"nan", "none"} or normalized == "-":
+        return None
+    if normalized.lower() in {"true", "false"}:
+        return normalized.lower() == "true"
+    try:
+        number = float(normalized)
+    except ValueError:
+        return normalized
+    return int(number) if number.is_integer() else number
+
+
+def _read_csv_records(path: Path) -> list[dict[str, Any]]:
+    try:
+        with path.open(encoding="utf-8", newline="") as stream:
+            return [
+                {key: _csv_value(value) for key, value in row.items() if key}
+                for row in csv.DictReader(stream)
+            ]
+    except (OSError, UnicodeError, csv.Error):
+        return []
+
+
+def _classification_report_data(
+    state: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any]:
+    spec = state.get("execution_spec") or {}
+    input_data = (spec.get("inputs") or [{}])[0]
+    records = (
+        (input_data.get("data") or {}).get("runs")
+        or (input_data.get("data") or {}).get("samples")
+        or []
+    )
+    sample_ids = list(
+        dict.fromkeys(
+            str(record["sample_id"])
+            for record in records
+            if isinstance(record, dict) and record.get("sample_id")
+        )
+    )
+    sample_prefixes = sorted(sample_ids, key=len, reverse=True)
+    tables_dir = run_dir / "results" / "classification" / "summary" / "tables"
+    candidates = _read_csv_records(tables_dir / "virus_candidates.csv")
+    representatives = _read_csv_records(tables_dir / "virus_representatives.csv")
+    vertebrate_candidates = _read_csv_records(
+        tables_dir / "vertebrate_virus_candidates.csv"
+    )
+    vertebrate_representatives = _read_csv_records(
+        tables_dir / "vertebrate_virus_representatives.csv"
+    )
+
+    normalized_representatives = []
+    for record in representatives:
+        qseqid = str(record.get("qseqid") or "")
+        sample_id = next(
+            (
+                sample
+                for sample in sample_prefixes
+                if qseqid == sample or qseqid.startswith(f"{sample}-")
+            ),
+            None,
+        )
+        normalized_representatives.append(
+            {
+                **({"sample_id": sample_id} if sample_id else {}),
+                **{
+                    field: record.get(field)
+                    for field in CLASSIFICATION_FIELDS
+                    if record.get(field) is not None
+                },
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "viral_type": spec.get("viral_type"),
+        "input_type": input_data.get("type"),
+        "sample_ids": sample_ids,
+        "candidate_count": len(candidates),
+        "representative_count": len(representatives),
+        "vertebrate_candidate_count": len(vertebrate_candidates),
+        "vertebrate_representative_count": len(vertebrate_representatives),
+        "representatives": normalized_representatives,
+        "tables": {
+            "candidates": str(tables_dir / "virus_candidates.csv"),
+            "representatives": str(tables_dir / "virus_representatives.csv"),
+            "vertebrate_candidates": str(
+                tables_dir / "vertebrate_virus_candidates.csv"
+            ),
+            "vertebrate_representatives": str(
+                tables_dir / "vertebrate_virus_representatives.csv"
+            ),
+        },
+        "artifacts": {
+            "完整证据表（XLSX）": str(tables_dir / "fullinfo.xlsx"),
+            "病毒候选表（XLSX）": str(tables_dir / "viruses.xlsx"),
+            "脊椎动物病毒表（XLSX）": str(tables_dir / "vertebrate_viruses.xlsx"),
+            "病毒候选序列（FASTA）": str(
+                run_dir
+                / "results"
+                / "classification"
+                / "downstream"
+                / "sequences"
+                / "putative_viralcontigs"
+                / "putative_viralcontigs.fna"
+            ),
+            "脊椎动物病毒序列（FASTA）": str(
+                run_dir
+                / "results"
+                / "classification"
+                / "summary"
+                / "sequences"
+                / "vert_viruses.fna"
+            ),
+            "脊椎动物代表序列（FASTA）": str(
+                run_dir
+                / "results"
+                / "classification"
+                / "summary"
+                / "sequences"
+                / "rep_vert_viruses.fna"
+            ),
+        },
     }
 
 
@@ -901,7 +1230,7 @@ def _output_manifest(run_dir: Path) -> dict[str, Any]:
             or path.is_symlink()
             or ".snakemake" in path.parts
             or ".bioagent" in path.parts
-            or path.relative_to(run_dir).parts[0] == "workflow"
+            or path.relative_to(run_dir).parts[0] == "workflows"
         ):
             continue
         if len(files) >= 5000:
@@ -1041,7 +1370,9 @@ def _stage_records(
     jobs: list[dict[str, Any]],
     log_jobs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    logged = {(job.get("job_id"), job.get("rule")): job for job in log_jobs}
+    logged = {
+        (job.get("phase"), job.get("job_id"), job.get("rule")): job for job in log_jobs
+    }
     stages = []
     for step in state.get("steps", []):
         rules = set(step.get("rules") or [])
@@ -1050,17 +1381,27 @@ def _stage_records(
         cpu_time = sum(float(job.get("cpu_time") or 0) for job in benchmark_jobs)
         wall_seconds = sum(float(job.get("s") or 0) for job in benchmark_jobs)
         for job in benchmark_jobs:
-            log_job = logged.get((str(job.get("jobid")), job.get("rule_name")))
+            log_job = logged.get(
+                (
+                    job.get("phase"),
+                    str(job.get("jobid")),
+                    job.get("rule_name"),
+                )
+            )
             if log_job:
                 job.update(
                     {
                         "started_at": log_job.get("started_at"),
                         "finished_at": log_job.get("finished_at"),
                         "status": log_job.get("status"),
+                        "inputs": log_job.get("inputs", []),
+                        "outputs": log_job.get("outputs", []),
+                        "commands": log_job.get("commands", []),
                     }
                 )
         benchmark_keys = {
-            (str(job.get("jobid")), job.get("rule_name")) for job in benchmark_jobs
+            (job.get("phase"), str(job.get("jobid")), job.get("rule_name"))
+            for job in benchmark_jobs
         }
         combined_jobs = [
             *benchmark_jobs,
@@ -1068,12 +1409,21 @@ def _stage_records(
                 {
                     "jobid": job.get("job_id"),
                     "rule_name": job.get("rule"),
+                    "phase": job.get("phase"),
                     "started_at": job.get("started_at"),
                     "finished_at": job.get("finished_at"),
                     "status": job.get("status"),
+                    "inputs": job.get("inputs", []),
+                    "outputs": job.get("outputs", []),
+                    "commands": job.get("commands", []),
                 }
                 for job in stage_log_jobs
-                if (str(job.get("job_id")), job.get("rule")) not in benchmark_keys
+                if (
+                    job.get("phase"),
+                    str(job.get("job_id")),
+                    job.get("rule"),
+                )
+                not in benchmark_keys
             ],
         ]
         starts = [job["started_at"] for job in combined_jobs if job.get("started_at")]
@@ -1095,7 +1445,11 @@ def _stage_records(
                 "cpu_time_seconds": cpu_time,
                 "effective_cores": cpu_time / wall_seconds if wall_seconds else None,
                 "max_job_rss_mb": max(
-                    (float(job.get("max_rss") or 0) for job in benchmark_jobs),
+                    (
+                        float(job["max_rss"])
+                        for job in benchmark_jobs
+                        if isinstance(job.get("max_rss"), (int, float))
+                    ),
                     default=None,
                 ),
                 "started_at": min(starts) if starts else None,
@@ -1114,11 +1468,13 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("state path does not match run directory")
 
     bioagent_dir = run_dir / ".bioagent"
-    benchmark_dir = bioagent_dir / "benchmarks"
+    benchmark_root = bioagent_dir / "benchmarks"
+    phase_log_root = bioagent_dir / "phase-logs"
     telemetry_path = bioagent_dir / "telemetry.json"
     input_stats_path = bioagent_dir / "input-sequences.tsv"
     log_path = Path(state["execution"]["log"]).resolve()
-    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    benchmark_root.mkdir(parents=True, exist_ok=True)
+    phase_log_root.mkdir(parents=True, exist_ok=True)
 
     started_at = _now()
     state["execution"].update({"started_at": started_at, "status": "running"})
@@ -1127,12 +1483,13 @@ def run(args: argparse.Namespace) -> int:
     spec = state.get("execution_spec") or {}
     workflow_id = str(spec.get("adapter") or "unknown")
     telemetry: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "run_id": state.get("run_id"),
         "chat_id": state.get("openwebui_chat_id"),
         "workflow_id": workflow_id,
         "started_at": started_at,
-        "runner_command": [],
+        "runner_commands": [],
+        "phases": [],
         "input_collection": {},
         "stages": [],
         "commands": [],
@@ -1152,6 +1509,7 @@ def run(args: argparse.Namespace) -> int:
     process: subprocess.Popen[str] | None = None
     previous_handlers: dict[int, Any] = {}
     prepared: PreparedExecution | None = None
+    active_phase: PreparedPhase | None = None
     settings = AdapterSettings.from_env()
 
     def cancel(signum: int, _frame: Any) -> None:
@@ -1171,37 +1529,100 @@ def run(args: argparse.Namespace) -> int:
         prepared = prepare_execution(state, settings)
         workflow_id = prepared.workflow_id
         state["workflow_id"] = workflow_id
-        state["workflow_dir"] = str(prepared.workflow_dir)
+        state["phases"] = [
+            {
+                "id": phase.id,
+                "workflow_id": phase.workflow_id,
+                "workflow_dir": str(phase.workflow_dir),
+                "results_dir": str(phase.results_dir),
+                "status": "pending",
+            }
+            for phase in prepared.phases
+        ]
         state["execution_spec"] = spec
         _write_json_atomic(state_path, state)
         telemetry["workflow_id"] = workflow_id
-        _instrument_workflow1(prepared.workflow_dir, benchmark_dir)
+        for phase in prepared.phases:
+            phase_benchmarks = benchmark_root / phase.id
+            phase_benchmarks.mkdir(parents=True, exist_ok=True)
+            if phase.workflow_id == "workflow1":
+                _instrument_workflow1(phase.workflow_dir, phase_benchmarks)
+            else:
+                _instrument_workflow2(phase.workflow_dir, phase_benchmarks)
         telemetry["input_collection"] = _collect_input_stats(
             prepared.seqkit,
-            prepared.workflow_dir,
+            prepared.phases[0].workflow_dir,
             input_stats_path,
         )
-
-        command = prepared.command
-        telemetry["runner_command"] = [redact_text(value) for value in command]
+        telemetry["runner_commands"] = [
+            [redact_text(value) for value in phase.command] for phase in prepared.phases
+        ]
+        phase_environment = os.environ.copy()
+        tool_dir = str(Path(prepared.seqkit).resolve().parent)
+        phase_environment["PATH"] = os.pathsep.join(
+            [tool_dir, phase_environment.get("PATH", "")]
+        )
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w", encoding="utf-8") as log_file:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            assert process.stdout is not None
-            for line in process.stdout:
-                log_file.write(line)
+            for phase_index, phase in enumerate(prepared.phases):
+                active_phase = phase
+                phase_started_at = _now()
+                state["phases"][phase_index].update(
+                    {"status": "running", "started_at": phase_started_at}
+                )
+                _write_json_atomic(state_path, state)
+                phase_log_path = phase_log_root / f"{phase.id}.log"
+                header = f"\nBioAgent phase: {phase.id}\n"
+                log_file.write(header)
                 log_file.flush()
-                sys.stdout.write(line)
+                sys.stdout.write(header)
                 sys.stdout.flush()
-            process.stdout.close()
-            returncode = process.wait()
+                with phase_log_path.open("w", encoding="utf-8") as phase_log:
+                    process = subprocess.Popen(
+                        phase.command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        env=phase_environment,
+                    )
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        phase_log.write(line)
+                        phase_log.flush()
+                        log_file.write(line)
+                        log_file.flush()
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    process.stdout.close()
+                    returncode = process.wait()
+                phase_finished_at = _now()
+                phase_status = "completed" if returncode == 0 else "failed"
+                state["phases"][phase_index].update(
+                    {
+                        "status": phase_status,
+                        "returncode": returncode,
+                        "finished_at": phase_finished_at,
+                    }
+                )
+                telemetry["phases"].append(
+                    {
+                        "id": phase.id,
+                        "workflow_id": phase.workflow_id,
+                        "workflow_dir": str(phase.workflow_dir),
+                        "results_dir": str(phase.results_dir),
+                        "command": [redact_text(value) for value in phase.command],
+                        "status": phase_status,
+                        "returncode": returncode,
+                        "started_at": phase_started_at,
+                        "finished_at": phase_finished_at,
+                        "log": str(phase_log_path),
+                    }
+                )
+                _write_json_atomic(state_path, state)
+                if returncode != 0:
+                    break
     except Exception as exc:
         error = redact_text(str(exc))
         returncode = 128 + cancelled_signal if cancelled_signal else 1
@@ -1212,9 +1633,62 @@ def run(args: argparse.Namespace) -> int:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        if active_phase and not any(
+            phase.get("id") == active_phase.id for phase in telemetry["phases"]
+        ):
+            phase_status = "cancelled" if cancelled_signal else "failed"
+            phase_finished_at = _now()
+            for phase in state.get("phases", []):
+                if phase.get("id") == active_phase.id:
+                    phase.update(
+                        {
+                            "status": phase_status,
+                            "returncode": returncode,
+                            "finished_at": phase_finished_at,
+                            **({"error": error} if error else {}),
+                        }
+                    )
+            telemetry["phases"].append(
+                {
+                    "id": active_phase.id,
+                    "workflow_id": active_phase.workflow_id,
+                    "workflow_dir": str(active_phase.workflow_dir),
+                    "results_dir": str(active_phase.results_dir),
+                    "command": [redact_text(value) for value in active_phase.command],
+                    "status": phase_status,
+                    "returncode": returncode,
+                    "finished_at": phase_finished_at,
+                    **({"error": error} if error else {}),
+                }
+            )
     finally:
-        log_data = _parse_log(log_path)
-        benchmarks = _parse_benchmarks(benchmark_dir)
+        phase_log_data = []
+        benchmarks: list[dict[str, Any]] = []
+        if prepared:
+            for phase in prepared.phases:
+                phase_log_path = phase_log_root / f"{phase.id}.log"
+                phase_log_data.append(_parse_log(phase_log_path, phase.id))
+                benchmarks.extend(
+                    _parse_benchmarks(benchmark_root / phase.id, phase.id)
+                )
+        log_jobs = [job for data in phase_log_data for job in data.get("jobs", [])]
+        commands = list(
+            dict.fromkeys(
+                command
+                for data in phase_log_data
+                for command in data.get("commands", [])
+            )
+        )
+        logged_software = list(
+            dict.fromkeys(
+                item for data in phase_log_data for item in data.get("software", [])
+            )
+        )
+        rrna_alignment_percents = [
+            value
+            for data in phase_log_data
+            for value in data.get("rrna_alignment_percents", [])
+        ]
         telemetry["final_collection"] = _collect_final_stats(
             prepared.seqkit if prepared else settings.seqkit,
             run_dir,
@@ -1231,13 +1705,13 @@ def run(args: argparse.Namespace) -> int:
                     if cancelled_signal
                     else "failed"
                 ),
-                "commands": log_data["commands"],
-                "software": log_data["software"],
-                "rrna_alignment_percents": log_data["rrna_alignment_percents"],
+                "commands": commands,
+                "software": logged_software,
+                "rrna_alignment_percents": rrna_alignment_percents,
                 "sequence_metrics": _sequence_metrics(run_dir, input_stats_path),
                 "fastp": _parse_fastp(run_dir),
                 "manifest": _output_manifest(run_dir),
-                "stages": _stage_records(state, benchmarks, log_data["jobs"]),
+                "stages": _stage_records(state, benchmarks, log_jobs),
                 **({"error": error} if error else {}),
                 **({"cancelled_signal": cancelled_signal} if cancelled_signal else {}),
             }
@@ -1247,7 +1721,11 @@ def run(args: argparse.Namespace) -> int:
                 [
                     *telemetry["software"],
                     *_software_versions(
-                        telemetry["runner_command"],
+                        (
+                            telemetry["runner_commands"][0]
+                            if telemetry["runner_commands"]
+                            else []
+                        ),
                         telemetry["commands"],
                         prepared.seqkit if prepared else settings.seqkit,
                     ),
@@ -1352,21 +1830,50 @@ def run(args: argparse.Namespace) -> int:
             "status": "ready",
             "available": True,
             "telemetry": str(telemetry_path),
-            "telemetry_version": 2,
+            "telemetry_version": 3,
         }
         state["report"] = {
             "status": "ready" if returncode == 0 else "unavailable",
             "available": returncode == 0,
-            "schema_version": 1,
+            "schema_version": 2,
             "telemetry": str(telemetry_path),
         }
-        telemetry["delivery_report"] = _workflow1_report_data(
-            state,
-            run_dir,
-            telemetry["sequence_metrics"],
-            telemetry["fastp"],
-            telemetry["rrna_alignment_percents"],
-        )
+        if workflow_id == "workflow1":
+            telemetry["delivery_report"] = {
+                "schema_version": 2,
+                "kind": "upstream",
+                "stages": telemetry["stages"],
+                "upstream": _workflow1_report_data(
+                    state,
+                    run_dir,
+                    telemetry["sequence_metrics"],
+                    telemetry["fastp"],
+                    telemetry["rrna_alignment_percents"],
+                ),
+            }
+        else:
+            has_upstream = (
+                ((spec.get("inputs") or [{}])[0]).get("type") == "raw_paired_reads"
+            )
+            telemetry["delivery_report"] = {
+                "schema_version": 2,
+                "kind": "virus_classification",
+                "stages": telemetry["stages"],
+                **(
+                    {
+                        "upstream": _workflow1_report_data(
+                            state,
+                            run_dir,
+                            telemetry["sequence_metrics"],
+                            telemetry["fastp"],
+                            telemetry["rrna_alignment_percents"],
+                        )
+                    }
+                    if has_upstream
+                    else {}
+                ),
+                "classification": _classification_report_data(state, run_dir),
+            }
         _write_json_atomic(telemetry_path, telemetry)
         _write_json_atomic(state_path, state)
         for signum, handler in previous_handlers.items():

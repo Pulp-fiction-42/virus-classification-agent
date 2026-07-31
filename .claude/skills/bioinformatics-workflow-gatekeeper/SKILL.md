@@ -22,10 +22,9 @@ Only these workflows are in scope:
 
 Do not propose workflow7 or any other workflow. You may internally compose supported workflows in series when the user's request clearly requires multiple supported phases, but do not expose workflow IDs as the main user-facing plan.
 
-The deterministic execution adapter currently implements one contiguous
-workflow1 segment only. Plans for workflow2-workflow6 or composed workflows may
-be discussed, but must remain `ready_to_execute: false` until their adapters
-exist.
+The deterministic execution adapters support one contiguous workflow1 segment
+and end-to-end virus classification from either raw paired reads or contigs.
+Plans for workflow3-workflow6 remain non-executable until their adapters exist.
 
 ## Core rule
 
@@ -91,10 +90,19 @@ Requirements:
 - `execution_spec` is required for an executable plan. Its adapter owns input validation, run-local configuration, prerequisite materialization, and concrete targets.
 - The workflow1 adapter accepts one contiguous segment delimited by `entry_rule` and `exit_rule`. The flattened `steps[].rules` must exactly equal that segment; the segment may start at any workflow1 rule.
 - Workflow1 entry types are `raw_paired_reads` for fastp, `fastp_paired_reads` for bowtie2, `clean_paired_reads` for merge, `merged_paired_reads` for megahit, and `contigs_fasta` for rename_filter.
+- The `virus_classification` adapter accepts `raw_paired_reads` or `contigs_fasta`. Raw reads run full preprocessing before classification; contigs begin at classification.
+- Default `viral_type` to `RNA+DNA`; use `RNA` or `DNA` only when the user explicitly narrows the scope.
+- Represent classification as a linear flow using these exact rule groups:
+  1. 序列预处理: raw reads use `get_orfs`, `merge_orfs`, `merge_contigs` because upstream contigs are already renamed; direct contigs use `rename_contigs`, `get_orfs`, `merge_orfs`, `merge_contigs`
+  2. 病毒候选搜索: `rna_virusidentification` and/or `dna_virusidentification`
+  3. 候选序列提取: `coverage_calc`, `fetch_contigs`, `fetch_proteins`
+  4. 分类证据分析: `mmseqs_nuclclust`, `fetch_nuclrep_prot`, `mmseqs_aaclust`, `cluster_summarize`, `checkv`, `megablast_nt`, `blastx_nr`, `blastx_vhdb`, `hmmsearch_rdrpscan`, `parse_blastresult`
+  5. 结果汇总: `summarize_tables`, `summarize_sequences`
+- For raw-read classification, prepend `fastp`, `bowtie2`, `merge`, then a combined `megahit`, `rename_filter` step. Do not expose the internal workflow boundary or parallel evidence branches.
 - Typed input data is adapter-specific and every file path must be absolute. Never invent file paths.
 - Use the selected workflow's existing tool flags, databases, presets, and thresholds as defaults. These technical choices are not user requirements and must not make an otherwise executable plan unready.
 - Set `ready_to_execute` to `true` once the supported analysis goal, input files, and required sample relationships are clear. Set it to `false` only when one of those user-level facts is missing or ambiguous, and ask for that information in plain language before the fenced block.
-- If the user adjusts requirements in natural language, translate the request into the run-local workflow configuration and output a complete updated scheme, not a partial diff. Reflect qualitative changes in the step labels and remove omitted stages from the step list.
+- If the user adjusts requirements in natural language, translate the request into the run-local workflow configuration and output a complete updated scheme, not a partial diff. Omit stages only when the selected adapter explicitly supports that entry or exit boundary.
 - Plan mode must not create run directories, write configs, run dry-runs, or execute Snakemake.
 - BioAgent plan mode is not Claude Code Plan Mode. Never call EnterPlanMode or ExitPlanMode and never write `.claude/sessions/plans` files; finish with the `analysis_plan` block.
 

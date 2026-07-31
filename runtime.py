@@ -875,7 +875,7 @@ class SessionManager:
             raise SessionStateError(f"分析方案执行区段无效：{exc}") from exc
 
         state = {
-            "version": 2,
+            "version": 3,
             "run_id": run.get("run_id"),
             "run_dir": str(run_dir),
             "openwebui_chat_id": chat_id,
@@ -906,13 +906,13 @@ class SessionManager:
                 "status": "collecting",
                 "available": False,
                 "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
-                "telemetry_version": 2,
+                "telemetry_version": 3,
                 "agent_trace": str(run_dir / ".bioagent" / "agent-trace.jsonl"),
             },
             "report": {
                 "status": "collecting",
                 "available": False,
-                "schema_version": 1,
+                "schema_version": 2,
                 "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
             },
         }
@@ -938,7 +938,7 @@ class SessionManager:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             state = {
-                "version": 2,
+                "version": 3,
                 "run_id": run.get("run_id"),
                 "run_dir": run.get("run_dir"),
                 "openwebui_chat_id": plan.get("openwebui_chat_id"),
@@ -976,12 +976,12 @@ class SessionManager:
             ),
             "status": "ready",
             "available": True,
-            "telemetry_version": 2,
+            "telemetry_version": 3,
         }
         state["report"] = {
             "status": "unavailable",
             "available": False,
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
         report_meta = state["technical_report"]
@@ -992,7 +992,7 @@ class SessionManager:
             self._write_json_atomic(
                 telemetry_path,
                 {
-                    "version": 2,
+                    "version": 3,
                     "run_id": state.get("run_id"),
                     "chat_id": state.get("openwebui_chat_id"),
                     "status": "failed",

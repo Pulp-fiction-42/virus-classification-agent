@@ -700,7 +700,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
         self.assertEqual(state["run_id"], plan["run"]["run_id"])
-        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["version"], 3)
         self.assertEqual(state["openwebui_chat_id"], self.chat_id)
         self.assertEqual(state["plan"]["title"], plan["title"])
         self.assertEqual(
@@ -950,8 +950,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"ready_to_execute"', config.SYSTEM_PROMPT)
         self.assertIn('"steps"', config.SYSTEM_PROMPT)
         self.assertIn('"execution_spec"', config.SYSTEM_PROMPT)
-        self.assertIn('"entry_rule"', config.SYSTEM_PROMPT)
-        self.assertIn('"exit_rule"', config.SYSTEM_PROMPT)
+        self.assertIn('"viral_type"', config.SYSTEM_PROMPT)
+        self.assertIn("workflow1 entry_rule and exit_rule", config.SYSTEM_PROMPT)
         self.assertIn("Do not create run directories", config.SYSTEM_PROMPT)
         self.assertIn("parameter defaults never block execution", config.SYSTEM_PROMPT)
         self.assertIn("final content in the response", config.SYSTEM_PROMPT)
