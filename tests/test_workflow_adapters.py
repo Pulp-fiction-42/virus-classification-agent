@@ -9,6 +9,7 @@ from workflow_adapters import (
     ExecutionSpecError,
     WORKFLOW1_RULES,
     normalize_execution_spec,
+    normalize_plan_execution_spec,
     prepare_execution,
     selected_rules,
     validate_plan_rules,
@@ -240,6 +241,51 @@ class WorkflowAdapterTests(unittest.TestCase):
         spec = normalize_execution_spec(self._workflow1_spec("bowtie2", "merge"))
         with self.assertRaises(ExecutionSpecError):
             validate_plan_rules(spec, [{"label": "跳过依赖", "rules": ["merge"]}])
+
+    def test_infers_missing_workflow1_boundaries_from_contiguous_plan_rules(self):
+        raw = self._workflow1_spec("merge", "megahit")
+        raw.pop("entry_rule")
+        raw.pop("exit_rule")
+        raw["viral_type"] = "RNA+DNA"
+        steps = [
+            {"label": "样本合并", "rules": ["merge"]},
+            {"label": "组装", "rules": ["megahit"]},
+        ]
+
+        normalized = normalize_plan_execution_spec(raw, steps)
+
+        self.assertEqual(normalized["entry_rule"], "merge")
+        self.assertEqual(normalized["exit_rule"], "megahit")
+        self.assertNotIn("viral_type", normalized)
+
+    def test_infers_one_missing_boundary_but_rejects_explicit_conflicts(self):
+        raw = self._workflow1_spec("merge", "megahit")
+        raw.pop("exit_rule")
+        steps = [
+            {"label": "样本合并", "rules": ["merge"]},
+            {"label": "组装", "rules": ["megahit"]},
+        ]
+        self.assertEqual(
+            normalize_plan_execution_spec(raw, steps)["exit_rule"], "megahit"
+        )
+
+        raw["entry_rule"] = "bowtie2"
+        with self.assertRaisesRegex(ExecutionSpecError, "entry_rule conflicts"):
+            normalize_plan_execution_spec(raw, steps)
+
+    def test_does_not_infer_workflow1_boundaries_from_non_contiguous_rules(self):
+        raw = self._workflow1_spec("fastp", "rename_filter")
+        raw.pop("entry_rule")
+        raw.pop("exit_rule")
+
+        with self.assertRaisesRegex(ExecutionSpecError, "contiguous rule segment"):
+            normalize_plan_execution_spec(
+                raw,
+                [
+                    {"label": "质控", "rules": ["fastp"]},
+                    {"label": "组装", "rules": ["megahit"]},
+                ],
+            )
 
     def test_rejects_relative_input_paths(self):
         spec = self._workflow1_spec("fastp")

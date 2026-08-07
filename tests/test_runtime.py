@@ -511,6 +511,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["steps"][0]["rules"], ["fastp"])
         self.assertEqual(item["steps"][1]["rules"], ["bowtie2"])
         self.assertEqual(item["execution_spec"]["exit_rule"], "bowtie2")
+        self.assertEqual(item["resource_estimate"]["version"], 1)
+        self.assertEqual(item["resource_estimate"]["confidence"], "low")
+        self.assertNotIn("eta", item["resource_estimate"])
         self.assertTrue(item["run"]["run_dir"].startswith(str(self.run_root)))
         self.assertFalse(Path(item["run"]["state_path"]).exists())
         saved = json.loads(
@@ -690,6 +693,75 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(plan)
         self.assertFalse(plan["ready_to_execute"])
         self.assertNotIn("execution_spec", plan)
+        self.assertIn("输入文件信息", plan["blocking_reason"])
+
+    def test_missing_workflow1_boundaries_are_inferred_from_latest_plan_shape(self):
+        raw_plan = {
+            "title": "病毒宏基因组上游流程",
+            "ready_to_execute": True,
+            "steps": [
+                {"label": "质控", "rules": ["fastp"]},
+                {"label": "去 rRNA", "rules": ["bowtie2"]},
+                {"label": "样本合并", "rules": ["merge"]},
+                {"label": "组装", "rules": ["megahit"]},
+                {"label": "重命名过滤", "rules": ["rename_filter"]},
+            ],
+            "execution_spec": {
+                "adapter": "workflow1",
+                "viral_type": "RNA+DNA",
+                "inputs": self.ready_plan()["execution_spec"]["inputs"],
+            },
+        }
+
+        plan = self.manager._build_analysis_plan(raw_plan)
+
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["ready_to_execute"])
+        self.assertEqual(plan["execution_spec"]["entry_rule"], "fastp")
+        self.assertEqual(plan["execution_spec"]["exit_rule"], "rename_filter")
+        self.assertNotIn("viral_type", plan["execution_spec"])
+        self.assertNotIn("blocking_reason", plan)
+
+    def test_invalid_workflow1_rules_expose_blocking_reason(self):
+        raw_plan = {
+            "title": "不连续流程",
+            "ready_to_execute": True,
+            "steps": [
+                {"label": "质控", "rules": ["fastp"]},
+                {"label": "组装", "rules": ["megahit"]},
+            ],
+            "execution_spec": {
+                "adapter": "workflow1",
+                "inputs": self.ready_plan()["execution_spec"]["inputs"],
+            },
+        }
+
+        plan = self.manager._build_analysis_plan(raw_plan)
+
+        self.assertIsNotNone(plan)
+        self.assertFalse(plan["ready_to_execute"])
+        self.assertIn("流程区段", plan["blocking_reason"])
+
+    def test_resource_estimation_failure_does_not_block_valid_plan(self):
+        class BrokenCalibrator:
+            def estimate(self, _spec):
+                raise RuntimeError("sqlite unavailable")
+
+        self.manager.resource_calibrator = BrokenCalibrator()
+        source = self.ready_plan()
+        raw_plan = {
+            "title": source["title"],
+            "ready_to_execute": True,
+            "steps": source["steps"],
+            "execution_spec": source["execution_spec"],
+        }
+
+        plan = self.manager._build_analysis_plan(raw_plan)
+
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["ready_to_execute"])
+        self.assertIn("execution_spec", plan)
+        self.assertNotIn("resource_estimate", plan)
 
     async def test_execute_creates_state_and_marks_missing_terminal_state_failed(self):
         plan = self.ready_plan()

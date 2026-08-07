@@ -69,11 +69,6 @@ In plan mode, produce a concrete analysis plan and append exactly one internal `
         }
       }
     ]
-  },
-  "resource_estimate": {
-    "eta": "约 1-2 小时",
-    "compute": "4-12 核，约 20 GB 内存",
-    "confidence": "估算"
   }
 }
 ```
@@ -89,6 +84,7 @@ Requirements:
 - `rules` is internal progress metadata. For every fixed Snakemake workflow step, list the exact rule names represented by that user-facing step; inspect that workflow's Snakefile when necessary. One step may contain multiple rules.
 - `execution_spec` is required for an executable plan. Its adapter owns input validation, run-local configuration, prerequisite materialization, and concrete targets.
 - The workflow1 adapter accepts one contiguous segment delimited by `entry_rule` and `exit_rule`. The flattened `steps[].rules` must exactly equal that segment; the segment may start at any workflow1 rule.
+- Every workflow1 `execution_spec` must include both `entry_rule` and `exit_rule`, exactly as shown above. `viral_type` belongs only to `virus_classification` and must never appear in a workflow1 spec.
 - Workflow1 entry types are `raw_paired_reads` for fastp, `fastp_paired_reads` for bowtie2, `clean_paired_reads` for merge, `merged_paired_reads` for megahit, and `contigs_fasta` for rename_filter.
 - The `virus_classification` adapter accepts `raw_paired_reads` or `contigs_fasta`. Raw reads run full preprocessing before classification; contigs begin at classification.
 - Default `viral_type` to `RNA+DNA`; use `RNA` or `DNA` only when the user explicitly narrows the scope.
@@ -100,6 +96,7 @@ Requirements:
   5. 结果汇总: `summarize_tables`, `summarize_sequences`
 - For raw-read classification, prepend `fastp`, `bowtie2`, `merge`, then a combined `megahit`, `rename_filter` step. Do not expose the internal workflow boundary or parallel evidence branches.
 - Typed input data is adapter-specific and every file path must be absolute. Never invent file paths.
+- Do not output `resource_estimate` or mention numeric runtime, CPU, or memory estimates in visible plan text. The runtime adds the deterministic telemetry-calibrated estimate after validating `execution_spec`.
 - Use the selected workflow's existing tool flags, databases, presets, and thresholds as defaults. These technical choices are not user requirements and must not make an otherwise executable plan unready.
 - Set `ready_to_execute` to `true` once the supported analysis goal, input files, and required sample relationships are clear. Set it to `false` only when one of those user-level facts is missing or ambiguous, and ask for that information in plain language before the fenced block.
 - If the user adjusts requirements in natural language, translate the request into the run-local workflow configuration and output a complete updated scheme, not a partial diff. Omit stages only when the selected adapter explicitly supports that entry or exit boundary.

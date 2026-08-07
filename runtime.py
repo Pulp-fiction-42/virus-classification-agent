@@ -68,9 +68,11 @@ except (
 
 
 import config
+from resource_calibration import ResourceCalibrator
 from workflow_adapters import (
     ExecutionSpecError,
     normalize_execution_spec,
+    normalize_plan_execution_spec,
     validate_plan_rules,
 )
 
@@ -311,6 +313,7 @@ class SessionManager:
         client_factory: Callable[[ClaudeAgentOptions], Any] = ClaudeSDKClient,
         idle_timeout_seconds: float = config.SESSION_IDLE_TIMEOUT_SECONDS,
         analysis_run_root: Path = config.ANALYSIS_RUN_ROOT,
+        resource_calibrator: ResourceCalibrator | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_dir = config_dir.resolve()
@@ -324,6 +327,14 @@ class SessionManager:
         self._prepare_sdk_config_dir()
         self.analysis_plan_dir = self.config_dir / "bioagent" / "analysis-plans"
         self.analysis_plan_dir.mkdir(parents=True, exist_ok=True)
+        self.resource_history_path = (
+            self.config_dir / "bioagent" / "resource-history.sqlite3"
+        )
+        self.resource_calibrator = resource_calibrator or ResourceCalibrator(
+            self.resource_history_path,
+            self.analysis_run_root,
+        )
+        self.resource_calibrator.backfill()
         self.client_factory = client_factory
         self.idle_timeout_seconds = idle_timeout_seconds
         self._sessions: dict[str, ManagedSession] = {}
@@ -785,15 +796,16 @@ class SessionManager:
             return None
 
         execution_spec = None
+        execution_error = None
         try:
-            execution_spec = normalize_execution_spec(raw_plan.get("execution_spec"))
-            validate_plan_rules(execution_spec, steps)
-        except ExecutionSpecError:
-            pass
+            execution_spec = normalize_plan_execution_spec(
+                raw_plan.get("execution_spec"), steps
+            )
+        except ExecutionSpecError as exc:
+            execution_error = exc
 
         run_id = self._new_run_id()
         run_dir = self.analysis_run_root / run_id
-        resource_estimate = raw_plan.get("resource_estimate")
         plan: dict[str, Any] = {
             "type": "analysis_plan",
             "id": f"analysis_plan_{run_id}",
@@ -815,14 +827,24 @@ class SessionManager:
         }
         if execution_spec is not None:
             plan["execution_spec"] = execution_spec
-        if isinstance(resource_estimate, dict):
-            plan["resource_estimate"] = {
-                "eta": resource_estimate.get("eta"),
-                "compute": resource_estimate.get("compute")
-                or resource_estimate.get("resource"),
-                "confidence": resource_estimate.get("confidence"),
-            }
+            try:
+                plan["resource_estimate"] = self.resource_calibrator.estimate(
+                    execution_spec
+                )
+            except Exception:
+                pass
+        elif execution_error is not None:
+            plan["blocking_reason"] = self._execution_blocking_reason(execution_error)
         return plan
+
+    @staticmethod
+    def _execution_blocking_reason(error: ExecutionSpecError) -> str:
+        message = str(error)
+        if "missing execution_spec" in message:
+            return "方案缺少可执行流程信息，请补充输入后重新生成方案。"
+        if "input" in message or "path" in message:
+            return "输入文件信息与流程起点不匹配，请检查输入后重新生成方案。"
+        return "流程区段与方案步骤不一致，请重新生成方案。"
 
     @staticmethod
     def _new_run_id() -> str:
@@ -894,6 +916,7 @@ class SessionManager:
                 if isinstance(step, dict) and step.get("id") and step.get("label")
             ],
             "resource_estimate": plan.get("resource_estimate"),
+            "resource_history_db": str(self.resource_history_path),
             "execution": {
                 "started": True,
                 "status": "running",

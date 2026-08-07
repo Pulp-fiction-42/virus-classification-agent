@@ -262,6 +262,46 @@ def normalize_execution_spec(raw: Any) -> dict[str, Any]:
     raise ExecutionSpecError("unsupported workflow adapter")
 
 
+def normalize_plan_execution_spec(
+    raw: Any, steps: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Normalize a plan spec, inferring only unambiguous workflow1 boundaries."""
+    candidate = raw
+    if (
+        isinstance(raw, dict)
+        and raw.get("adapter") == "workflow1"
+        and (raw.get("entry_rule") is None or raw.get("exit_rule") is None)
+    ):
+        planned_rules = tuple(
+            rule
+            for step in steps
+            for rule in (step.get("rules") or [])
+            if isinstance(rule, str)
+        )
+        inferred: tuple[str, str] | None = None
+        if planned_rules:
+            for start in range(len(WORKFLOW1_RULES)):
+                selected = WORKFLOW1_RULES[start : start + len(planned_rules)]
+                if selected == planned_rules:
+                    inferred = (selected[0], selected[-1])
+                    break
+        if inferred is None:
+            raise ExecutionSpecError(
+                "workflow1 steps must be one non-empty contiguous rule segment"
+            )
+
+        candidate = dict(raw)
+        for field, value in zip(("entry_rule", "exit_rule"), inferred):
+            explicit = candidate.get(field)
+            if explicit is not None and explicit != value:
+                raise ExecutionSpecError(f"{field} conflicts with steps[].rules")
+            candidate[field] = value
+
+    spec = normalize_execution_spec(candidate)
+    validate_plan_rules(spec, steps)
+    return spec
+
+
 def _workflow2_rules(
     viral_type: str, *, rename_contigs: bool = True
 ) -> tuple[str, ...]:

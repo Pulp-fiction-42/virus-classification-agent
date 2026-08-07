@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -450,6 +451,12 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     entry_rule="fastp",
                     exit_rule="merge",
                 )
+                state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                history_path = root / "resource-history.sqlite3"
+                state_payload["resource_history_db"] = str(history_path)
+                state_path.write_text(
+                    json.dumps(state_payload, ensure_ascii=False), encoding="utf-8"
+                )
                 source = self._write_workflow_source(root)
                 command = root / "snakemake"
                 command.write_text(
@@ -483,6 +490,15 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 self.assertEqual(telemetry["status"], expected_status)
                 self.assertIn("--benchmark-extended", telemetry["runner_commands"][0])
                 self.assertIn("--printshellcmds", telemetry["runner_commands"][0])
+                self.assertGreaterEqual(telemetry["resource_usage"]["samples"], 2)
+                self.assertIn(
+                    telemetry["resource_usage"]["load_bucket"], {"0", "1", "2+"}
+                )
+                self.assertEqual(telemetry["resource_profile"]["version"], 1)
+                self.assertEqual(
+                    telemetry["resource_profile"]["rules"],
+                    ["fastp", "bowtie2", "merge"],
+                )
                 self.assertTrue(state["technical_report"]["available"])
                 self.assertEqual(state["report"]["available"], exit_code == 0)
                 self.assertEqual(state["report"]["schema_version"], 2)
@@ -503,6 +519,11 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 else:
                     self.assertEqual(selected_stage_statuses[0], "failed")
                 self.assertIn("agent_trace", state["technical_report"])
+                with sqlite3.connect(history_path) as connection:
+                    observation = connection.execute(
+                        "SELECT terminal_status FROM run_observations"
+                    ).fetchone()
+                self.assertEqual(observation, (expected_status,))
                 self.assertIn(
                     "partial output", (bioagent / "execution.log").read_text()
                 )

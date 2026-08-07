@@ -36,6 +36,7 @@ MiniMax Anthropic-compatible API
 - 新 session 以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段只预先允许只读的 `Read`、`Glob`、`Grep`。
 - `/plan` 调用 `set_permission_mode("dontAsk")`，并注入 BioAgent `analysis_plan` 协议以避开 Claude Code Plan/ExitPlanMode；`/execute` 调用 `set_permission_mode("bypassPermissions")`，并额外拼接执行提示和 runtime 分配的 run reservation，要求按既有方案执行、保持 Markdown 输出、更新 `.bioagent/state.json` 和 `.bioagent/execution.log`。
 - 成功 run 由固定 runner 写入版本化交付指标与报告可用状态；runtime 不发送报告 output item，Open WebUI 从 run 状态提供下载入口，后端按需确定性渲染分析报告，不接收模型生成的 HTML。
+- 方案中的资源数字不由模型生成。runtime 根据已验证的 execution spec、输入序列规模与 SQLite 历史索引生成 P50/P90、峰值内存、安全余量和置信度。
 - 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
 - 构建统一的 `ClaudeAgentOptions`，加载项目 Skills 和 Claude Code preset tools。
 - 校验 transcript、SDK 执行结果和返回的 session ID。
@@ -56,6 +57,7 @@ MiniMax Anthropic-compatible API
 
 - 固定 runner 只接受 state 路径，按 adapter 生成的 phase 顺序执行 Snakemake；任一 phase 失败或取消后立即停止。
 - state v3 与 telemetry v3 汇总 phase、job、资源、命令、manifest、上游序列指标和病毒分类结果。
+- runner 每秒采样 Snakemake process tree RSS、整机内存和并行 analysis runner 数，并在终态更新资源历史索引；失败或取消记录只供稽核，不进入分位数。
 - workflow2 的 run-local 副本会增加 benchmark 与机器可读分类 CSV；源 workflow 不被修改。
 
 ### `.claude/skills/`
@@ -71,6 +73,8 @@ Claude SDK 将 transcript 写入：
 ```
 
 Open WebUI 继续独立保存 UI 消息和账号数据。runtime 只保存 chat UUID 到 Claude session ID 的映射，不读取或修改 Open WebUI 数据库。
+
+资源校准记录保存在 `.claude/sessions/bioagent/resource-history.sqlite3`。agent 启动时按 telemetry mtime 增量补漏，规划时只查询索引；输入统计按文件身份缓存且不保存原始路径。
 
 ## 并发与进程
 

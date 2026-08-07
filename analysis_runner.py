@@ -9,12 +9,18 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from resource_calibration import (
+    ProcessResourceMonitor,
+    ResourceCalibrator,
+    build_run_resource_profile,
+)
 from workflow_adapters import (
     AdapterSettings,
     PreparedExecution,
@@ -1511,6 +1517,10 @@ def run(args: argparse.Namespace) -> int:
     prepared: PreparedExecution | None = None
     active_phase: PreparedPhase | None = None
     settings = AdapterSettings.from_env()
+    resource_monitor = ProcessResourceMonitor(
+        lambda: process.pid if process and process.poll() is None else None
+    )
+    resource_monitor.start()
 
     def cancel(signum: int, _frame: Any) -> None:
         nonlocal cancelled_signal
@@ -1662,6 +1672,7 @@ def run(args: argparse.Namespace) -> int:
                 }
             )
     finally:
+        resource_usage = resource_monitor.stop()
         phase_log_data = []
         benchmarks: list[dict[str, Any]] = []
         if prepared:
@@ -1716,6 +1727,20 @@ def run(args: argparse.Namespace) -> int:
                 **({"cancelled_signal": cancelled_signal} if cancelled_signal else {}),
             }
         )
+        benchmark_peak = max(
+            (
+                float(job["max_rss"])
+                for stage in telemetry["stages"]
+                for job in stage.get("jobs") or []
+                if isinstance(job.get("max_rss"), (int, float))
+            ),
+            default=0.0,
+        )
+        resource_usage["peak_memory_mb"] = max(
+            float(resource_usage["peak_process_tree_rss_mb"]), benchmark_peak
+        )
+        resource_usage["memory_source"] = "process_tree+benchmark"
+        telemetry["resource_usage"] = resource_usage
         telemetry["software"] = list(
             dict.fromkeys(
                 [
@@ -1874,8 +1899,28 @@ def run(args: argparse.Namespace) -> int:
                 ),
                 "classification": _classification_report_data(state, run_dir),
             }
+        telemetry["resource_profile"] = build_run_resource_profile(
+            state,
+            telemetry,
+            settings,
+            str(resource_usage["load_bucket"]),
+        )
         _write_json_atomic(telemetry_path, telemetry)
         _write_json_atomic(state_path, state)
+        history_path = state.get("resource_history_db")
+        if isinstance(history_path, str) and history_path:
+            try:
+                ResourceCalibrator(
+                    Path(history_path), run_dir.parent, settings
+                ).record_run(
+                    state,
+                    telemetry,
+                    telemetry_mtime_ns=telemetry_path.stat().st_mtime_ns,
+                )
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                print(
+                    f"BioAgent resource history update failed: {exc}", file=sys.stderr
+                )
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
     return returncode

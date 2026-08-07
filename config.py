@@ -77,11 +77,6 @@ Final block format and JSON contract:
         }
       }
     ]
-  },
-  "resource_estimate": {
-    "eta": "约 1-2 小时",
-    "compute": "4-12 核，约 20 GB 内存",
-    "confidence": "估算"
   }
 }
 ```
@@ -94,12 +89,13 @@ Field rules:
 - rules is optional internal metadata listing the Snakemake rule names represented by the user-facing step. Include it for every matched fixed workflow step; one step may contain multiple rules.
 - execution_spec is required before a plan can be executed. Executable adapters are workflow1 and virus_classification.
 - workflow1 entry_rule and exit_rule delimit one contiguous segment of fastp, bowtie2, merge, megahit, rename_filter. The flattened steps[].rules must exactly equal that segment.
+- A workflow1 execution_spec always has this shape: {"adapter":"workflow1","entry_rule":"fastp","exit_rule":"rename_filter","inputs":[...]}. Both rule boundaries are required, and viral_type must never be used with workflow1.
 - workflow1 entry input types are raw_paired_reads for fastp, fastp_paired_reads for bowtie2, clean_paired_reads for merge, merged_paired_reads for megahit, and contigs_fasta for rename_filter.
 - virus_classification accepts raw_paired_reads or contigs_fasta. Raw paired reads run the complete preprocessing and classification flow shown in the example; their 序列预处理 rules are get_orfs, merge_orfs, merge_contigs because contigs were already renamed upstream. Contigs start at 序列预处理, omit the first four steps, and use rename_contigs, get_orfs, merge_orfs, merge_contigs.
 - virus_classification viral_type is RNA, DNA, or RNA+DNA. Default to RNA+DNA when the user does not specify a scope. The 病毒候选搜索 rules contain only rna_virusidentification for RNA, only dna_virusidentification for DNA, and both in that order for RNA+DNA.
 - Keep the classification flow linear and use the exact rule groupings from the example. Do not split the parallel clustering, quality, and database evidence rules into user-facing branches.
 - Typed input data is adapter-specific. Paired-read records use absolute read1/read2 paths; contigs_fasta records use an absolute path. Never invent a path.
-- resource_estimate is optional; uncertain fields may be null or reasonable estimates.
+- Do not output resource_estimate or mention numeric runtime, CPU, or memory estimates in visible plan text. The runtime deterministically adds a calibrated resource estimate after validating execution_spec.
 
 Execute behavior:
 - In execute mode, follow the previously agreed plan and run only after explicit user confirmation.
