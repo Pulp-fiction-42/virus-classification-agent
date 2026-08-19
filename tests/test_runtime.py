@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
+import time
 import unittest
 import uuid
 from dataclasses import dataclass
@@ -12,9 +14,7 @@ import runtime
 from runtime import (
     EXECUTE_MODE,
     PLAN_MODE,
-    EXECUTE_PROMPT_PREFIX,
     PLAN_PROMPT_PREFIX,
-    AgentTraceRecorder,
     InvalidSessionError,
     MarkdownTextStream,
     OutputItemAdded,
@@ -108,6 +108,15 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp_dir.name) / "agent"
         root.mkdir()
         self.run_root = Path(self.temp_dir.name) / "runs"
+        self.launches = []
+
+        def launch(state_path, log_path):
+            self.launches.append((state_path, log_path))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["execution"]["pid"] = 4321
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            return 4321
+
         self.manager = SessionManager(
             root,
             root / ".claude" / "sessions",
@@ -115,6 +124,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             client_factory=FakeClient,
             idle_timeout_seconds=60 * 60,
             analysis_run_root=self.run_root,
+            runner_launcher=launch,
         )
         self.chat_id = str(uuid.uuid4())
 
@@ -285,40 +295,6 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             "".join(self.texts(ephemeral)),
             "开始检查。\n\n## 检查完成",
         )
-
-    def test_agent_trace_records_tool_calls_and_redacts_secrets(self):
-        path = Path(self.temp_dir.name) / "agent-trace.jsonl"
-        recorder = AgentTraceRecorder(path)
-        recorder.consume(
-            {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {"type": "tool_use", "id": "tool-1", "name": "Bash"},
-            }
-        )
-        recorder.consume(
-            {
-                "type": "content_block_delta",
-                "index": 1,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": json.dumps(
-                        {
-                            "command": 'WEBUI_SECRET_KEY=hidden curl -H "Authorization: Bearer abc"',
-                            "api_key": "also-hidden",
-                        }
-                    ),
-                },
-            }
-        )
-        recorder.consume({"type": "content_block_stop", "index": 1})
-
-        event = json.loads(path.read_text(encoding="utf-8"))
-        serialized = json.dumps(event)
-        self.assertEqual(event["tool"], "Bash")
-        self.assertNotIn("hidden", serialized)
-        self.assertNotIn("abc", serialized)
-        self.assertGreaterEqual(serialized.count("[REDACTED]"), 3)
 
     @staticmethod
     def finish_run(plan, *, ok=True):
@@ -665,7 +641,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             self.texts(events),
-            ["当前方案缺少有效执行区段，请在 plan 模式重新生成方案。"],
+            ["当前方案缺少有效执行区段，请在方案模式重新生成方案。"],
         )
         self.assertFalse(Path(plan["run"]["state_path"]).exists())
         self.assertEqual(FakeClient.instances[0].queries, [])
@@ -894,17 +870,22 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("routing", contigs_plan)
 
-    async def test_execute_creates_state_and_marks_missing_terminal_state_failed(self):
+    async def test_execute_starts_runner_and_returns_structured_run(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
 
-        [event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)]
+        events = [
+            event
+            async for event in self.manager.start_execution(
+                self.chat_id, "assistant-message-1"
+            )
+        ]
 
         state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
         self.assertEqual(state["run_id"], plan["run"]["run_id"])
         self.assertEqual(state["version"], 3)
         self.assertEqual(state["openwebui_chat_id"], self.chat_id)
+        self.assertEqual(state["assistant_message_id"], "assistant-message-1")
         self.assertEqual(state["plan"]["title"], plan["title"])
         self.assertEqual(
             [step["status"] for step in state["steps"]], ["pending", "pending"]
@@ -912,11 +893,17 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["steps"][0]["rules"], ["fastp"])
         self.assertEqual(state["steps"][1]["rules"], ["bowtie2"])
         self.assertEqual(state["execution_spec"], plan["execution_spec"])
-        self.assertEqual(state["execution"]["status"], "failed")
-        self.assertIs(state["execution"]["ok"], False)
-        self.assertEqual(state["execution"]["returncode"], -1)
-        self.assertTrue(state["technical_report"]["available"])
-        self.assertEqual(state["technical_report"]["status"], "ready")
+        self.assertEqual(state["execution"]["status"], "running")
+        self.assertEqual(state["execution"]["pid"], 4321)
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(FakeClient.instances, [])
+        self.assertIn("分析任务已启动", "".join(self.texts(events)))
+        run_item = next(
+            event.item for event in events if isinstance(event, OutputItemAdded)
+        )
+        self.assertEqual(run_item["type"], "analysis_run")
+        self.assertEqual(run_item["status"], "running")
+        self.assertEqual(run_item["run"]["state_path"], plan["run"]["state_path"])
 
     async def test_execute_create_state_error_is_clear(self):
         blocked_root = Path(self.temp_dir.name) / "blocked-run-root"
@@ -930,6 +917,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             client_factory=FakeClient,
             idle_timeout_seconds=60 * 60,
             analysis_run_root=blocked_root,
+            runner_launcher=lambda *_: 1,
         )
         run_id = "analysis-20260709-120000-blocked1"
         run_dir = blocked_root / run_id
@@ -941,133 +929,108 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             "log_path": str(run_dir / ".bioagent" / "execution.log"),
         }
         manager._save_analysis_plan(self.chat_id, plan)
-        await manager.set_mode(self.chat_id, EXECUTE_MODE)
-
         with self.assertRaises(SessionStateError) as error:
-            [event async for event in manager.stream_turn(MESSAGES, self.chat_id)]
+            [
+                event
+                async for event in manager.start_execution(self.chat_id, "message")
+            ]
 
         self.assertIn("无法创建分析运行目录", str(error.exception))
         self.assertIn("BIOAGENT_RUN_ROOT", str(error.exception))
-        self.assertEqual(FakeClient.instances[-1].queries, [])
+        self.assertEqual(FakeClient.instances, [])
 
-    async def test_execute_rejects_consumed_plan_without_overwriting_state(self):
+    async def test_execute_rejects_mismatched_state_without_overwriting_it(self):
         plan = self.ready_plan()
         state_path = Path(plan["run"]["state_path"])
         state_path.parent.mkdir(parents=True)
         state_path.write_text('{"sentinel": true}\n', encoding="utf-8")
         self.manager._save_analysis_plan(self.chat_id, plan)
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-
         with self.assertRaises(SessionStateError) as error:
-            [event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)]
+            [
+                event
+                async for event in self.manager.start_execution(self.chat_id, "message")
+            ]
 
-        self.assertIn("已经启动", str(error.exception))
+        self.assertIn("不匹配", str(error.exception))
         self.assertEqual(
             json.loads(state_path.read_text(encoding="utf-8")),
             {"sentinel": True},
         )
-        self.assertEqual(FakeClient.instances[-1].queries, [])
+        self.assertEqual(FakeClient.instances, [])
 
-    async def test_execute_prompt_contains_plan_execution_instruction(self):
-        self.manager._save_analysis_plan(self.chat_id, self.ready_plan())
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-        [chunk async for chunk in self.manager.stream_turn(MESSAGES, self.chat_id)]
-
-        prompt, _ = FakeClient.instances[0].queries[0]
-        self.assertIn(EXECUTE_PROMPT_PREFIX, prompt)
-        self.assertIn("遵循之前计划模式下生成的计划执行", prompt)
-        self.assertIn("不要输出 analysis_plan", prompt)
-        self.assertIn("测序质控与分类方案", prompt)
-        self.assertIn("analysis-20260709-120000-testabcd", prompt)
-        self.assertIn(".bioagent/state.json", prompt)
-        self.assertIn(".bioagent/execution.log", prompt)
-        self.assertIn("RUNTIME RUNNER COMMAND:", prompt)
-        self.assertIn(
-            f'--state "{self.ready_plan()["run"]["state_path"]}"',
-            prompt,
-        )
-        self.assertIn("analysis_runner.py", prompt)
-        self.assertIn("不得直接调用 Snakemake", prompt)
-        self.assertIn("USER REQUEST:", prompt)
-
-    async def test_successful_execute_leaves_report_available_via_state(self):
+    async def test_execute_retry_returns_existing_status_without_relaunch(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-        FakeClient.before_result = lambda: self.finish_run(plan)
-        FakeClient.response_text_parts = ["分析完成，没有 HTML 控制块。"]
-
+        [event async for event in self.manager.start_execution(self.chat_id, "first")]
         events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+            event
+            async for event in self.manager.start_execution(self.chat_id, "second")
         ]
 
-        visible = "".join(self.texts(events))
-        report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
+        self.assertEqual(len(self.launches), 1)
+        self.assertIn("已经启动", "".join(self.texts(events)))
+
+    async def test_execute_launch_error_is_terminal_and_visible(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+
+        def fail_launch(*_):
+            raise OSError("fork failed")
+
+        self.manager.runner_launcher = fail_launch
+        events = [
+            event
+            async for event in self.manager.start_execution(self.chat_id, "message")
+        ]
+
         state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(state["execution"]["status"], "failed")
+        self.assertFalse(state["execution"]["ok"])
+        self.assertIn("fork failed", state["execution"]["error"])
+        self.assertIn("启动失败", "".join(self.texts(events)))
+        item = next(event.item for event in events if isinstance(event, OutputItemAdded))
+        self.assertEqual(item["status"], "failed")
 
-        self.assertEqual(visible.strip(), "分析完成，没有 HTML 控制块。")
-        self.assertFalse(
-            any(
-                isinstance(event, OutputItemAdded)
-                and event.item.get("type") == "diagnostic_report"
-                for event in events
-            )
+    async def test_short_lived_runner_completes_after_immediate_response(self):
+        root = Path(self.temp_dir.name) / "subprocess-agent"
+        root.mkdir()
+        (root / "analysis_runner.py").write_text(
+            """import json, os, sys
+from pathlib import Path
+path = Path(sys.argv[sys.argv.index('--state') + 1])
+state = json.loads(path.read_text())
+state['execution'].update({'pid': os.getpid(), 'status': 'completed', 'ok': True, 'returncode': 0})
+temporary = path.with_suffix('.json.tmp')
+temporary.write_text(json.dumps(state))
+temporary.replace(path)
+""",
+            encoding="utf-8",
         )
-        self.assertFalse(report_path.exists())
-        self.assertEqual(state["report"]["status"], "ready")
-        self.assertTrue(state["report"]["available"])
-
-    async def test_successful_execute_does_not_surface_report_state_in_chat(self):
+        manager = SessionManager(
+            root,
+            root / ".claude" / "sessions",
+            sdk_config_dir=root / "sdk-runtime",
+            client_factory=FakeClient,
+            analysis_run_root=self.run_root,
+        )
         plan = self.ready_plan()
-        self.manager._save_analysis_plan(self.chat_id, plan)
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-        FakeClient.before_result = lambda: self.finish_run(plan, ok=True)
-        FakeClient.response_text_parts = ["分析完成。"]
+        manager._save_analysis_plan(self.chat_id, plan)
 
-        def finish_without_report():
-            self.finish_run(plan, ok=True)
-            state_path = Path(plan["run"]["state_path"])
+        events = [
+            event
+            async for event in manager.start_execution(self.chat_id, "message-id")
+        ]
+        self.assertIn("分析任务已启动", "".join(self.texts(events)))
+
+        state_path = Path(plan["run"]["state_path"])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["report"]["available"] = False
-            state_path.write_text(json.dumps(state), encoding="utf-8")
-
-        FakeClient.before_result = finish_without_report
-
-        events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
-        ]
-
-        self.assertEqual("".join(self.texts(events)).strip(), "分析完成。")
-        self.assertFalse(
-            any(
-                isinstance(event, OutputItemAdded)
-                and event.item.get("type") == "diagnostic_report"
-                for event in events
-            )
-        )
-
-    async def test_failed_execute_does_not_emit_report(self):
-        plan = self.ready_plan()
-        self.manager._save_analysis_plan(self.chat_id, plan)
-        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
-        FakeClient.before_result = lambda: self.finish_run(plan, ok=False)
-        FakeClient.response_text_parts = ["分析失败。"]
-
-        events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
-        ]
-
-        visible = "".join(self.texts(events))
-        report_path = Path(plan["run"]["run_dir"]) / "diagnostic-opinion.html"
-        self.assertEqual(visible.strip(), "分析失败。")
-        self.assertFalse(report_path.exists())
-        self.assertFalse(
-            any(
-                isinstance(event, OutputItemAdded)
-                and event.item.get("type") == "diagnostic_report"
-                for event in events
-            )
-        )
+            if state["execution"]["status"] == "completed":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(state["execution"]["status"], "completed")
+        self.assertTrue(state["execution"]["ok"])
 
     async def test_existing_transcript_sends_latest_user_message_only(self):
         claude_session_id = "sdk-existing-session"
@@ -1176,12 +1139,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Do not create run directories", config.SYSTEM_PROMPT)
         self.assertIn("parameter defaults never block execution", config.SYSTEM_PROMPT)
         self.assertIn("final content in the response", config.SYSTEM_PROMPT)
-        self.assertIn(".bioagent/state.json", config.SYSTEM_PROMPT)
-        self.assertIn(".bioagent/execution.log", config.SYSTEM_PROMPT)
+        self.assertNotIn("RUNTIME RUNNER COMMAND", config.SYSTEM_PROMPT)
         self.assertNotIn("```diagnostic_report", config.SYSTEM_PROMPT)
-        self.assertIn(
-            "deterministically renders the diagnostic report", config.SYSTEM_PROMPT
-        )
         self.assertIn("ICTV virus taxonomy", config.SYSTEM_PROMPT)
         self.assertIn("ictv_family_info", config.SYSTEM_PROMPT)
 

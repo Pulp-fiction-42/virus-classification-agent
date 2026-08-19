@@ -23,6 +23,7 @@ from analysis_runner import (
     _stage_records,
     _upstream_metrics,
     _workflow1_report_data,
+    main as runner_main,
     redact_text,
     run,
 )
@@ -65,6 +66,29 @@ rule merge:
             encoding="utf-8",
         )
         return source
+
+    def test_main_terminalizes_unexpected_runner_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "execution": {"status": "running", "ok": None},
+                        "technical_report": {"status": "collecting"},
+                        "report": {"status": "collecting"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("analysis_runner.run", side_effect=RuntimeError("broken")):
+                returncode = runner_main(["--state", str(state_path)])
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(returncode, 1)
+            self.assertEqual(state["execution"]["status"], "failed")
+            self.assertFalse(state["execution"]["ok"])
+            self.assertEqual(state["execution"]["error"], "broken")
 
     @staticmethod
     def _write_state(run_dir: Path, *, entry_rule="fastp", exit_rule="fastp") -> Path:

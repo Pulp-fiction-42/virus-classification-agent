@@ -1833,6 +1833,8 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
 def run(args: argparse.Namespace) -> int:
     state_path = Path(args.state).resolve()
     state = _read_state(state_path)
+    state.setdefault("execution", {})["pid"] = os.getpid()
+    _write_json_atomic(state_path, state)
     if (state.get("execution_spec") or {}).get("adapter") == "adaptive_virus_analysis":
         return _run_adaptive(args, state)
     run_dir = Path(state["run_dir"]).resolve()
@@ -2293,5 +2295,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    state_path = Path(args.state).resolve()
+    try:
+        return run(args)
+    except Exception as exc:
+        try:
+            state = _read_state(state_path)
+            state.setdefault("execution", {}).update(
+                {
+                    "status": "failed",
+                    "ok": False,
+                    "returncode": -1,
+                    "current_step_id": None,
+                    "error": str(exc) or exc.__class__.__name__,
+                    "finished_at": _now(),
+                }
+            )
+            state.setdefault("technical_report", {}).update(
+                {"status": "unavailable", "available": False}
+            )
+            state.setdefault("report", {}).update(
+                {"status": "unavailable", "available": False}
+            )
+            _write_json_atomic(state_path, state)
+        except Exception as state_error:
+            print(
+                f"BioAgent runner could not terminalize state: {state_error}",
+                file=sys.stderr,
+            )
+        print(f"BioAgent runner failed: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(run(parse_args()))
+    raise SystemExit(main())

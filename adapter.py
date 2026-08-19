@@ -153,6 +153,7 @@ async def list_models():
 @app.post("/chat/completions")
 async def chat(req: ChatRequest, request: Request):
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
+    message_id = request.headers.get("X-OpenWebUI-Message-Id")
     task = background_task(req, request)
     routing = analysis_routing(req)
     requested_mode = analysis_mode(req)
@@ -173,7 +174,7 @@ async def chat(req: ChatRequest, request: Request):
             return completion_response(content, response_id)
         return streaming_text_response(content, response_id)
 
-    if not task and requested_mode:
+    if not task and requested_mode == PLAN_MODE:
         try:
             await sessions.set_mode(chat_id, requested_mode)
         except InvalidSessionError as exc:
@@ -186,6 +187,8 @@ async def chat(req: ChatRequest, request: Request):
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
+                else sessions.start_execution(chat_id, message_id)
+                if requested_mode == EXECUTE_MODE
                 else (
                     sessions.stream_turn(req.messages, chat_id, routing)
                     if routing
@@ -205,7 +208,7 @@ async def chat(req: ChatRequest, request: Request):
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return completion_response(content, response_id)
 
-    if not task:
+    if not task and requested_mode != EXECUTE_MODE:
         try:
             await sessions.ensure_session(chat_id)
         except InvalidSessionError as exc:
@@ -218,6 +221,8 @@ async def chat(req: ChatRequest, request: Request):
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
+                else sessions.start_execution(chat_id, message_id)
+                if requested_mode == EXECUTE_MODE
                 else (
                     sessions.stream_turn(req.messages, chat_id, routing)
                     if routing

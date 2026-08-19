@@ -38,6 +38,7 @@ class FakeSessions:
         self.ephemeral_calls = []
         self.ensure_calls = []
         self.mode_calls = []
+        self.execute_calls = []
 
     async def ensure_session(self, chat_id):
         self.ensure_calls.append(chat_id)
@@ -57,6 +58,18 @@ class FakeSessions:
         if self.fail:
             raise SessionStateError("task failed")
         yield TextDelta("ephemeral")
+
+    async def start_execution(self, chat_id, message_id):
+        self.execute_calls.append((chat_id, message_id))
+        yield TextDelta("started")
+        yield OutputItemAdded(
+            {
+                "type": "analysis_run",
+                "id": "analysis_run_test",
+                "status": "running",
+                "run": {"run_id": "test"},
+            }
+        )
 
     async def set_mode(self, chat_id, mode):
         self.mode_calls.append((chat_id, mode))
@@ -122,7 +135,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake.persistent_calls), 1)
         self.assertEqual(fake.ephemeral_calls, [])
 
-    async def test_execute_metadata_applies_mode_before_same_request(self):
+    async def test_execute_metadata_starts_runner_with_message_id(self):
         fake = FakeSessions()
         adapter.sessions = fake
         chat_id = "11111111-1111-1111-1111-111111111111"
@@ -138,16 +151,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                     }
                 },
             ),
-            request_with_headers(x_openwebui_chat_id=chat_id),
+            request_with_headers(
+                x_openwebui_chat_id=chat_id,
+                x_openwebui_message_id="assistant-message",
+            ),
         )
-        await response_text(response)
+        body = await response_text(response)
 
-        self.assertEqual(fake.mode_calls, [(chat_id, "execute")])
-        self.assertEqual(fake.persistent_calls, [(
-            [{"role": "user", "content": "确认启动分析"}],
-            chat_id,
-            routing,
-        )])
+        self.assertEqual(fake.execute_calls, [(chat_id, "assistant-message")])
+        self.assertEqual(fake.mode_calls, [])
+        self.assertEqual(fake.ensure_calls, [])
+        self.assertEqual(fake.persistent_calls, [])
+        self.assertIn('"type": "analysis_run"', body)
 
     async def test_streaming_and_non_streaming_preserve_markdown_boundaries(self):
         fake = FakeSessions(text_parts=["开始检查。", "\n\n## 检查完成"])
