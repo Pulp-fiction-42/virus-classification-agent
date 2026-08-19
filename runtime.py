@@ -71,6 +71,7 @@ import config
 from resource_calibration import ResourceCalibrator
 from workflow_adapters import (
     ExecutionSpecError,
+    full_analysis_spec,
     normalize_execution_spec,
     normalize_plan_execution_spec,
     validate_plan_rules,
@@ -372,7 +373,10 @@ class SessionManager:
             session.last_used_at = time.time()
 
     async def stream_turn(
-        self, messages: list[dict], chat_id: str | None
+        self,
+        messages: list[dict],
+        chat_id: str | None,
+        routing_request: dict[str, Any] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         normalized_chat_id = self._validate_chat_id(chat_id)
         session = await self._get_or_create_session(normalized_chat_id)
@@ -404,7 +408,9 @@ class SessionManager:
                 )
 
             try:
-                prompt = self._prefixed_prompt(session.mode, user_prompt, plan)
+                prompt = self._prefixed_prompt(
+                    session.mode, user_prompt, plan, routing_request=routing_request
+                )
                 session.last_used_at = time.time()
                 await session.client.query(prompt)
 
@@ -449,7 +455,9 @@ class SessionManager:
                 visible_parts, hidden_text = control_filter.finish()
                 for visible_text in visible_parts:
                     yield TextDelta(visible_text)
-                trailing_text, analysis_plan = self._extract_analysis_plan(hidden_text)
+                trailing_text, analysis_plan = self._extract_analysis_plan(
+                    hidden_text, routing_request=routing_request
+                )
                 if trailing_text:
                     yield TextDelta(f"\n\n{trailing_text}")
                 if analysis_plan:
@@ -613,10 +621,19 @@ class SessionManager:
 
     @staticmethod
     def _prefixed_prompt(
-        mode: str, prompt: str, plan: dict[str, Any] | None = None
+        mode: str,
+        prompt: str,
+        plan: dict[str, Any] | None = None,
+        routing_request: dict[str, Any] | None = None,
     ) -> str:
         if mode == PLAN_MODE:
-            return f"{PLAN_PROMPT_PREFIX}\n\nUSER REQUEST:\n{prompt}"
+            routing_text = (
+                "\n\nANALYSIS ROUTING UI SETTINGS (authoritative):\n"
+                + json.dumps(routing_request, ensure_ascii=False)
+                if routing_request
+                else ""
+            )
+            return f"{PLAN_PROMPT_PREFIX}{routing_text}\n\nUSER REQUEST:\n{prompt}"
         plan_json = json.dumps(plan, ensure_ascii=False, indent=2) if plan else "{}"
         run = plan.get("run") if isinstance((plan or {}).get("run"), dict) else {}
         runner_command = (
@@ -745,7 +762,12 @@ class SessionManager:
                 "the stored Claude session ID"
             )
 
-    def _extract_analysis_plan(self, text: str) -> tuple[str, dict[str, Any] | None]:
+    def _extract_analysis_plan(
+        self,
+        text: str,
+        *,
+        routing_request: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any] | None]:
         matches = list(ANALYSIS_PLAN_BLOCK_RE.finditer(text))
         visible = ANALYSIS_PLAN_BLOCK_RE.sub("", text).strip()
         if not matches:
@@ -756,12 +778,17 @@ class SessionManager:
                 raw_plan = json.loads(match.group(1))
             except json.JSONDecodeError:
                 continue
-            plan = self._build_analysis_plan(raw_plan)
+            plan = self._build_analysis_plan(raw_plan, routing_request=routing_request)
             if plan:
                 return visible, plan
         return visible, None
 
-    def _build_analysis_plan(self, raw_plan: Any) -> dict[str, Any] | None:
+    def _build_analysis_plan(
+        self,
+        raw_plan: Any,
+        *,
+        routing_request: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(raw_plan, dict) or not isinstance(
             raw_plan.get("steps"), list
         ):
@@ -797,15 +824,24 @@ class SessionManager:
 
         execution_spec = None
         execution_error = None
+        raw_execution_spec = raw_plan.get("execution_spec")
+        raw_execution_spec, steps = self._apply_analysis_routing(
+            raw_execution_spec,
+            steps,
+            routing_request,
+        )
         try:
-            execution_spec = normalize_plan_execution_spec(
-                raw_plan.get("execution_spec"), steps
-            )
+            execution_spec = normalize_plan_execution_spec(raw_execution_spec, steps)
         except ExecutionSpecError as exc:
             execution_error = exc
 
         run_id = self._new_run_id()
         run_dir = self.analysis_run_root / run_id
+        is_deep = bool(
+            execution_spec
+            and execution_spec.get("adapter") == "adaptive_virus_analysis"
+            and (execution_spec.get("routing") or {}).get("mode") == "deep"
+        )
         plan: dict[str, Any] = {
             "type": "analysis_plan",
             "id": f"analysis_plan_{run_id}",
@@ -816,6 +852,7 @@ class SessionManager:
             "ready_to_execute": (
                 raw_plan.get("ready_to_execute") is not False
                 and execution_spec is not None
+                and not is_deep
             ),
             "run": {
                 "run_id": run_id,
@@ -827,15 +864,73 @@ class SessionManager:
         }
         if execution_spec is not None:
             plan["execution_spec"] = execution_spec
+            if execution_spec.get("adapter") == "adaptive_virus_analysis":
+                plan["routing"] = {
+                    **execution_spec["routing"],
+                    "sample_fraction": 0.05,
+                    "available_routes": ["A", "B"],
+                }
             try:
                 plan["resource_estimate"] = self.resource_calibrator.estimate(
-                    execution_spec
+                    full_analysis_spec(execution_spec)
                 )
             except Exception:
                 pass
+            if is_deep:
+                plan["blocking_reason"] = (
+                    "深度探索路径暂未开放，请选择智能、紧急或标准模式。"
+                )
         elif execution_error is not None:
             plan["blocking_reason"] = self._execution_blocking_reason(execution_error)
         return plan
+
+    @staticmethod
+    def _apply_analysis_routing(
+        raw_execution_spec: Any,
+        steps: list[dict[str, Any]],
+        routing_request: dict[str, Any] | None,
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        if not routing_request or not isinstance(raw_execution_spec, dict):
+            return raw_execution_spec, steps
+        if raw_execution_spec.get("adapter") not in {
+            "virus_classification",
+            "adaptive_virus_analysis",
+        }:
+            return raw_execution_spec, steps
+
+        candidate = {**raw_execution_spec, "routing": routing_request}
+        try:
+            normalized = normalize_execution_spec(candidate)
+        except ExecutionSpecError:
+            return candidate, steps
+        if normalized["inputs"][0]["type"] != "raw_paired_reads":
+            return candidate, steps
+
+        adaptive_spec = {
+            **normalized,
+            "adapter": "adaptive_virus_analysis",
+            "routing": routing_request,
+        }
+        planned_rules = tuple(
+            rule
+            for step in steps
+            for rule in (step.get("rules") or [])
+            if isinstance(rule, str)
+        )
+        if planned_rules[:2] != ("adaptive_screen", "adaptive_route"):
+            steps = [
+                {
+                    "label": "5% 快速初筛",
+                    "tool": "Kraken2",
+                    "rules": ["adaptive_screen"],
+                },
+                {"label": "自适应路由决策", "rules": ["adaptive_route"]},
+                *steps,
+            ]
+        return adaptive_spec, [
+            {**step, "id": f"step_{index}"}
+            for index, step in enumerate(steps, start=1)
+        ]
 
     @staticmethod
     def _execution_blocking_reason(error: ExecutionSpecError) -> str:
@@ -882,6 +977,10 @@ class SessionManager:
                 f"分析运行目录不在 BIOAGENT_RUN_ROOT 内：{run_dir}；root={self.analysis_run_root}"
             )
 
+        state_path = run_dir / ".bioagent" / "state.json"
+        if state_path.exists():
+            raise SessionStateError("当前分析方案已经启动，请重新生成方案后再执行。")
+
         log_path = Path(
             str(run.get("log_path", run_dir / ".bioagent" / "execution.log"))
         ).resolve()
@@ -916,6 +1015,11 @@ class SessionManager:
                 if isinstance(step, dict) and step.get("id") and step.get("label")
             ],
             "resource_estimate": plan.get("resource_estimate"),
+            **(
+                {"routing": plan["routing"]}
+                if isinstance(plan.get("routing"), dict)
+                else {}
+            ),
             "resource_history_db": str(self.resource_history_path),
             "execution": {
                 "started": True,
@@ -945,7 +1049,7 @@ class SessionManager:
             bioagent_dir.mkdir(parents=True, exist_ok=True)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.touch(exist_ok=True)
-            self._write_json_atomic(bioagent_dir / "state.json", state)
+            self._write_json_atomic(state_path, state)
         except OSError as exc:
             raise SessionStateError(
                 f"无法创建分析运行目录：{run_dir}，请检查 BIOAGENT_RUN_ROOT 写权限"

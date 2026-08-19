@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from adaptive_routing import normalize_routing_request
+
 
 WORKFLOW1_RULES = (
     "fastp",
@@ -68,6 +70,7 @@ WORKFLOW2_SUMMARY_RULES = (
     "summarize_tables",
     "summarize_sequences",
 )
+ADAPTIVE_RULES = ("adaptive_screen", "adaptive_route")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -251,6 +254,33 @@ def _normalize_virus_classification(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_adaptive_virus_analysis(raw: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_virus_classification(raw)
+    if normalized["inputs"][0]["type"] != "raw_paired_reads":
+        raise ExecutionSpecError("adaptive_virus_analysis requires raw_paired_reads")
+    try:
+        routing = normalize_routing_request(raw.get("routing"))
+    except ValueError as exc:
+        raise ExecutionSpecError(str(exc)) from exc
+    return {
+        **normalized,
+        "adapter": "adaptive_virus_analysis",
+        "routing": routing,
+    }
+
+
+def full_analysis_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Return the existing deterministic full-classification spec for route B."""
+    normalized = normalize_execution_spec(spec)
+    if normalized["adapter"] != "adaptive_virus_analysis":
+        return normalized
+    return {
+        "adapter": "virus_classification",
+        "viral_type": normalized["viral_type"],
+        "inputs": normalized["inputs"],
+    }
+
+
 def normalize_execution_spec(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ExecutionSpecError("missing execution_spec")
@@ -259,6 +289,8 @@ def normalize_execution_spec(raw: Any) -> dict[str, Any]:
         return _normalize_workflow1(raw)
     if adapter == "virus_classification":
         return _normalize_virus_classification(raw)
+    if adapter == "adaptive_virus_analysis":
+        return _normalize_adaptive_virus_analysis(raw)
     raise ExecutionSpecError("unsupported workflow adapter")
 
 
@@ -323,10 +355,12 @@ def selected_rules(spec: dict[str, Any]) -> tuple[str, ...]:
         entry_index = WORKFLOW1_RULES.index(spec["entry_rule"])
         exit_index = WORKFLOW1_RULES.index(spec["exit_rule"])
         return WORKFLOW1_RULES[entry_index : exit_index + 1]
+    adaptive = ADAPTIVE_RULES if spec["adapter"] == "adaptive_virus_analysis" else ()
     upstream = (
         WORKFLOW1_RULES if spec["inputs"][0]["type"] == "raw_paired_reads" else ()
     )
     return (
+        *adaptive,
         *upstream,
         *_workflow2_rules(
             spec["viral_type"],
@@ -727,10 +761,20 @@ def _prepare_workflow2_phase(
 def prepare_execution(
     state: dict[str, Any],
     settings: AdapterSettings | None = None,
+    *,
+    execution_spec: dict[str, Any] | None = None,
 ) -> PreparedExecution:
     settings = settings or AdapterSettings.from_env()
-    spec = normalize_execution_spec(state.get("execution_spec"))
-    expected_rules = validate_plan_rules(spec, state.get("steps") or [])
+    spec = normalize_execution_spec(execution_spec or state.get("execution_spec"))
+    if spec["adapter"] == "adaptive_virus_analysis":
+        raise ExecutionSpecError(
+            "adaptive execution must select a route before preparation"
+        )
+    expected_rules = (
+        selected_rules(spec)
+        if execution_spec is not None
+        else validate_plan_rules(spec, state.get("steps") or [])
+    )
     run_dir = Path(state["run_dir"]).resolve()
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
 

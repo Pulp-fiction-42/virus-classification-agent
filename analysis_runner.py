@@ -16,6 +16,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from adaptive_routing import (
+    SCREEN_MEMORY_MB,
+    SCREEN_THREADS,
+    collect_resource_snapshot,
+    decide_route,
+)
+from adaptive_screening import run_rapid_screen
 from resource_calibration import (
     ProcessResourceMonitor,
     ResourceCalibrator,
@@ -26,13 +33,20 @@ from workflow_adapters import (
     PreparedExecution,
     PreparedPhase,
     WORKFLOW1_RULES,
+    full_analysis_spec,
     prepare_execution,
+    selected_rules,
 )
+
+
+FULL_ANALYSIS_MINIMUM_MEMORY_MB = 24 * 1024
+FULL_ANALYSIS_MINIMUM_THREADS = 8
 
 
 RULE_START_RE = re.compile(r"^(?:local)?rule\s+([A-Za-z0-9_]+):$")
 FINISHED_RE = re.compile(r"Finished jobid:\s*(\d+)\s+\(Rule:\s*([A-Za-z0-9_]+)\)")
 TIMESTAMP_RE = re.compile(r"^\[([A-Z][a-z]{2} .+ \d{4})\]$")
+LOG_TIMESTAMP_FORMAT = "%a %b %d %H:%M:%S %Y"
 SECRET_RE = re.compile(
     r"(?i)(authorization|api[_-]?key|auth[_-]?token|secret|password)"
     r"(\s*[:=]\s*|\s+)([^\s\"']+)"
@@ -73,6 +87,30 @@ class RunnerCancelled(RuntimeError):
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = datetime.strptime(value, LOG_TIMESTAMP_FORMAT)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed
+
+
+def _canonical_timestamp(value: str) -> str:
+    return _parse_timestamp(value).isoformat(timespec="seconds")
+
+
+def _time_bounds(values: list[str]) -> tuple[str | None, str | None]:
+    if not values:
+        return None, None
+    parsed = [_parse_timestamp(value) for value in values]
+    return (
+        min(parsed).isoformat(timespec="seconds"),
+        max(parsed).isoformat(timespec="seconds"),
+    )
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -446,7 +484,7 @@ def _parse_log(log_path: Path, phase: str | None = None) -> dict[str, Any]:
     for raw_line in lines:
         line = re.sub(r"\x1b\[[0-9;]*m", "", raw_line).strip()
         if timestamp_match := TIMESTAMP_RE.match(line):
-            current_timestamp = timestamp_match.group(1)
+            current_timestamp = _canonical_timestamp(timestamp_match.group(1))
             continue
         if match := RULE_START_RE.match(line):
             pending_rule = match.group(1)
@@ -1436,6 +1474,18 @@ def _stage_records(
         finishes = [
             job["finished_at"] for job in combined_jobs if job.get("finished_at")
         ]
+        started_at, _ = _time_bounds(starts)
+        _, finished_at = _time_bounds(finishes)
+        elapsed_seconds = (
+            max(
+                0.0,
+                (
+                    _parse_timestamp(finished_at) - _parse_timestamp(started_at)
+                ).total_seconds(),
+            )
+            if started_at and finished_at
+            else None
+        )
         stages.append(
             {
                 "id": step.get("id"),
@@ -1447,9 +1497,12 @@ def _stage_records(
                     and all(job.get("status") == "completed" for job in stage_log_jobs)
                     else step.get("status", "pending")
                 ),
-                "wall_seconds": wall_seconds,
+                "wall_seconds": elapsed_seconds,
+                "job_wall_seconds": wall_seconds,
                 "cpu_time_seconds": cpu_time,
-                "effective_cores": cpu_time / wall_seconds if wall_seconds else None,
+                "effective_cores": (
+                    cpu_time / elapsed_seconds if elapsed_seconds else None
+                ),
                 "max_job_rss_mb": max(
                     (
                         float(job["max_rss"])
@@ -1458,17 +1511,330 @@ def _stage_records(
                     ),
                     default=None,
                 ),
-                "started_at": min(starts) if starts else None,
-                "finished_at": max(finishes) if finishes else None,
+                "started_at": started_at,
+                "finished_at": finished_at,
                 "jobs": combined_jobs,
             }
         )
     return stages
 
 
+def _set_step_status(state: dict[str, Any], rule: str, status: str) -> None:
+    for step in state.get("steps", []):
+        if rule in (step.get("rules") or []):
+            step["status"] = status
+
+
+def _finish_routing_record(
+    routing: dict[str, Any], *, phase: str, success: bool
+) -> None:
+    finished_at = _now()
+    try:
+        duration = max(
+            0.0,
+            (
+                datetime.fromisoformat(finished_at)
+                - datetime.fromisoformat(str(routing["started_at"]))
+            ).total_seconds(),
+        )
+    except (KeyError, TypeError, ValueError):
+        duration = None
+    deadline = (routing.get("request") or {}).get("deadline_seconds")
+    routing.update(
+        {
+            "phase": phase,
+            "finished_at": finished_at,
+            "actual_duration_seconds": duration,
+            "deadline_met": (
+                duration <= deadline
+                if isinstance(duration, (int, float))
+                and isinstance(deadline, (int, float))
+                else None
+            ),
+            "success": success,
+        }
+    )
+
+
+def _terminal_adaptive_state(
+    state_path: Path,
+    state: dict[str, Any],
+    telemetry: dict[str, Any],
+    *,
+    status: str,
+    returncode: int,
+    error: str | None = None,
+    report_available: bool = False,
+) -> int:
+    finished_at = _now()
+    state["execution"].update(
+        {
+            "status": status,
+            "ok": returncode == 0,
+            "returncode": returncode,
+            "current_step_id": None,
+            "finished_at": finished_at,
+            **({"error": error} if error else {}),
+        }
+    )
+    state["technical_report"] = {
+        **(state.get("technical_report") or {}),
+        "status": "ready",
+        "available": True,
+        "telemetry": str(state_path.parent / "telemetry.json"),
+        "telemetry_version": 3,
+    }
+    state["report"] = {
+        "status": "ready" if report_available else "unavailable",
+        "available": report_available,
+        "schema_version": 2,
+        "telemetry": str(state_path.parent / "telemetry.json"),
+    }
+    telemetry.update(
+        {
+            "finished_at": finished_at,
+            "status": status,
+            "returncode": returncode,
+            **({"error": error} if error else {}),
+        }
+    )
+    _write_json_atomic(state_path.parent / "telemetry.json", telemetry)
+    _write_json_atomic(state_path, state)
+    return returncode
+
+
+def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
+    state_path = Path(args.state).resolve()
+    run_dir = Path(state["run_dir"]).resolve()
+    bioagent_dir = run_dir / ".bioagent"
+    routing_path = bioagent_dir / "routing.json"
+    log_path = Path(state["execution"]["log"]).resolve()
+    spec = state["execution_spec"]
+    routing_request = spec["routing"]
+    full_spec = full_analysis_spec(spec)
+    calibrator = ResourceCalibrator(
+        Path(
+            state.get("resource_history_db")
+            or bioagent_dir / "resource-history.sqlite3"
+        ),
+        run_dir.parent,
+    )
+    history = calibrator.history_summary(full_spec)
+    started_at = _now()
+    routing_record: dict[str, Any] = {
+        "version": 2,
+        "run_id": state.get("run_id"),
+        "request": routing_request,
+        "phase": "screening_admission",
+        "started_at": started_at,
+        "screening": None,
+        "decision": None,
+        "resources": {},
+        "history": history,
+        "accuracy": None,
+        "expert_feedback": None,
+    }
+    telemetry: dict[str, Any] = {
+        "version": 3,
+        "run_id": state.get("run_id"),
+        "chat_id": state.get("openwebui_chat_id"),
+        "workflow_id": "adaptive_virus_analysis",
+        "started_at": started_at,
+        "routing": routing_record,
+        "stages": [],
+        "commands": [],
+        "software": [],
+        "sequence_metrics": [],
+        "fastp": [],
+        "manifest": {"files": [], "omitted": 0},
+    }
+    state["workflow_id"] = "adaptive_virus_analysis"
+    state["routing"] = routing_record
+    state["execution"].update({"status": "running", "started_at": started_at})
+    _set_step_status(state, "adaptive_screen", "running")
+
+    screen_resources = collect_resource_snapshot(
+        run_dir.parent,
+        run_id=state.get("run_id"),
+        required_threads=SCREEN_THREADS,
+        required_memory_mb=SCREEN_MEMORY_MB,
+    )
+    routing_record["resources"]["screening"] = screen_resources
+    if not screen_resources["admission_ok"]:
+        routing_record.update(
+            {
+                "phase": "blocked",
+                "decision": {
+                    "phase": "blocked",
+                    "selected_route": None,
+                    "reason_codes": screen_resources["reason_codes"],
+                },
+            }
+        )
+        _finish_routing_record(routing_record, phase="blocked", success=False)
+        _set_step_status(state, "adaptive_screen", "failed")
+        _write_json_atomic(routing_path, routing_record)
+        return _terminal_adaptive_state(
+            state_path,
+            state,
+            telemetry,
+            status="blocked",
+            returncode=2,
+            error="快速初筛资源不足",
+        )
+
+    try:
+        routing_record["phase"] = "screening"
+        _write_json_atomic(routing_path, routing_record)
+        _write_json_atomic(state_path, state)
+        screening = run_rapid_screen(spec, run_dir, threads=SCREEN_THREADS)
+    except Exception as exc:
+        error = redact_text(str(exc))
+        routing_record["error"] = error
+        _finish_routing_record(routing_record, phase="failed", success=False)
+        _set_step_status(state, "adaptive_screen", "failed")
+        _write_json_atomic(routing_path, routing_record)
+        return _terminal_adaptive_state(
+            state_path,
+            state,
+            telemetry,
+            status="failed",
+            returncode=1,
+            error=error,
+        )
+
+    routing_record["screening"] = screening
+    _set_step_status(state, "adaptive_screen", "completed")
+    _set_step_status(state, "adaptive_route", "running")
+    decision = decide_route(
+        routing_request,
+        screening,
+        history=history,
+    )
+    if decision["selected_route"] == "B":
+        estimate = state.get("resource_estimate") or {}
+        calibrated_requirement = estimate.get("status") == "calibrated"
+        full_resources = collect_resource_snapshot(
+            run_dir.parent,
+            run_id=state.get("run_id"),
+            required_threads=(
+                int(estimate.get("cpu_cores") or FULL_ANALYSIS_MINIMUM_THREADS)
+                if calibrated_requirement
+                else FULL_ANALYSIS_MINIMUM_THREADS
+            ),
+            required_memory_mb=(
+                float((estimate.get("peak_memory_mb") or {}).get("reserve"))
+                if calibrated_requirement
+                else FULL_ANALYSIS_MINIMUM_MEMORY_MB
+            ),
+        )
+        full_resources["requirement_source"] = (
+            "calibrated" if calibrated_requirement else "minimum"
+        )
+        routing_record["resources"]["full_analysis"] = full_resources
+        decision = decide_route(
+            routing_request,
+            screening,
+            full_resources=full_resources,
+            history=history,
+        )
+    routing_record.update({"phase": decision["phase"], "decision": decision})
+    state["routing"] = routing_record
+    _set_step_status(state, "adaptive_route", "completed")
+    _write_json_atomic(routing_path, routing_record)
+    _write_json_atomic(state_path, state)
+
+    if decision["phase"] == "blocked":
+        for step in state.get("steps", []):
+            if step.get("status") == "pending":
+                step["status"] = "skipped"
+        _finish_routing_record(routing_record, phase="blocked", success=False)
+        state["routing"] = routing_record
+        telemetry["routing"] = routing_record
+        telemetry["delivery_report"] = {
+            "schema_version": 2,
+            "kind": "adaptive_alert",
+            "report_kind": "preliminary_screen",
+            "routing": routing_record,
+            "screening": screening,
+        }
+        _write_json_atomic(routing_path, routing_record)
+        return _terminal_adaptive_state(
+            state_path,
+            state,
+            telemetry,
+            status="blocked",
+            returncode=2,
+            error="完整分析资源不足",
+            report_available=True,
+        )
+
+    if decision["selected_route"] == "A":
+        for step in state.get("steps", []):
+            if step.get("status") == "pending":
+                step["status"] = "skipped"
+        _finish_routing_record(routing_record, phase="completed", success=True)
+        state["routing"] = routing_record
+        telemetry["routing"] = routing_record
+        telemetry["delivery_report"] = {
+            "schema_version": 2,
+            "kind": "adaptive_alert",
+            "report_kind": decision["report_kind"],
+            "routing": routing_record,
+            "screening": screening,
+        }
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            f"Adaptive route A completed: {decision['report_kind']}\n",
+            encoding="utf-8",
+        )
+        _write_json_atomic(routing_path, routing_record)
+        return _terminal_adaptive_state(
+            state_path,
+            state,
+            telemetry,
+            status="completed",
+            returncode=0,
+            report_available=True,
+        )
+
+    state["adaptive_execution_spec"] = spec
+    state["selected_execution_spec"] = full_spec
+    state["execution_spec"] = full_spec
+    full_rules = set(selected_rules(full_spec))
+    state["steps"] = [
+        step
+        for step in state.get("steps", [])
+        if full_rules.intersection(step.get("rules") or [])
+    ]
+    routing_record["phase"] = "full_analysis"
+    state["routing"] = routing_record
+    _write_json_atomic(routing_path, routing_record)
+    _write_json_atomic(state_path, state)
+    result = run(args)
+    final_state = _read_state(state_path)
+    telemetry_path = bioagent_dir / "telemetry.json"
+    final_telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    _finish_routing_record(
+        routing_record,
+        phase="completed" if result == 0 else "failed",
+        success=result == 0,
+    )
+    final_state["routing"] = routing_record
+    final_telemetry["routing"] = routing_record
+    if isinstance(final_telemetry.get("delivery_report"), dict):
+        final_telemetry["delivery_report"]["routing"] = routing_record
+    _write_json_atomic(routing_path, routing_record)
+    _write_json_atomic(state_path, final_state)
+    _write_json_atomic(telemetry_path, final_telemetry)
+    return result
+
+
 def run(args: argparse.Namespace) -> int:
     state_path = Path(args.state).resolve()
     state = _read_state(state_path)
+    if (state.get("execution_spec") or {}).get("adapter") == "adaptive_virus_analysis":
+        return _run_adaptive(args, state)
     run_dir = Path(state["run_dir"]).resolve()
     if state_path != run_dir / ".bioagent" / "state.json":
         raise ValueError("state path does not match run directory")
@@ -1818,15 +2184,10 @@ def run(args: argparse.Namespace) -> int:
                 step["status"] = "failed"
             if stage.get("wall_seconds") is not None:
                 step["duration_seconds"] = stage["wall_seconds"]
-            stage_jobs = stage.get("jobs") or []
-            starts = [job["started_at"] for job in stage_jobs if job.get("started_at")]
-            finishes = [
-                job["finished_at"] for job in stage_jobs if job.get("finished_at")
-            ]
-            if starts:
-                step["started_at"] = min(starts)
-            if finishes:
-                step["finished_at"] = max(finishes)
+            if stage.get("started_at"):
+                step["started_at"] = stage["started_at"]
+            if stage.get("finished_at"):
+                step["finished_at"] = stage["finished_at"]
         if returncode != 0:
             first_pending = next(
                 (

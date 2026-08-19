@@ -516,13 +516,13 @@ class ResourceCalibrator:
 
     @staticmethod
     def _resource_floor_mb(rules: list[str]) -> int:
+        if "megahit" in rules:
+            return 24 * 1024
         if any(
             rule in rules
             for rule in ("rna_virusidentification", "dna_virusidentification")
         ):
             return 128 * 1024
-        if "megahit" in rules:
-            return 24 * 1024
         return 8 * 1024
 
     @staticmethod
@@ -538,12 +538,17 @@ class ResourceCalibrator:
                 "p90": None,
                 "reserve": ResourceCalibrator._resource_floor_mb(rules),
             },
-            "cpu_cores": cpu_cores,
+            "cpu_cores": 8 if "megahit" in rules else cpu_cores,
             "confidence": "low",
             "matched_runs": 0,
             "distinct_inputs": 0,
             "basis": reason,
-            "warning": "历史依据不足，暂不提供 P50/P90；仅显示保守硬件下限。",
+            "warning": (
+                "无可靠峰值预测；24 GiB 仅为完整 raw reads 流程的最低准入，"
+                "NR/NT 比对可能显著更高并有 OOM 风险。"
+                if "megahit" in rules
+                else "历史依据不足，暂不提供 P50/P90；仅显示最低准入。"
+            ),
         }
 
     def estimate(self, spec: dict[str, Any]) -> dict[str, Any]:
@@ -679,6 +684,70 @@ class ResourceCalibrator:
             "warning": warning,
         }
 
+    def history_summary(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Summarize comparable terminal runs, including failures in success rate."""
+        empty = {
+            "matched_runs": 0,
+            "mean_duration_seconds": None,
+            "p90_duration_seconds": None,
+            "technical_success_probability": None,
+            "confidence": "insufficient",
+        }
+        try:
+            profile = self._planning_profile(spec)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return empty
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT terminal_status, duration_seconds, sequences, bases
+                FROM run_observations
+                WHERE workflow_signature = ?
+                  AND input_type = ?
+                  AND viral_type = ?
+                  AND database_signature = ?
+                ORDER BY updated_at DESC
+                LIMIT 100
+                """,
+                (
+                    profile["workflow_signature"],
+                    profile["input_type"],
+                    profile["viral_type"],
+                    profile["database_signature"],
+                ),
+            ).fetchall()
+        matches = []
+        for row in rows:
+            if not row["sequences"] or not row["bases"]:
+                continue
+            if not all(
+                0.5 <= profile[field] / row[field] <= 2
+                for field in ("sequences", "bases")
+            ):
+                continue
+            matches.append(row)
+        if not matches:
+            return empty
+        durations = sorted(
+            float(row["duration_seconds"])
+            for row in matches
+            if row["terminal_status"] == "completed"
+            and isinstance(row["duration_seconds"], (int, float))
+        )
+        p90_index = max(0, math.ceil(len(durations) * 0.9) - 1)
+        return {
+            "matched_runs": len(matches),
+            "mean_duration_seconds": (
+                round(statistics.mean(durations)) if durations else None
+            ),
+            "p90_duration_seconds": round(durations[p90_index]) if durations else None,
+            "technical_success_probability": sum(
+                row["terminal_status"] == "completed" for row in matches
+            )
+            / len(matches),
+            "confidence": "sufficient" if len(matches) >= 5 else "insufficient",
+        }
+
     def record_run(
         self,
         state: dict[str, Any],
@@ -689,8 +758,10 @@ class ResourceCalibrator:
         run_id = telemetry.get("run_id") or state.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             return
-        spec = state.get("execution_spec") or (state.get("plan") or {}).get(
-            "execution_spec"
+        spec = (
+            state.get("selected_execution_spec")
+            or state.get("execution_spec")
+            or (state.get("plan") or {}).get("execution_spec")
         )
         workflow_signature = None
         rules: list[str] = []

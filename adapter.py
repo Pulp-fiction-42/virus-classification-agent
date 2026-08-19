@@ -69,6 +69,20 @@ def background_task(req: ChatRequest, request: Request) -> str | None:
     return task.strip() if task and task.strip() else None
 
 
+def analysis_routing(req: ChatRequest) -> dict[str, Any] | None:
+    metadata = req.metadata if isinstance(req.metadata, dict) else {}
+    chat_meta = metadata.get("chat_meta")
+    routing = chat_meta.get("analysis_routing") if isinstance(chat_meta, dict) else None
+    return routing if isinstance(routing, dict) else None
+
+
+def analysis_mode(req: ChatRequest) -> str | None:
+    metadata = req.metadata if isinstance(req.metadata, dict) else {}
+    chat_meta = metadata.get("chat_meta")
+    mode = chat_meta.get("analysis_mode") if isinstance(chat_meta, dict) else None
+    return mode if mode in {PLAN_MODE, EXECUTE_MODE} else None
+
+
 def error_sse(exc: Exception, response_id: str) -> str:
     payload = {
         "id": response_id,
@@ -140,6 +154,8 @@ async def list_models():
 async def chat(req: ChatRequest, request: Request):
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
     task = background_task(req, request)
+    routing = analysis_routing(req)
+    requested_mode = analysis_mode(req)
     command = latest_user_text(req.messages)
     response_id = completion_id()
 
@@ -157,12 +173,24 @@ async def chat(req: ChatRequest, request: Request):
             return completion_response(content, response_id)
         return streaming_text_response(content, response_id)
 
+    if not task and requested_mode:
+        try:
+            await sessions.set_mode(chat_id, requested_mode)
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SessionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     if not req.stream:
         try:
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
-                else sessions.stream_turn(req.messages, chat_id)
+                else (
+                    sessions.stream_turn(req.messages, chat_id, routing)
+                    if routing
+                    else sessions.stream_turn(req.messages, chat_id)
+                )
             )
             parts = []
             async for event in events:
@@ -190,7 +218,11 @@ async def chat(req: ChatRequest, request: Request):
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
-                else sessions.stream_turn(req.messages, chat_id)
+                else (
+                    sessions.stream_turn(req.messages, chat_id, routing)
+                    if routing
+                    else sessions.stream_turn(req.messages, chat_id)
+                )
             )
             async for event in events:
                 if isinstance(event, TextDelta):

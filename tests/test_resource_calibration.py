@@ -197,7 +197,7 @@ class ResourceCalibrationTests(unittest.TestCase):
         self.assertEqual(estimate["confidence"], "medium")
         self.assertEqual(estimate["status"], "calibrated")
 
-    def test_zero_sample_classification_uses_conservative_floor(self):
+    def test_raw_classification_without_history_uses_minimum_admission(self):
         with (
             patch.object(
                 self.calibrator,
@@ -209,8 +209,9 @@ class ResourceCalibrationTests(unittest.TestCase):
             estimate = self.calibrator.estimate(self.classification_spec())
 
         self.assertIsNone(estimate["duration_seconds"]["p50"])
-        self.assertEqual(estimate["peak_memory_mb"]["reserve"], 128 * 1024)
-        self.assertIn("历史依据不足", estimate["warning"])
+        self.assertEqual(estimate["peak_memory_mb"]["reserve"], 24 * 1024)
+        self.assertIn("最低准入", estimate["warning"])
+        self.assertIn("OOM", estimate["warning"])
 
     def test_monitor_returns_aggregate_without_time_series(self):
         monitor = ProcessResourceMonitor(lambda: os.getpid(), interval_seconds=0.01)

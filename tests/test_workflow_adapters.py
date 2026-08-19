@@ -8,6 +8,7 @@ from workflow_adapters import (
     AdapterSettings,
     ExecutionSpecError,
     WORKFLOW1_RULES,
+    full_analysis_spec,
     normalize_execution_spec,
     normalize_plan_execution_spec,
     prepare_execution,
@@ -309,6 +310,28 @@ class WorkflowAdapterTests(unittest.TestCase):
         self.assertIn("rename_contigs", selected_rules(contigs))
         self.assertIn("rna_virusidentification", selected_rules(contigs))
         self.assertNotIn("dna_virusidentification", selected_rules(contigs))
+
+    def test_adaptive_classification_normalizes_routing_and_full_path(self):
+        spec = self._classification_spec("raw_paired_reads")
+        spec["adapter"] = "adaptive_virus_analysis"
+        spec["routing"] = {"mode": "emergency"}
+
+        normalized = normalize_execution_spec(spec)
+        self.assertEqual(normalized["routing"]["deadline_seconds"], 900)
+        self.assertEqual(
+            selected_rules(normalized)[:2], ("adaptive_screen", "adaptive_route")
+        )
+
+        full = full_analysis_spec(normalized)
+        self.assertEqual(full["adapter"], "virus_classification")
+        self.assertNotIn("routing", full)
+        self.assertNotIn("adaptive_screen", selected_rules(full))
+
+    def test_adaptive_classification_requires_raw_paired_reads(self):
+        spec = self._classification_spec("contigs_fasta")
+        spec["adapter"] = "adaptive_virus_analysis"
+        with self.assertRaises(ExecutionSpecError):
+            normalize_execution_spec(spec)
 
     def test_prepares_two_phases_for_reads_and_one_for_contigs(self):
         raw_spec = self._classification_spec("raw_paired_reads")

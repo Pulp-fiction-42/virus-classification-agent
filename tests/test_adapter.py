@@ -37,12 +37,13 @@ class FakeSessions:
         self.persistent_calls = []
         self.ephemeral_calls = []
         self.ensure_calls = []
+        self.mode_calls = []
 
     async def ensure_session(self, chat_id):
         self.ensure_calls.append(chat_id)
 
-    async def stream_turn(self, messages, chat_id):
-        self.persistent_calls.append((messages, chat_id))
+    async def stream_turn(self, messages, chat_id, routing=None):
+        self.persistent_calls.append((messages, chat_id, routing))
         if self.fail:
             raise SessionStateError(
                 "无法创建分析运行目录：/tmp/run，请检查 BIOAGENT_RUN_ROOT 写权限"
@@ -58,7 +59,7 @@ class FakeSessions:
         yield TextDelta("ephemeral")
 
     async def set_mode(self, chat_id, mode):
-        return None
+        self.mode_calls.append((chat_id, mode))
 
     async def close_all(self):
         return None
@@ -120,6 +121,33 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
         self.assertEqual(fake.ephemeral_calls, [])
+
+    async def test_execute_metadata_applies_mode_before_same_request(self):
+        fake = FakeSessions()
+        adapter.sessions = fake
+        chat_id = "11111111-1111-1111-1111-111111111111"
+        routing = {"mode": "emergency", "deadline_seconds": 900}
+
+        response = await adapter.chat(
+            ChatRequest(
+                messages=[{"role": "user", "content": "确认启动分析"}],
+                metadata={
+                    "chat_meta": {
+                        "analysis_mode": "execute",
+                        "analysis_routing": routing,
+                    }
+                },
+            ),
+            request_with_headers(x_openwebui_chat_id=chat_id),
+        )
+        await response_text(response)
+
+        self.assertEqual(fake.mode_calls, [(chat_id, "execute")])
+        self.assertEqual(fake.persistent_calls, [(
+            [{"role": "user", "content": "确认启动分析"}],
+            chat_id,
+            routing,
+        )])
 
     async def test_streaming_and_non_streaming_preserve_markdown_boundaries(self):
         fake = FakeSessions(text_parts=["开始检查。", "\n\n## 检查完成"])

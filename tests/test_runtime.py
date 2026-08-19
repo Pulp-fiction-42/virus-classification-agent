@@ -22,6 +22,7 @@ from runtime import (
     SessionStateError,
     TextDelta,
 )
+from workflow_adapters import normalize_execution_spec, selected_rules
 
 
 MESSAGES = [
@@ -763,6 +764,136 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("execution_spec", plan)
         self.assertNotIn("resource_estimate", plan)
 
+    def test_ui_routing_overrides_model_and_deep_plan_is_unready(self):
+        execution_spec = {
+            "adapter": "adaptive_virus_analysis",
+            "viral_type": "RNA+DNA",
+            "routing": {"mode": "standard"},
+            "inputs": self.ready_plan()["execution_spec"]["inputs"],
+        }
+        rules = selected_rules(normalize_execution_spec(execution_spec))
+        raw_plan = {
+            "title": "自适应病毒分析",
+            "ready_to_execute": True,
+            "steps": [{"label": rule, "rules": [rule]} for rule in rules],
+            "execution_spec": execution_spec,
+        }
+
+        emergency = self.manager._build_analysis_plan(
+            raw_plan,
+            routing_request={"mode": "emergency", "deadline_seconds": 18_000},
+        )
+        deep = self.manager._build_analysis_plan(
+            raw_plan,
+            routing_request={"mode": "deep"},
+        )
+
+        self.assertEqual(emergency["routing"]["mode"], "emergency")
+        self.assertEqual(emergency["routing"]["deadline_seconds"], 18_000)
+        self.assertEqual(emergency["routing"]["sample_fraction"], 0.05)
+        self.assertEqual(emergency["routing"]["available_routes"], ["A", "B"])
+        self.assertTrue(emergency["ready_to_execute"])
+        self.assertFalse(deep["ready_to_execute"])
+        self.assertIn("暂未开放", deep["blocking_reason"])
+
+    def test_ui_routing_upgrades_raw_classification_to_adaptive(self):
+        execution_spec = {
+            "adapter": "virus_classification",
+            "viral_type": "RNA+DNA",
+            "inputs": self.ready_plan()["execution_spec"]["inputs"],
+        }
+        rules = selected_rules(normalize_execution_spec(execution_spec))
+        raw_plan = {
+            "title": "病毒分类分析",
+            "ready_to_execute": True,
+            "steps": [{"label": rule, "rules": [rule]} for rule in rules],
+            "execution_spec": execution_spec,
+        }
+
+        for routing in (
+            {"mode": "auto"},
+            {"mode": "emergency", "deadline_seconds": 900},
+            {"mode": "standard"},
+        ):
+            with self.subTest(routing=routing):
+                plan = self.manager._build_analysis_plan(
+                    raw_plan,
+                    routing_request=routing,
+                )
+
+                self.assertTrue(plan["ready_to_execute"])
+                self.assertEqual(
+                    plan["execution_spec"]["adapter"],
+                    "adaptive_virus_analysis",
+                )
+                self.assertEqual(plan["execution_spec"]["routing"], routing)
+                self.assertEqual(plan["routing"]["mode"], routing["mode"])
+                self.assertEqual(
+                    [step["rules"] for step in plan["steps"][:2]],
+                    [["adaptive_screen"], ["adaptive_route"]],
+                )
+                self.assertEqual(plan["steps"][0]["label"], "5% 快速初筛")
+                self.assertEqual(plan["steps"][0]["tool"], "Kraken2")
+                self.assertEqual(plan["steps"][1]["label"], "自适应路由决策")
+                self.assertEqual(
+                    tuple(
+                        rule
+                        for step in plan["steps"]
+                        for rule in step.get("rules", [])
+                    ),
+                    selected_rules(plan["execution_spec"]),
+                )
+
+    def test_ui_routing_does_not_convert_workflow1_or_contigs(self):
+        workflow1 = self.ready_plan()
+        workflow1_plan = self.manager._build_analysis_plan(
+            {
+                "title": workflow1["title"],
+                "ready_to_execute": True,
+                "steps": workflow1["steps"],
+                "execution_spec": workflow1["execution_spec"],
+            },
+            routing_request={"mode": "auto"},
+        )
+        contigs_spec = {
+            "adapter": "virus_classification",
+            "viral_type": "RNA",
+            "inputs": [
+                {
+                    "id": "primary",
+                    "type": "contigs_fasta",
+                    "data": {
+                        "samples": [
+                            {
+                                "sample_id": "sample",
+                                "path": "/data/input_contigs.fasta",
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        contigs_plan = self.manager._build_analysis_plan(
+            {
+                "title": "Contigs 病毒分类",
+                "ready_to_execute": True,
+                "steps": [
+                    {"label": rule, "rules": [rule]}
+                    for rule in selected_rules(normalize_execution_spec(contigs_spec))
+                ],
+                "execution_spec": contigs_spec,
+            },
+            routing_request={"mode": "auto"},
+        )
+
+        self.assertEqual(workflow1_plan["execution_spec"]["adapter"], "workflow1")
+        self.assertNotIn("routing", workflow1_plan)
+        self.assertEqual(
+            contigs_plan["execution_spec"]["adapter"],
+            "virus_classification",
+        )
+        self.assertNotIn("routing", contigs_plan)
+
     async def test_execute_creates_state_and_marks_missing_terminal_state_failed(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
@@ -817,6 +948,24 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("无法创建分析运行目录", str(error.exception))
         self.assertIn("BIOAGENT_RUN_ROOT", str(error.exception))
+        self.assertEqual(FakeClient.instances[-1].queries, [])
+
+    async def test_execute_rejects_consumed_plan_without_overwriting_state(self):
+        plan = self.ready_plan()
+        state_path = Path(plan["run"]["state_path"])
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text('{"sentinel": true}\n', encoding="utf-8")
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+
+        with self.assertRaises(SessionStateError) as error:
+            [event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)]
+
+        self.assertIn("已经启动", str(error.exception))
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8")),
+            {"sentinel": True},
+        )
         self.assertEqual(FakeClient.instances[-1].queries, [])
 
     async def test_execute_prompt_contains_plan_execution_instruction(self):

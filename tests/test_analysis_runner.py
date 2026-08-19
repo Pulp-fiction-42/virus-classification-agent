@@ -158,6 +158,77 @@ rule merge:
             "BIOAGENT_SNAKEMAKE_CORES": "8",
         }
 
+    @staticmethod
+    def _write_adaptive_state(run_dir: Path, mode: str = "emergency") -> Path:
+        bioagent = run_dir / ".bioagent"
+        bioagent.mkdir(parents=True)
+        read1 = run_dir / "input_r1.fq"
+        read2 = run_dir / "input_r2.fq"
+        read1.write_text("@read/1\nAC\n+\nII\n", encoding="utf-8")
+        read2.write_text("@read/2\nTG\n+\nII\n", encoding="utf-8")
+        state_path = bioagent / "state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "run_id": "adaptive-test",
+                    "run_dir": str(run_dir),
+                    "steps": [
+                        {
+                            "id": "screen",
+                            "label": "5% 初筛",
+                            "rules": ["adaptive_screen"],
+                            "status": "pending",
+                        },
+                        {
+                            "id": "route",
+                            "label": "调度决策",
+                            "rules": ["adaptive_route"],
+                            "status": "pending",
+                        },
+                        {
+                            "id": "fastp",
+                            "label": "完整分析",
+                            "rules": ["fastp"],
+                            "status": "pending",
+                        },
+                    ],
+                    "execution_spec": {
+                        "adapter": "adaptive_virus_analysis",
+                        "viral_type": "RNA+DNA",
+                        "routing": {"mode": mode, "deadline_seconds": 900},
+                        "inputs": [
+                            {
+                                "id": "primary",
+                                "type": "raw_paired_reads",
+                                "data": {
+                                    "runs": [
+                                        {
+                                            "run_id": "run",
+                                            "sample_id": "sample",
+                                            "read1": str(read1),
+                                            "read2": str(read2),
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    },
+                    "resource_estimate": {
+                        "cpu_cores": 8,
+                        "peak_memory_mb": {"reserve": 8192},
+                    },
+                    "execution": {
+                        "status": "planned",
+                        "ok": None,
+                        "log": str(bioagent / "execution.log"),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return state_path
+
     def test_redacts_headers_and_sensitive_environment_values(self):
         command = (
             "Authorization: Bearer abc WEBUI_SECRET_KEY=hidden "
@@ -171,6 +242,136 @@ rule merge:
         self.assertNotIn("abc", redacted)
         self.assertNotIn("bad", redacted)
         self.assertGreaterEqual(redacted.count("[REDACTED]"), 4)
+
+    def test_emergency_low_confidence_finishes_with_screen_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = self._write_adaptive_state(Path(temp_dir) / "run")
+            screening = {
+                "sample_fraction": 0.05,
+                "known_virus_high_confidence": False,
+                "samples": [],
+            }
+            admitted = {"admission_ok": True, "reason_codes": []}
+            with (
+                patch(
+                    "analysis_runner.ResourceCalibrator.history_summary",
+                    return_value={},
+                ),
+                patch(
+                    "analysis_runner.collect_resource_snapshot", return_value=admitted
+                ),
+                patch("analysis_runner.run_rapid_screen", return_value=screening),
+            ):
+                returncode = run(argparse.Namespace(state=str(state_path)))
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            telemetry = json.loads(
+                (state_path.parent / "telemetry.json").read_text(encoding="utf-8")
+            )
+            routing = json.loads(
+                (state_path.parent / "routing.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(state["execution"]["status"], "completed")
+        self.assertEqual(routing["decision"]["selected_route"], "A")
+        self.assertEqual(routing["decision"]["report_kind"], "preliminary_screen")
+        self.assertTrue(routing["deadline_met"])
+        self.assertIsInstance(routing["actual_duration_seconds"], (int, float))
+        self.assertEqual(telemetry["delivery_report"]["kind"], "adaptive_alert")
+
+    def test_route_b_resource_failure_is_blocked_without_queueing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = self._write_adaptive_state(Path(temp_dir) / "run", mode="auto")
+            screening = {
+                "sample_fraction": 0.05,
+                "known_virus_high_confidence": False,
+                "samples": [],
+            }
+            admitted = {"admission_ok": True, "reason_codes": []}
+            blocked = {"admission_ok": False, "reason_codes": ["MEMORY_INSUFFICIENT"]}
+            with (
+                patch(
+                    "analysis_runner.ResourceCalibrator.history_summary",
+                    return_value={},
+                ),
+                patch(
+                    "analysis_runner.collect_resource_snapshot",
+                    side_effect=[admitted, blocked],
+                ),
+                patch("analysis_runner.run_rapid_screen", return_value=screening),
+            ):
+                returncode = run(argparse.Namespace(state=str(state_path)))
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            telemetry = json.loads(
+                (state_path.parent / "telemetry.json").read_text(encoding="utf-8")
+            )
+            routing = json.loads(
+                (state_path.parent / "routing.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(state["execution"]["status"], "blocked")
+        self.assertEqual(routing["decision"]["selected_route"], "B")
+        self.assertEqual(routing["decision"]["report_kind"], "preliminary_screen")
+        self.assertIn("MEMORY_INSUFFICIENT", routing["decision"]["reason_codes"])
+        self.assertEqual(
+            routing["resources"]["full_analysis"]["requirement_source"], "minimum"
+        )
+        self.assertTrue(state["report"]["available"])
+        self.assertEqual(telemetry["delivery_report"]["kind"], "adaptive_alert")
+        self.assertEqual(
+            telemetry["delivery_report"]["report_kind"], "preliminary_screen"
+        )
+
+    def test_calibrated_requirement_still_blocks_when_reserve_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = self._write_adaptive_state(Path(temp_dir) / "run", mode="auto")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["resource_estimate"] = {
+                "status": "calibrated",
+                "cpu_cores": 16,
+                "peak_memory_mb": {"reserve": 96 * 1024},
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            screening = {
+                "sample_fraction": 0.05,
+                "known_virus_high_confidence": False,
+                "samples": [],
+            }
+            admitted = {"admission_ok": True, "reason_codes": []}
+            blocked = {
+                "admission_ok": False,
+                "reason_codes": ["MEMORY_INSUFFICIENT"],
+            }
+            with (
+                patch(
+                    "analysis_runner.ResourceCalibrator.history_summary",
+                    return_value={},
+                ),
+                patch(
+                    "analysis_runner.collect_resource_snapshot",
+                    side_effect=[admitted, blocked],
+                ) as snapshot,
+                patch("analysis_runner.run_rapid_screen", return_value=screening),
+            ):
+                returncode = run(argparse.Namespace(state=str(state_path)))
+
+            routing = json.loads(
+                (state_path.parent / "routing.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(snapshot.call_args_list[1].kwargs["required_threads"], 16)
+        self.assertEqual(
+            snapshot.call_args_list[1].kwargs["required_memory_mb"],
+            96 * 1024,
+        )
+        self.assertEqual(
+            routing["resources"]["full_analysis"]["requirement_source"],
+            "calibrated",
+        )
 
     def test_workflow1_instrumentation_adds_extended_stats_and_benchmarks(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -379,6 +580,50 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             ["/tools/blastx -query candidates.fna -db nr --out blastx_nr.tsv"],
         )
         self.assertEqual(parsed["jobs"][0]["status"], "completed")
+        self.assertRegex(
+            parsed["jobs"][0]["started_at"], r"2026-07-30T10:00:00[+-]\d\d:\d\d"
+        )
+
+    def test_stage_times_are_chronological_across_midnight(self):
+        jobs = [
+            {
+                "jobid": 1,
+                "rule_name": "blastx_nr",
+                "s": 43_931.5,
+                "cpu_time": 87_840.0,
+                "max_rss": 1024,
+            }
+        ]
+        log_jobs = [
+            {
+                "job_id": "1",
+                "rule": "blastx_nr",
+                "started_at": "Thu Aug 13 16:45:01 2026",
+                "finished_at": "Fri Aug 14 04:57:01 2026",
+                "status": "completed",
+            }
+        ]
+        stages = _stage_records(
+            {
+                "steps": [
+                    {
+                        "id": "classification",
+                        "label": "分类证据分析",
+                        "rules": ["blastx_nr"],
+                        "status": "running",
+                    }
+                ]
+            },
+            jobs,
+            log_jobs,
+        )
+
+        stage = stages[0]
+        self.assertRegex(stage["started_at"], r"2026-08-13T16:45:01[+-]\d\d:\d\d")
+        self.assertRegex(stage["finished_at"], r"2026-08-14T04:57:01[+-]\d\d:\d\d")
+        self.assertEqual(stage["wall_seconds"], 43_920)
+        self.assertEqual(stage["job_wall_seconds"], 43_931.5)
+        self.assertEqual(stage["effective_cores"], 2.0)
 
     def test_parses_fastp_and_aggregates_rrna_assembly_and_final_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:

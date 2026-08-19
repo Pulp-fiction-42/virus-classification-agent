@@ -22,8 +22,8 @@ Only these workflows are in scope:
 
 Do not propose workflow7 or any other workflow. You may internally compose supported workflows in series when the user's request clearly requires multiple supported phases, but do not expose workflow IDs as the main user-facing plan.
 
-The deterministic execution adapters support one contiguous workflow1 segment
-and end-to-end virus classification from either raw paired reads or contigs.
+The deterministic execution adapters support one contiguous workflow1 segment,
+end-to-end virus classification, and adaptive raw-read virus classification.
 Plans for workflow3-workflow6 remain non-executable until their adapters exist.
 
 ## Core rule
@@ -87,6 +87,8 @@ Requirements:
 - Every workflow1 `execution_spec` must include both `entry_rule` and `exit_rule`, exactly as shown above. `viral_type` belongs only to `virus_classification` and must never appear in a workflow1 spec.
 - Workflow1 entry types are `raw_paired_reads` for fastp, `fastp_paired_reads` for bowtie2, `clean_paired_reads` for merge, `merged_paired_reads` for megahit, and `contigs_fasta` for rename_filter.
 - The `virus_classification` adapter accepts `raw_paired_reads` or `contigs_fasta`. Raw reads run full preprocessing before classification; contigs begin at classification.
+- Default raw paired-read virus classification on `/analysis` to `adaptive_virus_analysis`. Its plan starts with `adaptive_screen` and `adaptive_route`, followed by the complete raw-read classification rules. Its execution spec includes `routing.mode` (`auto`, `emergency`, `standard`, or `deep`) and optional `routing.deadline_seconds`. UI routing settings are authoritative. Deep is not executable in this MVP.
+- Adaptive emergency mode always stops after the 5% Kraken2 screen and emits a preliminary report, including when confidence is low. Never describe a low-confidence screen as negative. Auto continues to full classification only when screening is not high-confidence; standard always continues.
 - Default `viral_type` to `RNA+DNA`; use `RNA` or `DNA` only when the user explicitly narrows the scope.
 - Represent classification as a linear flow using these exact rule groups:
   1. 序列预处理: raw reads use `get_orfs`, `merge_orfs`, `merge_contigs` because upstream contigs are already renamed; direct contigs use `rename_contigs`, `get_orfs`, `merge_orfs`, `merge_contigs`
