@@ -39,6 +39,7 @@ MiniMax Anthropic-compatible API
 - 方案中的资源数字不由模型生成。runtime 根据已验证的 execution spec、输入序列规模与 SQLite 历史索引生成 P50/P90、峰值内存、安全余量和置信度。
 - 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
 - 构建统一的 `ClaudeAgentOptions`，加载项目 Skills 和 Claude Code preset tools。
+- SDK 使用 20k token thinking budget 并请求 `display=summarized`；runtime 只把 `AssistantMessage` 中的非空思考摘要和脱敏工具调用写入 chat 审计 JSONL，启动 run 时快照到 `.bioagent/agent-trace.jsonl`。思考摘要只解释方案形成过程，不作为结果证据。
 - 校验 transcript、SDK 执行结果和返回的 session ID。
 
 `SessionManager` 持有内存 client registry 和文件式 chat-map，但不访问 `webui.db`。
@@ -57,7 +58,8 @@ MiniMax Anthropic-compatible API
 ### `analysis_runner.py`
 
 - 固定 runner 只接受 state 路径，按编译后的 phase 顺序执行 Snakemake；任一 phase 失败或取消后立即停止。
-- state v3 与 telemetry v3 汇总 phase、job、资源、命令、manifest，以及上游、病毒识别、宿主、微生物谱、定量和注释指标。
+- state v3 与 telemetry v3 汇总 phase、job、资源、命令、manifest，以及上游、病毒识别、宿主、微生物谱、定量和注释指标；交付报告 schema v4 另外保存确定性 `conclusions` 与 `evidence`。
+- 每条结果结论至少引用一个数值证据。证据记录报告字段、精确值、单位和 run-local 来源定位；后端下载报告时重新读取来源并计算允许的聚合公式，任何缺失、越界或不一致都拒绝出具报告。
 - runner 每秒采样 Snakemake process tree RSS、整机内存和并行 analysis runner 数，并在终态更新资源历史索引；失败或取消记录只供稽核，不进入分位数。
 - workflow 1–6 的 run-local 副本增加 benchmark；workflow2 另增加机器可读分类 CSV。源 workflow 不被修改。
 
@@ -73,7 +75,7 @@ Claude SDK 将 transcript 写入：
 /data/bioagent/agent/.claude/sessions/projects/-data-bioagent-agent/<claude_session_id>.jsonl
 ```
 
-Open WebUI 继续独立保存 UI 消息和账号数据。runtime 只保存 chat UUID 到 Claude session ID 的映射，不读取或修改 Open WebUI 数据库。
+Open WebUI 继续独立保存 UI 消息和账号数据。runtime 保存 chat UUID 到 Claude session ID 的映射及版本化 Agent 审计 JSONL，不读取或修改 Open WebUI 数据库。
 
 资源校准记录保存在 `.claude/sessions/bioagent/resource-history.sqlite3`。agent 启动时按 telemetry mtime 增量补漏，规划时只查询索引；输入统计按文件身份缓存且不保存原始路径。
 

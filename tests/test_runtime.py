@@ -890,6 +890,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(state["execution"]["status"], "running")
         self.assertEqual(state["execution"]["pid"], 4321)
+        self.assertEqual(state["report"]["schema_version"], 4)
+        self.assertTrue(Path(state["technical_report"]["agent_trace"]).is_file())
         self.assertEqual(len(self.launches), 1)
         self.assertEqual(FakeClient.instances, [])
         self.assertIn("分析任务已启动", "".join(self.texts(events)))
@@ -1106,6 +1108,14 @@ temporary.replace(path)
         self.assertEqual(options.disallowed_tools, [])
         self.assertEqual(options.system_prompt, config.SYSTEM_PROMPT)
         self.assertEqual(options.env["BIOAGENT_RUN_ROOT"], str(self.run_root))
+        self.assertEqual(
+            options.thinking,
+            {
+                "type": "enabled",
+                "budget_tokens": 20_000,
+                "display": "summarized",
+            },
+        )
 
     async def test_sdk_options_register_taxonagent_mcp_server(self):
         await self.manager.ensure_session(self.chat_id)
@@ -1120,6 +1130,41 @@ temporary.replace(path)
                 }
             },
         )
+
+    def test_assistant_thinking_and_tools_are_deduplicated_and_redacted(self):
+        message = runtime.AssistantMessage(
+            content=[
+                runtime.ThinkingBlock("核对输入与交付目标", "signature-not-stored"),
+                runtime.ToolUseBlock(
+                    "tool-1",
+                    "Read",
+                    {"path": "/data/input", "api_key": "secret-value"},
+                ),
+            ],
+            model="MiniMax-M3",
+            uuid="message-1",
+        )
+
+        self.manager._record_assistant_trace(self.chat_id, message)
+        self.manager._record_assistant_trace(self.chat_id, message)
+
+        lines = self.manager._agent_trace_path(self.chat_id).read_text(encoding="utf-8").splitlines()
+        records = [json.loads(line) for line in lines]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["type"], "thinking_summary")
+        self.assertNotIn("signature", records[0])
+        self.assertEqual(records[1]["input"]["api_key"], "[REDACTED]")
+
+    def test_empty_thinking_block_does_not_create_trace(self):
+        message = runtime.AssistantMessage(
+            content=[runtime.ThinkingBlock("", "signature-not-stored")],
+            model="MiniMax-M3",
+            uuid="message-empty",
+        )
+
+        self.manager._record_assistant_trace(self.chat_id, message)
+
+        self.assertFalse(self.manager._agent_trace_path(self.chat_id).exists())
 
     def test_system_prompt_contains_analysis_plan_contract(self):
         legacy_contract = "analysis" + "_scheme"

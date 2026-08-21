@@ -1416,13 +1416,385 @@ def _pipeline_report_data(
             "summary": str(root / "summary/annotation_summary.csv"),
         }
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "analysis_pipeline",
         "deliverables": spec.get("deliverables") or [],
         "sections": sections,
         "stages": telemetry.get("stages") or [],
         "manifest": telemetry.get("manifest") or {},
     }
+
+
+def _pointer_token(value: Any) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _walk_numeric(value: Any, pointer: str = ""):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"evidence", "conclusions"}:
+                continue
+            yield from _walk_numeric(item, f"{pointer}/{_pointer_token(key)}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk_numeric(item, f"{pointer}/{index}")
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        yield pointer or "/", value
+
+
+def _relative_report_path(path: str | Path, run_dir: Path) -> str | None:
+    if not isinstance(path, (str, Path)):
+        return None
+    try:
+        return Path(path).resolve().relative_to(run_dir.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _report_value(delivery: dict[str, Any], pointer: str) -> Any:
+    value: Any = delivery
+    for raw_token in pointer.split("/")[1:]:
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        value = value[int(token)] if isinstance(value, list) else value[token]
+    return value
+
+
+def _evidence_unit(pointer: str) -> str:
+    key = pointer.rsplit("/", 1)[-1]
+    if "percent" in key:
+        return "%"
+    if key.endswith("fraction"):
+        return "ratio"
+    if key in {"bases", "sum_len", "qlen", "n50", "max_length", "mean_length"}:
+        return "bp"
+    if key.endswith("seconds"):
+        return "s"
+    if key.endswith("_mb"):
+        return "MB"
+    if "reads" in key or "count" in key or key == "sequences":
+        return "count"
+    return ""
+
+
+def _special_evidence_source(
+    pointer: str,
+    delivery: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any] | None:
+    if pointer.startswith("/routing/"):
+        return {
+            "type": "json",
+            "path": ".bioagent/routing.json",
+            "pointer": pointer.removeprefix("/routing") or "/",
+        }
+    if pointer.startswith("/screening/"):
+        return {
+            "type": "json",
+            "path": ".bioagent/routing.json",
+            "pointer": pointer,
+        }
+
+    classification = (delivery.get("sections") or {}).get("virus_identification")
+    prefix = "/sections/virus_identification/"
+    if isinstance(classification, dict) and pointer.startswith(prefix):
+        suffix = pointer.removeprefix(prefix)
+        count_tables = {
+            "candidate_count": "candidates",
+            "representative_count": "representatives",
+            "vertebrate_candidate_count": "vertebrate_candidates",
+            "vertebrate_representative_count": "vertebrate_representatives",
+        }
+        if suffix in count_tables:
+            path = (classification.get("tables") or {}).get(count_tables[suffix])
+            relative = _relative_report_path(path, run_dir) if path else None
+            if relative:
+                return {"type": "delimited_count", "path": relative, "delimiter": ","}
+        match = re.fullmatch(r"representatives/(\d+)/([^/]+)", suffix)
+        if match:
+            index, column = int(match.group(1)), match.group(2)
+            representatives = classification.get("representatives") or []
+            if index < len(representatives):
+                qseqid = representatives[index].get("qseqid")
+                path = (classification.get("tables") or {}).get("representatives")
+                relative = _relative_report_path(path, run_dir) if path else None
+                if relative and qseqid:
+                    return {
+                        "type": "delimited_cell",
+                        "path": relative,
+                        "delimiter": ",",
+                        "where": {"qseqid": qseqid},
+                        "column": column,
+                    }
+
+    sections = delivery.get("sections") or {}
+    host = sections.get("host_identification") or {}
+    if pointer == "/sections/host_identification/identified_result_count":
+        relative = _relative_report_path(host.get("report"), run_dir)
+        if relative:
+            return {"type": "xlsx_row_count", "path": relative}
+
+    for level in ("species", "genus", "family"):
+        microbial = ((sections.get("microbial_profile") or {}).get(level) or {})
+        base = f"/sections/microbial_profile/{level}"
+        relative = _relative_report_path(microbial.get("table"), run_dir)
+        if pointer == f"{base}/taxa_count" and relative:
+            return {"type": "line_count", "path": relative, "header": True}
+        match = re.fullmatch(re.escape(base) + r"/top_taxa/([^/]+)/fraction", pointer)
+        if match and relative:
+            sample_id = match.group(1).replace("~1", "/").replace("~0", "~")
+            return {
+                "type": "delimited_aggregate",
+                "path": relative,
+                "delimiter": "\t",
+                "column": f"{sample_id}_frac",
+                "operation": "max",
+            }
+
+    quantification = sections.get("virus_quantification") or {}
+    quant_path = _relative_report_path(quantification.get("table"), run_dir)
+    quant_sources = {
+        "/sections/virus_quantification/record_count": ("count", None),
+        "/sections/virus_quantification/sample_count": ("distinct_count", "sample_id"),
+        "/sections/virus_quantification/reference_count": ("distinct_count", "reference_id"),
+        "/sections/virus_quantification/max_rpm": ("max", "RPM"),
+    }
+    if pointer in quant_sources and quant_path:
+        operation, column = quant_sources[pointer]
+        return {
+            "type": "delimited_aggregate",
+            "path": quant_path,
+            "delimiter": ",",
+            "operation": operation,
+            **({"column": column} if column else {}),
+        }
+
+    annotation_sources = {
+        "/sections/virus_annotation/filtered_sequence_count": (
+            "fasta_count",
+            "results/virus-annotation/results/checkv/filtered_viral_gt50.fna",
+        ),
+        "/sections/virus_annotation/functional_annotation_count": (
+            "line_count",
+            "results/virus-annotation/results/function/dramv/annotations.tsv",
+        ),
+        "/sections/virus_annotation/consistency_warning_count": (
+            "line_count",
+            "results/virus-annotation/results/summary/consistency_report.tsv",
+        ),
+    }
+    if pointer in annotation_sources:
+        source_type, path = annotation_sources[pointer]
+        return {
+            "type": source_type,
+            "path": path,
+            **({"header": True} if source_type == "line_count" else {}),
+        }
+
+    upstream = sections.get("upstream")
+    match = re.fullmatch(
+        r"/sections/upstream/samples/(\d+)/fastp/(before|after)/(reads|bases)",
+        pointer,
+    )
+    if isinstance(upstream, dict) and match:
+        sample_index, side, metric = int(match.group(1)), match.group(2), match.group(3)
+        samples = upstream.get("samples") or []
+        if sample_index < len(samples):
+            reports = ((samples[sample_index].get("fastp") or {}).get("reports") or [])
+            if len(reports) == 1:
+                relative = _relative_report_path(reports[0], run_dir)
+                if relative:
+                    raw_side = "before_filtering" if side == "before" else "after_filtering"
+                    raw_metric = "total_reads" if metric == "reads" else "total_bases"
+                    return {
+                        "type": "json",
+                        "path": relative,
+                        "pointer": f"/summary/{raw_side}/{raw_metric}",
+                    }
+    return None
+
+
+def _report_conclusions(
+    delivery: dict[str, Any], evidence_by_pointer: dict[str, str]
+) -> list[dict[str, Any]]:
+    conclusions: list[dict[str, Any]] = []
+
+    def add(text: str, pointers: list[str]) -> None:
+        evidence_ids = [evidence_by_pointer[pointer] for pointer in pointers if pointer in evidence_by_pointer]
+        if evidence_ids:
+            conclusions.append(
+                {
+                    "id": f"C-{len(conclusions) + 1:04d}",
+                    "text": text,
+                    "evidence_ids": evidence_ids,
+                }
+            )
+
+    if isinstance(delivery.get("screening"), dict):
+        samples = delivery["screening"].get("samples") or []
+        for index, sample in enumerate(samples):
+            top = sample.get("top_species") or {}
+            base = f"/screening/samples/{index}"
+            pointers = [
+                f"{base}/sampled_read_pairs",
+                f"{base}/viral_reads",
+                f"{base}/top_species/reads",
+                f"{base}/top_species_sample_fraction",
+                f"{base}/top_species_viral_fraction",
+            ]
+            for check_index, _check in enumerate(sample.get("confidence_checks") or []):
+                pointers.extend(
+                    [
+                        f"{base}/confidence_checks/{check_index}/actual",
+                        f"{base}/confidence_checks/{check_index}/threshold",
+                    ]
+                )
+            confidence_text = (
+                "三项门槛均通过，判为高置信。"
+                if sample.get("known_virus_high_confidence") is True
+                else "未通过全部三项门槛，不形成高置信结论。"
+            )
+            add(
+                f'样本 {sample.get("sample_id") or "—"} 的 5% 初筛最高物种为 '
+                f'{top.get("name") or "—"}，命中 {top.get("reads") or 0} reads；'
+                f'样本占比 {float(sample.get("top_species_sample_fraction") or 0) * 100:.4f}%，'
+                f'病毒内占比 {float(sample.get("top_species_viral_fraction") or 0) * 100:.2f}%；'
+                f'{confidence_text}',
+                pointers,
+            )
+
+    sections = delivery.get("sections") or {}
+    upstream = sections.get("upstream")
+    if isinstance(upstream, dict):
+        for index, sample in enumerate(upstream.get("samples") or []):
+            sample_id = sample.get("sample_id") or "—"
+            fastp = sample.get("fastp") or {}
+            if isinstance(fastp.get("reads_retained_percent"), (int, float)):
+                pointer = f"/sections/upstream/samples/{index}/fastp/reads_retained_percent"
+                add(f'样本 {sample_id} 经 fastp 后 Reads 保留率为 {fastp["reads_retained_percent"]:.2f}%。', [pointer])
+            rrna = sample.get("rrna") or {}
+            if isinstance(rrna.get("reads_retained_percent"), (int, float)):
+                pointer = f"/sections/upstream/samples/{index}/rrna/reads_retained_percent"
+                add(f'样本 {sample_id} 去 rRNA 后 Reads 保留率为 {rrna["reads_retained_percent"]:.2f}%。', [pointer])
+            assembly = sample.get("assembly") or {}
+            if isinstance(assembly.get("reads"), (int, float)):
+                pointers = [f"/sections/upstream/samples/{index}/assembly/reads"]
+                if isinstance(assembly.get("n50"), (int, float)):
+                    pointers.append(f"/sections/upstream/samples/{index}/assembly/n50")
+                add(
+                    f'样本 {sample_id} 组装产生 {assembly.get("reads")} 条 Contigs'
+                    + (f'，N50 为 {assembly.get("n50")} bp。' if assembly.get("n50") is not None else '。'),
+                    pointers,
+                )
+
+    classification = sections.get("virus_identification")
+    if isinstance(classification, dict):
+        candidate_pointer = "/sections/virus_identification/candidate_count"
+        candidate_count = classification.get("candidate_count")
+        add(
+            "未检出符合流程判定条件的病毒候选。"
+            if candidate_count == 0
+            else f"固定流程检出 {candidate_count} 条候选病毒 Contigs。",
+            [candidate_pointer],
+        )
+        for index, item in enumerate(classification.get("representatives") or []):
+            numeric_fields = [
+                field
+                for field in ("completeness", "contamination", "nr_pident", "approval_rate")
+                if isinstance(item.get(field), (int, float))
+            ]
+            if numeric_fields:
+                label = item.get("nr_svfamily") or item.get("vhdb_svfamily") or item.get("nr_besthit") or "未定分类"
+                add(
+                    f'代表序列 {item.get("qseqid") or "—"} 的流程分类结果为 {label}；数值证据见引用。',
+                    [f"/sections/virus_identification/representatives/{index}/{field}" for field in numeric_fields],
+                )
+
+    simple_conclusions = [
+        ("host_identification", "identified_result_count", "宿主鉴定结果记录数"),
+        ("virus_quantification", "max_rpm", "病毒定量结果中的最高 RPM"),
+        ("virus_annotation", "filtered_sequence_count", "质量过滤后病毒序列数"),
+        ("virus_annotation", "functional_annotation_count", "功能注释记录数"),
+        ("virus_annotation", "consistency_warning_count", "一致性警告数"),
+    ]
+    for section_name, key, label in simple_conclusions:
+        value = (sections.get(section_name) or {}).get(key)
+        if isinstance(value, (int, float)):
+            add(f"{label}为 {value}。", [f"/sections/{section_name}/{key}"])
+    for level, item in (sections.get("microbial_profile") or {}).items():
+        if isinstance(item, dict) and isinstance(item.get("taxa_count"), (int, float)):
+            add(
+                f"微生物 {level} 层级记录 {item['taxa_count']} 个分类单元。",
+                [f"/sections/microbial_profile/{level}/taxa_count"],
+            )
+    return conclusions
+
+
+def _attach_report_evidence(
+    delivery: dict[str, Any],
+    state: dict[str, Any],
+    run_dir: Path,
+    telemetry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    delivery["schema_version"] = 4
+    evidence = []
+    evidence_by_pointer: dict[str, str] = {}
+    for pointer, value in _walk_numeric(delivery):
+        evidence_id = f"E-{len(evidence) + 1:04d}"
+        record = {
+            "id": evidence_id,
+            "label": pointer.rsplit("/", 1)[-1].replace("_", " "),
+            "value": value,
+            "unit": _evidence_unit(pointer),
+            "report_pointer": pointer,
+        }
+        retention = re.fullmatch(
+            r"(.+)/(fastp|rrna)/(reads|bases)_retained_percent",
+            pointer,
+        )
+        if retention:
+            base, stage, metric = retention.groups()
+            after_pointer = f"{base}/{stage}/after/{metric}"
+            before_pointer = f"{base}/{stage}/before/{metric}"
+            if after_pointer in evidence_by_pointer and before_pointer in evidence_by_pointer:
+                record["derivation"] = {
+                    "operation": "percent",
+                    "inputs": [
+                        evidence_by_pointer[after_pointer],
+                        evidence_by_pointer[before_pointer],
+                    ],
+                }
+        if "derivation" not in record:
+            record["source"] = _special_evidence_source(pointer, delivery, run_dir) or {
+                "type": "json",
+                "path": ".bioagent/telemetry.json",
+                "pointer": f"/delivery_report{pointer}",
+            }
+        evidence.append(record)
+        evidence_by_pointer[pointer] = evidence_id
+    delivery["evidence"] = evidence
+    delivery["conclusions"] = _report_conclusions(delivery, evidence_by_pointer)
+    if isinstance(telemetry, dict):
+        technical_snapshot = {
+            key: value
+            for key, value in telemetry.items()
+            if key != "delivery_report"
+        }
+        for pointer, value in _walk_numeric(technical_snapshot):
+            evidence.append(
+                {
+                    "id": f"E-{len(evidence) + 1:04d}",
+                    "label": pointer.rsplit("/", 1)[-1].replace("_", " "),
+                    "value": value,
+                    "unit": _evidence_unit(pointer),
+                    "telemetry_pointer": pointer,
+                    "source": {
+                        "type": "json",
+                        "path": ".bioagent/telemetry.json",
+                        "pointer": pointer,
+                    },
+                }
+            )
+    return delivery
 
 
 def _software_versions(
@@ -1801,7 +2173,7 @@ def _terminal_adaptive_state(
     state["report"] = {
         "status": "ready" if report_available else "unavailable",
         "available": report_available,
-        "schema_version": 3,
+        "schema_version": 4,
         "telemetry": str(state_path.parent / "telemetry.json"),
     }
     telemetry.update(
@@ -1985,13 +2357,18 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         _finish_routing_record(routing_record, phase="blocked", success=False)
         state["routing"] = routing_record
         telemetry["routing"] = routing_record
-        telemetry["delivery_report"] = {
-            "schema_version": 3,
-            "kind": "analysis_pipeline",
-            "report_kind": "preliminary_screen",
-            "routing": routing_record,
-            "screening": screening,
-        }
+        telemetry["delivery_report"] = _attach_report_evidence(
+            {
+                "schema_version": 4,
+                "kind": "analysis_pipeline",
+                "report_kind": "preliminary_screen",
+                "routing": routing_record,
+                "screening": screening,
+            },
+            state,
+            run_dir,
+            telemetry,
+        )
         _write_json_atomic(routing_path, routing_record)
         return _terminal_adaptive_state(
             state_path,
@@ -2010,13 +2387,18 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         _finish_routing_record(routing_record, phase="completed", success=True)
         state["routing"] = routing_record
         telemetry["routing"] = routing_record
-        telemetry["delivery_report"] = {
-            "schema_version": 3,
-            "kind": "analysis_pipeline",
-            "report_kind": decision["report_kind"],
-            "routing": routing_record,
-            "screening": screening,
-        }
+        telemetry["delivery_report"] = _attach_report_evidence(
+            {
+                "schema_version": 4,
+                "kind": "analysis_pipeline",
+                "report_kind": decision["report_kind"],
+                "routing": routing_record,
+                "screening": screening,
+            },
+            state,
+            run_dir,
+            telemetry,
+        )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
             f"Adaptive route A completed: {decision['report_kind']}\n",
@@ -2459,10 +2841,15 @@ def run(args: argparse.Namespace) -> int:
         state["report"] = {
             "status": "ready" if returncode == 0 else "unavailable",
             "available": returncode == 0,
-            "schema_version": 3,
+            "schema_version": 4,
             "telemetry": str(telemetry_path),
         }
-        telemetry["delivery_report"] = _pipeline_report_data(state, run_dir, telemetry)
+        telemetry["delivery_report"] = _attach_report_evidence(
+            _pipeline_report_data(state, run_dir, telemetry),
+            state,
+            run_dir,
+            telemetry,
+        )
         telemetry["resource_profile"] = build_run_resource_profile(
             state,
             telemetry,

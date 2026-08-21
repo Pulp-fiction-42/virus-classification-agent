@@ -14,6 +14,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from analysis_runner import (
+    _attach_report_evidence,
     _classification_report_data,
     _instrument_workflow1,
     _instrument_workflow2,
@@ -787,10 +788,10 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 )
                 self.assertTrue(state["technical_report"]["available"])
                 self.assertEqual(state["report"]["available"], exit_code == 0)
-                self.assertEqual(state["report"]["schema_version"], 3)
+                self.assertEqual(state["report"]["schema_version"], 4)
                 self.assertEqual(
                     telemetry["delivery_report"]["schema_version"],
-                    3,
+                    4,
                 )
                 selected_stage_statuses = [
                     stage["status"]
@@ -1409,6 +1410,47 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 "putative_viralcontigs.fna"
             )
         )
+
+    def test_report_evidence_links_conclusions_to_raw_classification_table(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            tables = run_dir / "results/virus-identification/summary/tables"
+            tables.mkdir(parents=True)
+            candidates = tables / "virus_candidates.csv"
+            candidates.write_text("qseqid\ncontig-1\n", encoding="utf-8")
+            delivery = {
+                "schema_version": 4,
+                "kind": "analysis_pipeline",
+                "sections": {
+                    "virus_identification": {
+                        "candidate_count": 1,
+                        "representative_count": 0,
+                        "vertebrate_candidate_count": 0,
+                        "vertebrate_representative_count": 0,
+                        "representatives": [],
+                        "tables": {
+                            "candidates": str(candidates),
+                            "representatives": str(tables / "virus_representatives.csv"),
+                            "vertebrate_candidates": str(tables / "vertebrate_virus_candidates.csv"),
+                            "vertebrate_representatives": str(tables / "vertebrate_virus_representatives.csv"),
+                        },
+                    }
+                },
+                "stages": [],
+                "manifest": {},
+            }
+
+            result = _attach_report_evidence(delivery, {}, run_dir)
+
+        evidence = next(
+            item
+            for item in result["evidence"]
+            if item["report_pointer"]
+            == "/sections/virus_identification/candidate_count"
+        )
+        self.assertEqual(evidence["source"]["type"], "delimited_count")
+        self.assertEqual(evidence["source"]["path"], "results/virus-identification/summary/tables/virus_candidates.csv")
+        self.assertEqual(result["conclusions"][0]["evidence_ids"], [evidence["id"]])
 
     def test_pipeline_report_extracts_branch_specific_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:

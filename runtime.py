@@ -19,10 +19,13 @@ from typing import Any
 
 try:
     from claude_agent_sdk import (
+        AssistantMessage,
         ClaudeAgentOptions,
         ClaudeSDKClient,
         ResultMessage,
         StreamEvent,
+        ThinkingBlock,
+        ToolUseBlock,
     )
 except (
     ModuleNotFoundError
@@ -64,6 +67,25 @@ except (
         result: str | None = None
         errors: list[str] | None = None
         subtype: str = "success"
+
+    @dataclass
+    class ThinkingBlock:  # type: ignore[no-redef]
+        thinking: str
+        signature: str = ""
+
+    @dataclass
+    class ToolUseBlock:  # type: ignore[no-redef]
+        id: str
+        name: str
+        input: dict[str, Any]
+
+    @dataclass
+    class AssistantMessage:  # type: ignore[no-redef]
+        content: list[Any]
+        model: str = ""
+        uuid: str | None = None
+        message_id: str | None = None
+        parent_tool_use_id: str | None = None
 
     @dataclass
     class StreamEvent:  # type: ignore[no-redef]
@@ -225,6 +247,8 @@ class SessionManager:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.chat_map_dir = self.config_dir / "bioagent" / "chat-map"
         self.chat_map_dir.mkdir(parents=True, exist_ok=True)
+        self.agent_trace_dir = self.config_dir / "bioagent" / "agent-traces"
+        self.agent_trace_dir.mkdir(parents=True, exist_ok=True)
         self.sdk_config_dir = sdk_config_dir.resolve()
         self._prepare_sdk_config_dir()
         self.analysis_plan_dir = self.config_dir / "bioagent" / "analysis-plans"
@@ -312,6 +336,8 @@ class SessionManager:
                     if text:
                         for visible_text in control_filter.push(text):
                             yield TextDelta(visible_text)
+                elif isinstance(message, AssistantMessage):
+                    self._record_assistant_trace(normalized_chat_id, message)
                 elif isinstance(message, ResultMessage):
                     result_seen = True
                     self._record_result(normalized_chat_id, session, message)
@@ -533,6 +559,11 @@ class SessionManager:
             permission_mode=permission_mode,
             resume=resume,
             model=config.MODEL,
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 20_000,
+                "display": "summarized",
+            },
             include_partial_messages=True,
             cwd=self.project_root,
             add_dirs=config.EXTRA_DIRS,
@@ -903,11 +934,12 @@ class SessionManager:
                 "available": False,
                 "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
                 "telemetry_version": 3,
+                "agent_trace": str(run_dir / ".bioagent" / "agent-trace.jsonl"),
             },
             "report": {
                 "status": "collecting",
                 "available": False,
-                "schema_version": 2,
+                "schema_version": 4,
                 "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
             },
         }
@@ -917,6 +949,7 @@ class SessionManager:
             bioagent_dir.mkdir(parents=True, exist_ok=True)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.touch(exist_ok=True)
+            self._snapshot_agent_trace(chat_id, bioagent_dir / "agent-trace.jsonl")
             self._write_json_atomic(state_path, state)
         except OSError as exc:
             raise SessionStateError(
@@ -986,6 +1019,94 @@ class SessionManager:
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         tmp_path.replace(path)
+
+    def _agent_trace_path(self, chat_id: str) -> Path:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", chat_id)
+        return self.agent_trace_dir / f"{safe_name}.jsonl"
+
+    @classmethod
+    def _redact_trace_value(cls, value: Any, key: str = "") -> Any:
+        if re.search(r"token|secret|password|api[_-]?key|authorization", key, re.I):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {
+                str(item_key): cls._redact_trace_value(item, str(item_key))
+                for item_key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._redact_trace_value(item) for item in value]
+        if isinstance(value, str):
+            return re.sub(
+                r"(?i)(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+",
+                r"\1[REDACTED]",
+                value,
+            )
+        return value
+
+    def _record_assistant_trace(self, chat_id: str, message: AssistantMessage) -> None:
+        message_id = (
+            getattr(message, "uuid", None)
+            or getattr(message, "message_id", None)
+            or str(uuid.uuid4())
+        )
+        records = []
+        for index, block in enumerate(message.content):
+            event_id = f"{message_id}:{index}"
+            if isinstance(block, ThinkingBlock) and block.thinking.strip():
+                records.append(
+                    {
+                        "version": 1,
+                        "id": event_id,
+                        "type": "thinking_summary",
+                        "timestamp": datetime.now()
+                        .astimezone()
+                        .isoformat(timespec="seconds"),
+                        "message_id": message_id,
+                        "thinking": block.thinking.strip(),
+                    }
+                )
+            elif isinstance(block, ToolUseBlock):
+                records.append(
+                    {
+                        "version": 1,
+                        "id": event_id,
+                        "type": "tool_use",
+                        "timestamp": datetime.now()
+                        .astimezone()
+                        .isoformat(timespec="seconds"),
+                        "message_id": message_id,
+                        "tool": block.name,
+                        "input": self._redact_trace_value(block.input),
+                    }
+                )
+        if not records:
+            return
+
+        path = self._agent_trace_path(chat_id)
+        existing_ids: set[str] = set()
+        if path.is_file():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        value = json.loads(line)
+                        if isinstance(value, dict) and isinstance(value.get("id"), str):
+                            existing_ids.add(value["id"])
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise SessionStateError(f"Cannot read agent trace: {path}") from exc
+        new_records = [record for record in records if record["id"] not in existing_ids]
+        if not new_records:
+            return
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                for record in new_records:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            raise SessionStateError(f"Cannot write agent trace: {path}") from exc
+
+    def _snapshot_agent_trace(self, chat_id: str, destination: Path) -> None:
+        source = self._agent_trace_path(chat_id)
+        content = source.read_text(encoding="utf-8") if source.is_file() else ""
+        destination.write_text(content, encoding="utf-8")
 
     def _chat_map_path(self, chat_id: str) -> Path:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", chat_id)
