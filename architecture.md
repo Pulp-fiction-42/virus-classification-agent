@@ -49,16 +49,17 @@ MiniMax Anthropic-compatible API
 
 ### `workflow_adapters.py`
 
-- `workflow1` adapter 验证并准备任意连续的 reads 预处理或组装区段。
-- `virus_classification` adapter 接受原始双端 reads 或 contigs；前者准备上游与分类两个 phase，后者只准备分类 phase。
-- 每个 phase 使用独立的 run-local workflow、结果目录、配置、source cache 和 targets。分类源码固定来自 `workflow2_virusid_2026db`。
+- 唯一外部 adapter 是 `analysis_pipeline` v2；旧 adapter 不再接受。
+- `workflow_catalog.py` 定义 artifact 文件角色、记录粒度和公开 stage DAG，`pipeline_spec.py` 从输入与交付物编译最小依赖闭包。
+- workflow 1–6 各自最多生成一个 run-local phase；同一 source workflow 的 targets 合并，跨 workflow 按拓扑顺序复用上游产物。
+- 中间入口只物化完整 typed artifact bundle；占位仅用于 Snakemake 必需但无生物学意义的伴随文件。
 
 ### `analysis_runner.py`
 
-- 固定 runner 只接受 state 路径，按 adapter 生成的 phase 顺序执行 Snakemake；任一 phase 失败或取消后立即停止。
-- state v3 与 telemetry v3 汇总 phase、job、资源、命令、manifest、上游序列指标和病毒分类结果。
+- 固定 runner 只接受 state 路径，按编译后的 phase 顺序执行 Snakemake；任一 phase 失败或取消后立即停止。
+- state v3 与 telemetry v3 汇总 phase、job、资源、命令、manifest，以及上游、病毒识别、宿主、微生物谱、定量和注释指标。
 - runner 每秒采样 Snakemake process tree RSS、整机内存和并行 analysis runner 数，并在终态更新资源历史索引；失败或取消记录只供稽核，不进入分位数。
-- workflow2 的 run-local 副本会增加 benchmark 与机器可读分类 CSV；源 workflow 不被修改。
+- workflow 1–6 的 run-local 副本增加 benchmark；workflow2 另增加机器可读分类 CSV。源 workflow 不被修改。
 
 ### `.claude/skills/`
 

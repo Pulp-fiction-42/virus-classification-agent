@@ -11,6 +11,7 @@ from pathlib import Path
 
 import config
 import runtime
+from pipeline_spec import normalize_execution_spec, selected_rules
 from runtime import (
     EXECUTE_MODE,
     PLAN_MODE,
@@ -22,7 +23,6 @@ from runtime import (
     SessionStateError,
     TextDelta,
 )
-from workflow_adapters import normalize_execution_spec, selected_rules
 
 
 MESSAGES = [
@@ -153,34 +153,34 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "log_path": str(run_dir / ".bioagent" / "execution.log"),
             },
             "steps": [
-                {"id": "step_1", "label": "质控", "tool": "fastp", "rules": ["fastp"]},
+                {"id": "read_qc", "label": "序列质控", "tool": "fastp", "rules": ["fastp"]},
                 {
-                    "id": "step_2",
-                    "label": "去 rRNA",
+                    "id": "rrna_filter",
+                    "label": "去除 rRNA",
                     "tool": "Bowtie2",
                     "rules": ["bowtie2"],
                 },
             ],
             "execution_spec": {
-                "adapter": "workflow1",
-                "entry_rule": "fastp",
-                "exit_rule": "bowtie2",
+                "version": 2,
+                "adapter": "analysis_pipeline",
                 "inputs": [
                     {
                         "id": "primary",
                         "type": "raw_paired_reads",
-                        "data": {
-                            "runs": [
-                                {
-                                    "run_id": "run",
-                                    "sample_id": "sample",
-                                    "read1": "/data/input_r1.fastq.gz",
-                                    "read2": "/data/input_r2.fastq.gz",
-                                }
-                            ]
-                        },
+                        "records": [{
+                            "run_id": "run",
+                            "sample_id": "sample",
+                            "files": {
+                                "read1": "/data/input_r1.fastq.gz",
+                                "read2": "/data/input_r2.fastq.gz",
+                            },
+                        }],
                     }
                 ],
+                "deliverables": ["rrna_filter"],
+                "options": {"viral_type": "RNA+DNA"},
+                "policy": {"mode": "standard"},
             },
         }
 
@@ -436,7 +436,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             """
 ```analysis_plan
 {
-  "version": 1,
+  "version": 2,
   "title": "测序质控与分类方案",
   "ready_to_execute": true,
   "steps": [
@@ -444,19 +444,23 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
     {"label": "去 rRNA", "tool": "Bowtie2", "rules": ["bowtie2"]}
   ],
   "execution_spec": {
-    "adapter": "workflow1",
-    "entry_rule": "fastp",
-    "exit_rule": "bowtie2",
+    "version": 2,
+    "adapter": "analysis_pipeline",
     "inputs": [{
       "id": "primary",
       "type": "raw_paired_reads",
-      "data": {"runs": [{
+      "records": [{
         "run_id": "run",
         "sample_id": "sample",
-        "read1": "/data/input_r1.fastq.gz",
-        "read2": "/data/input_r2.fastq.gz"
-      }]}
-    }]
+        "files": {
+          "read1": "/data/input_r1.fastq.gz",
+          "read2": "/data/input_r2.fastq.gz"
+        }
+      }]
+    }],
+    "deliverables": ["rrna_filter"],
+    "options": {"viral_type": "RNA+DNA"},
+    "policy": {"mode": "standard"}
   },
   "resource_estimate": {
     "eta": "约 1 小时",
@@ -483,11 +487,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(item["ready_to_execute"])
         self.assertEqual(
             [step["label"] for step in item["steps"]],
-            ["质控", "去 rRNA"],
+            ["序列质控", "去除 rRNA"],
         )
         self.assertEqual(item["steps"][0]["rules"], ["fastp"])
         self.assertEqual(item["steps"][1]["rules"], ["bowtie2"])
-        self.assertEqual(item["execution_spec"]["exit_rule"], "bowtie2")
+        self.assertEqual(item["execution_spec"]["adapter"], "analysis_pipeline")
+        self.assertEqual(item["execution_spec"]["deliverables"], ["rrna_filter"])
         self.assertEqual(item["resource_estimate"]["version"], 1)
         self.assertEqual(item["resource_estimate"]["confidence"], "low")
         self.assertNotIn("eta", item["resource_estimate"])
@@ -591,7 +596,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         FakeClient.response_text_parts = [
             """第一版。
 ```analysis_plan
-{"title":"完整流程","ready_to_execute":true,"steps":[{"label":"质控"},{"label":"组装"}]}
+{"title":"完整流程","ready_to_execute":true,"execution_spec":{"version":2,"adapter":"analysis_pipeline","inputs":[{"id":"primary","type":"raw_paired_reads","records":[{"run_id":"run","sample_id":"sample","files":{"read1":"/data/r1.fq.gz","read2":"/data/r2.fq.gz"}}]}],"deliverables":["assembly"],"policy":{"mode":"standard"}}}
 ```
 """
         ]
@@ -600,7 +605,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         FakeClient.response_text_parts = [
             """已按要求移除组装。
 ```analysis_plan
-{"title":"质控流程","ready_to_execute":true,"steps":[{"label":"宽松质控"}]}
+{"title":"质控流程","ready_to_execute":true,"execution_spec":{"version":2,"adapter":"analysis_pipeline","inputs":[{"id":"primary","type":"raw_paired_reads","records":[{"run_id":"run","sample_id":"sample","files":{"read1":"/data/r1.fq.gz","read2":"/data/r2.fq.gz"}}]}],"deliverables":["read_qc"],"policy":{"mode":"standard"}}}
 ```
 """
         ]
@@ -614,7 +619,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             event.item for event in events if isinstance(event, OutputItemAdded)
         ]
 
-        self.assertEqual([step["label"] for step in saved["steps"]], ["宽松质控"])
+        self.assertEqual([step["label"] for step in saved["steps"]], ["序列质控"])
         self.assertEqual(output_items[0]["run"]["run_id"], saved["run"]["run_id"])
 
     async def test_execute_without_ready_plan_does_not_query_client(self):
@@ -652,16 +657,17 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             "ready_to_execute": True,
             "steps": [{"label": "样本合并", "rules": ["merge"]}],
             "execution_spec": {
-                "adapter": "workflow1",
-                "entry_rule": "merge",
-                "exit_rule": "merge",
+                "version": 2,
+                "adapter": "analysis_pipeline",
                 "inputs": [
                     {
                         "id": "primary",
                         "type": "raw_paired_reads",
-                        "data": {"runs": []},
+                        "records": [],
                     }
                 ],
+                "deliverables": ["sample_merge"],
+                "policy": {"mode": "standard"},
             },
         }
 
@@ -672,21 +678,17 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("execution_spec", plan)
         self.assertIn("输入文件信息", plan["blocking_reason"])
 
-    def test_missing_workflow1_boundaries_are_inferred_from_latest_plan_shape(self):
+    def test_runtime_compiles_canonical_stages_without_model_steps(self):
         raw_plan = {
             "title": "病毒宏基因组上游流程",
             "ready_to_execute": True,
-            "steps": [
-                {"label": "质控", "rules": ["fastp"]},
-                {"label": "去 rRNA", "rules": ["bowtie2"]},
-                {"label": "样本合并", "rules": ["merge"]},
-                {"label": "组装", "rules": ["megahit"]},
-                {"label": "重命名过滤", "rules": ["rename_filter"]},
-            ],
             "execution_spec": {
-                "adapter": "workflow1",
-                "viral_type": "RNA+DNA",
+                "version": 2,
+                "adapter": "analysis_pipeline",
                 "inputs": self.ready_plan()["execution_spec"]["inputs"],
+                "deliverables": ["contig_filter"],
+                "options": {"viral_type": "RNA+DNA"},
+                "policy": {"mode": "standard"},
             },
         }
 
@@ -694,9 +696,11 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(plan)
         self.assertTrue(plan["ready_to_execute"])
-        self.assertEqual(plan["execution_spec"]["entry_rule"], "fastp")
-        self.assertEqual(plan["execution_spec"]["exit_rule"], "rename_filter")
-        self.assertNotIn("viral_type", plan["execution_spec"])
+        self.assertEqual(
+            [step["id"] for step in plan["steps"]],
+            ["read_qc", "rrna_filter", "sample_merge", "assembly", "contig_filter"],
+        )
+        self.assertEqual(plan["execution_spec"]["adapter"], "analysis_pipeline")
         self.assertNotIn("blocking_reason", plan)
 
     def test_invalid_workflow1_rules_expose_blocking_reason(self):
@@ -742,16 +746,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_ui_routing_overrides_model_and_deep_plan_is_unready(self):
         execution_spec = {
-            "adapter": "adaptive_virus_analysis",
-            "viral_type": "RNA+DNA",
-            "routing": {"mode": "standard"},
-            "inputs": self.ready_plan()["execution_spec"]["inputs"],
+            **self.ready_plan()["execution_spec"],
+            "deliverables": ["virus_summary"],
         }
-        rules = selected_rules(normalize_execution_spec(execution_spec))
         raw_plan = {
             "title": "自适应病毒分析",
             "ready_to_execute": True,
-            "steps": [{"label": rule, "rules": [rule]} for rule in rules],
             "execution_spec": execution_spec,
         }
 
@@ -764,7 +764,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             routing_request={"mode": "deep"},
         )
 
-        self.assertEqual(emergency["routing"]["mode"], "emergency")
+        self.assertEqual(emergency["routing"]["requested_mode"], "emergency")
+        self.assertEqual(emergency["routing"]["effective_mode"], "emergency")
         self.assertEqual(emergency["routing"]["deadline_seconds"], 18_000)
         self.assertEqual(emergency["routing"]["sample_fraction"], 0.05)
         self.assertEqual(emergency["routing"]["available_routes"], ["A", "B"])
@@ -774,15 +775,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_ui_routing_upgrades_raw_classification_to_adaptive(self):
         execution_spec = {
-            "adapter": "virus_classification",
-            "viral_type": "RNA+DNA",
-            "inputs": self.ready_plan()["execution_spec"]["inputs"],
+            **self.ready_plan()["execution_spec"],
+            "deliverables": ["virus_summary"],
         }
-        rules = selected_rules(normalize_execution_spec(execution_spec))
         raw_plan = {
             "title": "病毒分类分析",
             "ready_to_execute": True,
-            "steps": [{"label": rule, "rules": [rule]} for rule in rules],
             "execution_spec": execution_spec,
         }
 
@@ -800,17 +798,16 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(plan["ready_to_execute"])
                 self.assertEqual(
                     plan["execution_spec"]["adapter"],
-                    "adaptive_virus_analysis",
+                    "analysis_pipeline",
                 )
-                self.assertEqual(plan["execution_spec"]["routing"], routing)
-                self.assertEqual(plan["routing"]["mode"], routing["mode"])
-                self.assertEqual(
-                    [step["rules"] for step in plan["steps"][:2]],
-                    [["adaptive_screen"], ["adaptive_route"]],
-                )
-                self.assertEqual(plan["steps"][0]["label"], "5% 快速初筛")
-                self.assertEqual(plan["steps"][0]["tool"], "Kraken2")
-                self.assertEqual(plan["steps"][1]["label"], "自适应路由决策")
+                self.assertEqual(plan["routing"]["requested_mode"], routing["mode"])
+                if routing["mode"] == "standard":
+                    self.assertEqual(plan["steps"][0]["id"], "read_qc")
+                else:
+                    self.assertEqual(
+                        [step["id"] for step in plan["steps"][:2]],
+                        ["adaptive_screen", "adaptive_route"],
+                    )
                 self.assertEqual(
                     tuple(
                         rule
@@ -820,7 +817,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                     selected_rules(plan["execution_spec"]),
                 )
 
-    def test_ui_routing_does_not_convert_workflow1_or_contigs(self):
+    def test_ui_routing_applies_to_reads_and_falls_back_for_contigs(self):
         workflow1 = self.ready_plan()
         workflow1_plan = self.manager._build_analysis_plan(
             {
@@ -832,43 +829,39 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             routing_request={"mode": "auto"},
         )
         contigs_spec = {
-            "adapter": "virus_classification",
-            "viral_type": "RNA",
+            "version": 2,
+            "adapter": "analysis_pipeline",
             "inputs": [
                 {
                     "id": "primary",
                     "type": "contigs_fasta",
-                    "data": {
-                        "samples": [
-                            {
-                                "sample_id": "sample",
-                                "path": "/data/input_contigs.fasta",
-                            }
-                        ]
-                    },
+                    "records": [{
+                        "sample_id": "sample",
+                        "files": {"fasta": "/data/input_contigs.fasta"},
+                    }],
                 }
             ],
+            "deliverables": ["virus_summary"],
+            "options": {"viral_type": "RNA"},
+            "policy": {"mode": "standard"},
         }
         contigs_plan = self.manager._build_analysis_plan(
             {
                 "title": "Contigs 病毒分类",
                 "ready_to_execute": True,
-                "steps": [
-                    {"label": rule, "rules": [rule]}
-                    for rule in selected_rules(normalize_execution_spec(contigs_spec))
-                ],
                 "execution_spec": contigs_spec,
             },
             routing_request={"mode": "auto"},
         )
 
-        self.assertEqual(workflow1_plan["execution_spec"]["adapter"], "workflow1")
-        self.assertNotIn("routing", workflow1_plan)
+        self.assertEqual(workflow1_plan["execution_spec"]["adapter"], "analysis_pipeline")
+        self.assertTrue(workflow1_plan["routing"]["adaptive"])
         self.assertEqual(
             contigs_plan["execution_spec"]["adapter"],
-            "virus_classification",
+            "analysis_pipeline",
         )
-        self.assertNotIn("routing", contigs_plan)
+        self.assertFalse(contigs_plan["routing"]["adaptive"])
+        self.assertEqual(contigs_plan["routing"]["effective_mode"], "standard")
 
     async def test_execute_starts_runner_and_returns_structured_run(self):
         plan = self.ready_plan()
@@ -892,7 +885,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(state["steps"][0]["rules"], ["fastp"])
         self.assertEqual(state["steps"][1]["rules"], ["bowtie2"])
-        self.assertEqual(state["execution_spec"], plan["execution_spec"])
+        self.assertEqual(
+            state["execution_spec"], normalize_execution_spec(plan["execution_spec"])
+        )
         self.assertEqual(state["execution"]["status"], "running")
         self.assertEqual(state["execution"]["pid"], 4321)
         self.assertEqual(len(self.launches), 1)
@@ -1132,13 +1127,13 @@ temporary.replace(path)
         self.assertIn("analysis_plan", config.SYSTEM_PROMPT)
         self.assertIn("```analysis_plan", config.SYSTEM_PROMPT)
         self.assertIn('"ready_to_execute"', config.SYSTEM_PROMPT)
-        self.assertIn('"steps"', config.SYSTEM_PROMPT)
+        self.assertIn("Do not include model-authored steps", config.SYSTEM_PROMPT)
         self.assertIn('"execution_spec"', config.SYSTEM_PROMPT)
         self.assertIn('"viral_type"', config.SYSTEM_PROMPT)
-        self.assertIn("workflow1 entry_rule and exit_rule", config.SYSTEM_PROMPT)
+        self.assertIn("analysis_pipeline version 2", config.SYSTEM_PROMPT)
         self.assertIn("Do not create run directories", config.SYSTEM_PROMPT)
-        self.assertIn("parameter defaults never block execution", config.SYSTEM_PROMPT)
-        self.assertIn("final content in the response", config.SYSTEM_PROMPT)
+        self.assertIn("Multiple deliverables are allowed", config.SYSTEM_PROMPT)
+        self.assertIn("final analysis_plan fenced block", config.SYSTEM_PROMPT)
         self.assertNotIn("RUNTIME RUNNER COMMAND", config.SYSTEM_PROMPT)
         self.assertNotIn("```diagnostic_report", config.SYSTEM_PROMPT)
         self.assertIn("ICTV virus taxonomy", config.SYSTEM_PROMPT)
@@ -1162,11 +1157,11 @@ temporary.replace(path)
         self.assertIn("technical choices are not user requirements", skill)
         self.assertIn("Never execute a stage omitted from the latest plan", skill)
         self.assertIn("execution_spec", skill)
-        self.assertIn("one contiguous segment", skill)
-        self.assertIn("clean_paired_reads", skill)
+        self.assertIn("analysis_pipeline` version 2", skill)
+        self.assertIn("Multiple endpoints are allowed", skill)
         self.assertIn("${RUN_DIR}/.bioagent/state.json", skill)
         self.assertIn("${RUN_DIR}/.bioagent/execution.log", skill)
-        self.assertIn("RUNTIME RUNNER COMMAND", skill)
+        self.assertIn("runtime-provided runner command", skill)
         self.assertIn("analysis_runner.py", skill)
         self.assertIn("Do not edit it manually", skill)
         self.assertNotIn("rsync -a", skill)

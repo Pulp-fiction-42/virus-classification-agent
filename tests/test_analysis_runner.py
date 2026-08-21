@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from unittest.mock import patch
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from analysis_runner import (
     _parse_benchmarks,
     _parse_fastp,
     _parse_log,
+    _pipeline_report_data,
     _parse_seqkit_table,
     _stage_records,
     _upstream_metrics,
@@ -27,7 +29,8 @@ from analysis_runner import (
     redact_text,
     run,
 )
-from workflow_adapters import PreparedExecution, PreparedPhase, WORKFLOW1_RULES
+from pipeline_spec import canonical_steps, normalize_execution_spec
+from workflow_adapters import PreparedExecution, PreparedPhase
 
 
 class AnalysisRunnerTests(unittest.TestCase):
@@ -100,13 +103,40 @@ rule merge:
         read2 = input_dir / f"{entry_rule}_r2.fq.gz"
         read1.write_text("reads\n", encoding="utf-8")
         read2.write_text("reads\n", encoding="utf-8")
-        rules = ("fastp", "bowtie2", "merge")
-        selected = rules[rules.index(entry_rule) : rules.index(exit_rule) + 1]
         input_type = {
             "fastp": "raw_paired_reads",
-            "bowtie2": "fastp_paired_reads",
-            "merge": "clean_paired_reads",
+            "bowtie2": "qc_paired_reads",
+            "merge": "clean_run_paired_reads",
         }[entry_rule]
+        deliverable = {
+            "fastp": "read_qc",
+            "bowtie2": "rrna_filter",
+            "merge": "sample_merge",
+        }[exit_rule]
+        execution_spec = normalize_execution_spec(
+            {
+                "version": 2,
+                "adapter": "analysis_pipeline",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": input_type,
+                        "records": [
+                            {
+                                "run_id": "run",
+                                "sample_id": "sample",
+                                "files": {
+                                    "read1": str(read1),
+                                    "read2": str(read2),
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "deliverables": [deliverable],
+                "policy": {"mode": "standard"},
+            }
+        )
         state_path = bioagent / "state.json"
         state_path.write_text(
             json.dumps(
@@ -116,35 +146,10 @@ rule merge:
                     "run_dir": str(run_dir),
                     "openwebui_chat_id": "chat-test",
                     "steps": [
-                        {
-                            "id": f"step_{index + 1}",
-                            "label": rule,
-                            "rules": [rule],
-                            "status": "pending",
-                        }
-                        for index, rule in enumerate(selected)
+                        {**step, "status": "pending"}
+                        for step in canonical_steps(execution_spec)
                     ],
-                    "execution_spec": {
-                        "adapter": "workflow1",
-                        "entry_rule": entry_rule,
-                        "exit_rule": exit_rule,
-                        "inputs": [
-                            {
-                                "id": "primary",
-                                "type": input_type,
-                                "data": {
-                                    "runs": [
-                                        {
-                                            "run_id": "run",
-                                            "sample_id": "sample",
-                                            "read1": str(read1),
-                                            "read2": str(read2),
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    },
+                    "execution_spec": execution_spec,
                     "execution": {
                         "status": "running",
                         "ok": None,
@@ -183,6 +188,30 @@ rule merge:
         }
 
     @staticmethod
+    def _contig_spec(path: Path, viral_type: str = "RNA+DNA") -> dict:
+        return normalize_execution_spec(
+            {
+                "version": 2,
+                "adapter": "analysis_pipeline",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "contigs_fasta",
+                        "records": [
+                            {
+                                "sample_id": "sample",
+                                "files": {"fasta": str(path)},
+                            }
+                        ],
+                    }
+                ],
+                "deliverables": ["virus_summary"],
+                "options": {"viral_type": viral_type},
+                "policy": {"mode": "standard"},
+            }
+        )
+
+    @staticmethod
     def _write_adaptive_state(run_dir: Path, mode: str = "emergency") -> Path:
         bioagent = run_dir / ".bioagent"
         bioagent.mkdir(parents=True)
@@ -190,6 +219,30 @@ rule merge:
         read2 = run_dir / "input_r2.fq"
         read1.write_text("@read/1\nAC\n+\nII\n", encoding="utf-8")
         read2.write_text("@read/2\nTG\n+\nII\n", encoding="utf-8")
+        execution_spec = normalize_execution_spec(
+            {
+                "version": 2,
+                "adapter": "analysis_pipeline",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "raw_paired_reads",
+                        "records": [
+                            {
+                                "run_id": "run",
+                                "sample_id": "sample",
+                                "files": {
+                                    "read1": str(read1),
+                                    "read2": str(read2),
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "deliverables": ["read_qc"],
+                "policy": {"mode": mode, "deadline_seconds": 900},
+            }
+        )
         state_path = bioagent / "state.json"
         state_path.write_text(
             json.dumps(
@@ -198,46 +251,10 @@ rule merge:
                     "run_id": "adaptive-test",
                     "run_dir": str(run_dir),
                     "steps": [
-                        {
-                            "id": "screen",
-                            "label": "5% 初筛",
-                            "rules": ["adaptive_screen"],
-                            "status": "pending",
-                        },
-                        {
-                            "id": "route",
-                            "label": "调度决策",
-                            "rules": ["adaptive_route"],
-                            "status": "pending",
-                        },
-                        {
-                            "id": "fastp",
-                            "label": "完整分析",
-                            "rules": ["fastp"],
-                            "status": "pending",
-                        },
+                        {**step, "status": "pending"}
+                        for step in canonical_steps(execution_spec)
                     ],
-                    "execution_spec": {
-                        "adapter": "adaptive_virus_analysis",
-                        "viral_type": "RNA+DNA",
-                        "routing": {"mode": mode, "deadline_seconds": 900},
-                        "inputs": [
-                            {
-                                "id": "primary",
-                                "type": "raw_paired_reads",
-                                "data": {
-                                    "runs": [
-                                        {
-                                            "run_id": "run",
-                                            "sample_id": "sample",
-                                            "read1": str(read1),
-                                            "read2": str(read2),
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    },
+                    "execution_spec": execution_spec,
                     "resource_estimate": {
                         "cpu_cores": 8,
                         "peak_memory_mb": {"reserve": 8192},
@@ -302,7 +319,7 @@ rule merge:
         self.assertEqual(routing["decision"]["report_kind"], "preliminary_screen")
         self.assertTrue(routing["deadline_met"])
         self.assertIsInstance(routing["actual_duration_seconds"], (int, float))
-        self.assertEqual(telemetry["delivery_report"]["kind"], "adaptive_alert")
+        self.assertEqual(telemetry["delivery_report"]["kind"], "analysis_pipeline")
 
     def test_route_b_resource_failure_is_blocked_without_queueing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -344,7 +361,7 @@ rule merge:
             routing["resources"]["full_analysis"]["requirement_source"], "minimum"
         )
         self.assertTrue(state["report"]["available"])
-        self.assertEqual(telemetry["delivery_report"]["kind"], "adaptive_alert")
+        self.assertEqual(telemetry["delivery_report"]["kind"], "analysis_pipeline")
         self.assertEqual(
             telemetry["delivery_report"]["report_kind"], "preliminary_screen"
         )
@@ -770,14 +787,14 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 )
                 self.assertTrue(state["technical_report"]["available"])
                 self.assertEqual(state["report"]["available"], exit_code == 0)
-                self.assertEqual(state["report"]["schema_version"], 2)
+                self.assertEqual(state["report"]["schema_version"], 3)
                 self.assertEqual(
                     telemetry["delivery_report"]["schema_version"],
-                    2,
+                    3,
                 )
                 selected_stage_statuses = [
                     stage["status"]
-                    for stage in telemetry["delivery_report"]["upstream"]["stages"]
+                    for stage in telemetry["delivery_report"]["sections"]["upstream"]["stages"]
                     if stage["rule"] in {"fastp", "bowtie2", "merge"}
                 ]
                 if exit_code == 0:
@@ -846,9 +863,9 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             run_dir = root / "run"
             state_path = self._write_state(run_dir)
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["execution_spec"]["inputs"][0]["data"]["runs"][0]["read1"] = str(
-                root / "missing.fastq.gz"
-            )
+            state["execution_spec"]["inputs"][0]["records"][0]["files"][
+                "read1"
+            ] = str(root / "missing.fastq.gz")
             state_path.write_text(json.dumps(state), encoding="utf-8")
             source = self._write_workflow_source(root)
             command = root / "snakemake"
@@ -889,24 +906,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                         "run_id": "analysis-test",
                         "run_dir": str(run_dir),
                         "openwebui_chat_id": "chat-test",
-                        "execution_spec": {
-                            "adapter": "virus_classification",
-                            "viral_type": "RNA+DNA",
-                            "inputs": [
-                                {
-                                    "id": "primary",
-                                    "type": "contigs_fasta",
-                                    "data": {
-                                        "samples": [
-                                            {
-                                                "sample_id": "sample",
-                                                "path": str(input_path),
-                                            }
-                                        ]
-                                    },
-                                }
-                            ],
-                        },
+                        "execution_spec": self._contig_spec(input_path),
                         "steps": [],
                         "execution": {
                             "status": "running",
@@ -960,7 +960,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 ),
             )
             prepared = PreparedExecution(
-                workflow_id="virus_classification",
+                workflow_id="analysis_pipeline",
                 phases=phases,
                 seqkit=str(seqkit),
                 selected_rules=("fastp",),
@@ -994,24 +994,9 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                         "run_id": "analysis-test",
                         "run_dir": str(run_dir),
                         "openwebui_chat_id": "chat-test",
-                        "execution_spec": {
-                            "adapter": "virus_classification",
-                            "viral_type": "RNA",
-                            "inputs": [
-                                {
-                                    "id": "primary",
-                                    "type": "contigs_fasta",
-                                    "data": {
-                                        "samples": [
-                                            {
-                                                "sample_id": "sample",
-                                                "path": str(root / "contigs.fa"),
-                                            }
-                                        ]
-                                    },
-                                }
-                            ],
-                        },
+                        "execution_spec": self._contig_spec(
+                            root / "contigs.fa", "RNA"
+                        ),
                         "steps": [],
                         "execution": {
                             "status": "running",
@@ -1071,7 +1056,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 ),
             )
             prepared = PreparedExecution(
-                workflow_id="virus_classification",
+                workflow_id="analysis_pipeline",
                 phases=phases,
                 seqkit=str(self._write_seqkit(root)),
                 selected_rules=("fastp",),
@@ -1152,19 +1137,33 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 }
                 for run_id in ("lane1", "lane2")
             ]
-            state = {
-                "execution_spec": {
-                    "adapter": "workflow1",
-                    "entry_rule": "fastp",
-                    "exit_rule": "bowtie2",
+            execution_spec = normalize_execution_spec(
+                {
+                    "version": 2,
+                    "adapter": "analysis_pipeline",
                     "inputs": [
                         {
                             "id": "primary",
                             "type": "raw_paired_reads",
-                            "data": {"runs": records},
+                            "records": [
+                                {
+                                    "run_id": record["run_id"],
+                                    "sample_id": record["sample_id"],
+                                    "files": {
+                                        "read1": record["read1"],
+                                        "read2": record["read2"],
+                                    },
+                                }
+                                for record in records
+                            ],
                         }
                     ],
-                },
+                    "deliverables": ["rrna_filter"],
+                    "policy": {"mode": "standard"},
+                }
+            )
+            state = {
+                "execution_spec": execution_spec,
                 "steps": [
                     {"rules": ["fastp"], "status": "completed"},
                     {"rules": ["bowtie2"], "status": "completed"},
@@ -1282,54 +1281,53 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
 
     def test_delivery_report_marks_each_workflow_entry_stage(self):
         cases = {
-            "fastp": ("raw_paired_reads", "runs", "raw", None),
-            "bowtie2": ("fastp_paired_reads", "runs", "post_fastp", "fastp"),
-            "merge": ("clean_paired_reads", "runs", "post_rrna", "bowtie2"),
-            "megahit": (
-                "merged_paired_reads",
-                "samples",
-                "merged_reads",
-                "merge",
-            ),
-            "rename_filter": (
-                "contigs_fasta",
-                "samples",
-                "assembly",
-                "megahit",
-            ),
+            "fastp": ("raw_paired_reads", "raw", None),
+            "bowtie2": ("qc_paired_reads", "post_fastp", "fastp"),
+            "merge": ("clean_run_paired_reads", "post_rrna", "bowtie2"),
+            "megahit": ("clean_sample_paired_reads", "merged_reads", "merge"),
+            "rename_filter": ("assembled_contigs", "assembly", "megahit"),
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             for entry_rule, (
                 input_type,
-                collection,
                 input_stage,
                 provided_rule,
             ) in cases.items():
                 fields = {"sample_id": "sample"}
-                if collection == "runs":
+                if input_type in {
+                    "raw_paired_reads",
+                    "qc_paired_reads",
+                    "clean_run_paired_reads",
+                }:
                     fields["run_id"] = "run"
                 if entry_rule == "rename_filter":
-                    fields["path"] = str(root / "contigs.fa")
+                    fields["files"] = {"fasta": str(root / "contigs.fa")}
                 else:
-                    fields["read1"] = str(root / "r1.fq")
-                    fields["read2"] = str(root / "r2.fq")
-                selected = WORKFLOW1_RULES[WORKFLOW1_RULES.index(entry_rule) :]
-                state = {
-                    "execution_spec": {
-                        "adapter": "workflow1",
-                        "entry_rule": entry_rule,
-                        "exit_rule": WORKFLOW1_RULES[-1],
+                    fields["files"] = {
+                        "read1": str(root / "r1.fq"),
+                        "read2": str(root / "r2.fq"),
+                    }
+                execution_spec = normalize_execution_spec(
+                    {
+                        "version": 2,
+                        "adapter": "analysis_pipeline",
                         "inputs": [
                             {
                                 "id": "primary",
                                 "type": input_type,
-                                "data": {collection: [fields]},
+                                "records": [fields],
                             }
                         ],
-                    },
+                        "deliverables": ["contig_filter"],
+                        "policy": {"mode": "standard"},
+                    }
+                )
+                state = {
+                    "execution_spec": execution_spec,
                     "steps": [
-                        {"rules": [rule], "status": "completed"} for rule in selected
+                        {**step, "status": "completed"}
+                        for step in canonical_steps(execution_spec)
                     ],
                 }
 
@@ -1348,7 +1346,13 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
     def test_classification_report_parses_counts_evidence_and_sample(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)
-            tables = run_dir / "results" / "classification" / "summary" / "tables"
+            tables = (
+                run_dir
+                / "results"
+                / "virus-identification"
+                / "summary"
+                / "tables"
+            )
             tables.mkdir(parents=True)
             header = (
                 "qseqid,qlen,viral_type,checkv_quality,completeness,"
@@ -1367,24 +1371,26 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             }.items():
                 (tables / name).write_text(content, encoding="utf-8")
             state = {
-                "execution_spec": {
-                    "adapter": "virus_classification",
-                    "viral_type": "RNA+DNA",
-                    "inputs": [
-                        {
-                            "id": "primary",
-                            "type": "contigs_fasta",
-                            "data": {
-                                "samples": [
+                "execution_spec": normalize_execution_spec(
+                    {
+                        "version": 2,
+                        "adapter": "analysis_pipeline",
+                        "inputs": [
+                            {
+                                "id": "primary",
+                                "type": "contigs_fasta",
+                                "records": [
                                     {
                                         "sample_id": "sample-a",
-                                        "path": "/input/contigs.fa",
+                                        "files": {"fasta": "/input/contigs.fa"},
                                     }
-                                ]
-                            },
-                        }
-                    ],
-                }
+                                ],
+                            }
+                        ],
+                        "deliverables": ["virus_summary"],
+                        "policy": {"mode": "standard"},
+                    }
+                )
             }
 
             report = _classification_report_data(state, run_dir)
@@ -1403,6 +1409,142 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 "putative_viralcontigs.fna"
             )
         )
+
+    def test_pipeline_report_extracts_branch_specific_metrics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            annotation_input = run_dir / "input-virus.fna"
+            annotation_input.write_text(">v1\nAC\n>v2\nTG\n", encoding="utf-8")
+
+            host_report = (
+                run_dir
+                / "results/host-identification/HostIdentification_result.xlsx"
+            )
+            host_report.parent.mkdir(parents=True)
+            with zipfile.ZipFile(host_report, "w") as archive:
+                archive.writestr(
+                    "xl/worksheets/sheet1.xml",
+                    "<worksheet><sheetData><row/><row/><row/></sheetData></worksheet>",
+                )
+
+            microbial = run_dir / "results/microbial-profile/results/summary"
+            microbial.mkdir(parents=True)
+            for level in ("species", "genus", "family"):
+                (microbial / f"combined_{level}.txt").write_text(
+                    "taxonomy_id\tname\tsample-a_frac\n"
+                    "1\tTaxon A\t0.25\n2\tTaxon B\t0.75\n",
+                    encoding="utf-8",
+                )
+
+            quant = (
+                run_dir
+                / "results/virus-quantification/results/summary/rpm.csv"
+            )
+            quant.parent.mkdir(parents=True)
+            quant.write_text(
+                "sample_id,reference_id,RPM\n"
+                "sample-a,v1,120.5\nsample-a,v2,8\nsample-b,v1,64\n",
+                encoding="utf-8",
+            )
+
+            annotation = run_dir / "results/virus-annotation/results"
+            (annotation / "summary").mkdir(parents=True)
+            (annotation / "checkv").mkdir()
+            (annotation / "function/dramv").mkdir(parents=True)
+            (annotation / "summary/strategy.tsv").write_text(
+                "sequence\tstrategy\nv1\tprovirus\nv2\tstandard\n",
+                encoding="utf-8",
+            )
+            (annotation / "checkv/filtered_viral_gt50.fna").write_text(
+                ">v1\nAC\n", encoding="utf-8"
+            )
+            (annotation / "function/dramv/annotations.tsv").write_text(
+                "sequence\tfunction\nv1\tcapsid\n", encoding="utf-8"
+            )
+            (annotation / "summary/consistency_report.tsv").write_text(
+                "sequence\twarning\nv2\ttaxonomy conflict\n", encoding="utf-8"
+            )
+
+            state = {
+                "execution_spec": {
+                    "deliverables": [
+                        "host_summary",
+                        "microbe_summary",
+                        "virus_rpm",
+                        "annotation_delivery",
+                    ],
+                    "stages": [
+                        {"id": "host_summary"},
+                        {"id": "microbe_summary"},
+                        {"id": "virus_rpm"},
+                        {"id": "annotation_delivery"},
+                    ],
+                    "inputs": [
+                        {
+                            "id": "reads",
+                            "type": "clean_sample_paired_reads",
+                            "records": [
+                                {
+                                    "sample_id": "sample-a",
+                                    "files": {
+                                        "read1": "/input/a.1.fq",
+                                        "read2": "/input/a.2.fq",
+                                    },
+                                },
+                                {
+                                    "sample_id": "sample-b",
+                                    "files": {
+                                        "read1": "/input/b.1.fq",
+                                        "read2": "/input/b.2.fq",
+                                    },
+                                },
+                            ],
+                        },
+                        {
+                            "id": "virus",
+                            "type": "virus_reference_fasta",
+                            "records": [
+                                {"files": {"fasta": str(annotation_input)}}
+                            ],
+                        },
+                    ],
+                }
+            }
+
+            report = _pipeline_report_data(
+                state,
+                run_dir,
+                {
+                    "stages": [
+                        {"id": "host_summary", "status": "completed"}
+                    ],
+                    "manifest": {"files": []},
+                },
+            )
+
+        self.assertEqual(report["kind"], "analysis_pipeline")
+        host = report["sections"]["host_identification"]
+        self.assertEqual(host["sample_count"], 2)
+        self.assertEqual(host["identified_result_count"], 2)
+        microbial_report = report["sections"]["microbial_profile"]
+        self.assertEqual(microbial_report["species"]["taxa_count"], 2)
+        self.assertEqual(
+            microbial_report["species"]["top_taxa"]["sample-a"]["name"],
+            "Taxon B",
+        )
+        quant_report = report["sections"]["virus_quantification"]
+        self.assertEqual(quant_report["sample_count"], 2)
+        self.assertEqual(quant_report["reference_count"], 2)
+        self.assertEqual(quant_report["max_rpm"], 120.5)
+        annotation_report = report["sections"]["virus_annotation"]
+        self.assertEqual(annotation_report["input_sequence_count"], 2)
+        self.assertEqual(annotation_report["filtered_sequence_count"], 1)
+        self.assertEqual(
+            annotation_report["strategy_distribution"],
+            {"provirus": 1, "standard": 1},
+        )
+        self.assertEqual(annotation_report["functional_annotation_count"], 1)
+        self.assertEqual(annotation_report["consistency_warning_count"], 1)
 
 
 if __name__ == "__main__":

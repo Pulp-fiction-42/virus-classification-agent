@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from pipeline_spec import normalize_execution_spec
 from resource_calibration import ProcessResourceMonitor, ResourceCalibrator
 from workflow_adapters import AdapterSettings
 
@@ -58,34 +59,35 @@ class ResourceCalibrationTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def workflow1_spec(self) -> dict:
-        return {
-            "adapter": "workflow1",
-            "entry_rule": "fastp",
-            "exit_rule": "bowtie2",
+        return normalize_execution_spec({
+            "version": 2,
+            "adapter": "analysis_pipeline",
             "inputs": [
                 {
                     "id": "primary",
                     "type": "raw_paired_reads",
-                    "data": {
-                        "runs": [
-                            {
-                                "run_id": "run",
-                                "sample_id": "sample",
-                                "read1": str(self.read1),
-                                "read2": str(self.read2),
-                            }
-                        ]
-                    },
+                    "records": [{
+                        "run_id": "run",
+                        "sample_id": "sample",
+                        "files": {
+                            "read1": str(self.read1),
+                            "read2": str(self.read2),
+                        },
+                    }],
                 }
             ],
-        }
+            "deliverables": ["rrna_filter"],
+            "policy": {"mode": "standard"},
+        })
 
     def classification_spec(self) -> dict:
-        spec = self.workflow1_spec()
-        spec.pop("entry_rule")
-        spec.pop("exit_rule")
-        spec.update({"adapter": "virus_classification", "viral_type": "RNA"})
-        return spec
+        raw = self.workflow1_spec()
+        return normalize_execution_spec({
+            **raw,
+            "deliverables": ["virus_summary"],
+            "options": {"viral_type": "RNA"},
+            "policy": {"mode": "standard"},
+        })
 
     def record(
         self,

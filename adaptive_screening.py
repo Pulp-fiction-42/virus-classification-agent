@@ -165,9 +165,17 @@ def run_rapid_screen(
     log_path = run_dir / ".bioagent/screening.log"
     sample_buckets: dict[str, dict[str, Any]] = {}
     with log_path.open("w", encoding="utf-8") as log:
-        for record in spec["inputs"][0]["data"]["runs"]:
+        input_type = (spec.get("policy") or {}).get("adaptive_input_type")
+        paired_input = next(
+            (item for item in spec.get("inputs", []) if item.get("type") == input_type),
+            None,
+        )
+        if paired_input is None:
+            raise ValueError("adaptive pipeline has no paired-read input")
+        for record in paired_input["records"]:
             sample_id = record["sample_id"]
-            sample_dir = output_root / record["run_id"]
+            run_id = record.get("run_id", sample_id)
+            sample_dir = output_root / run_id
             sample_dir.mkdir(parents=True, exist_ok=True)
             sampled1 = sample_dir / "sampled_r1.fastq.gz"
             sampled2 = sample_dir / "sampled_r2.fastq.gz"
@@ -181,7 +189,7 @@ def run_rapid_screen(
                     str(SAMPLE_SEED),
                     "--out-file",
                     str(sampled1),
-                    record["read1"],
+                    record["files"]["read1"],
                 ],
                 log,
             )
@@ -195,7 +203,7 @@ def run_rapid_screen(
                     str(SAMPLE_SEED),
                     "--out-file",
                     str(sampled2),
-                    record["read2"],
+                    record["files"]["read2"],
                 ],
                 log,
             )

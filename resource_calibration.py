@@ -15,7 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from workflow_adapters import AdapterSettings, selected_rules
+from pipeline_spec import selected_rules
+from workflow_adapters import AdapterSettings
 
 
 SCHEMA_VERSION = 1
@@ -223,49 +224,61 @@ def _database_profile(config_paths: list[tuple[str, Path]]) -> tuple[str, list[s
 def _source_config_paths(
     spec: dict[str, Any], settings: AdapterSettings
 ) -> list[tuple[str, Path]]:
-    paths: list[tuple[str, Path]] = []
-    input_type = spec["inputs"][0]["type"]
-    if spec["adapter"] == "workflow1" or input_type == "raw_paired_reads":
-        paths.append(("upstream", settings.workflow1_source / "config" / "config.yaml"))
-    if spec["adapter"] == "virus_classification":
-        paths.append(
-            ("classification", settings.workflow2_source / "config" / "config.yaml")
-        )
-    return paths
+    workflow_ids = {stage.get("workflow_id") for stage in spec.get("stages") or []}
+    sources = {
+        "workflow1": settings.workflow1_source,
+        "workflow2": settings.workflow2_source,
+        "workflow3": settings.workflow3_source,
+        "workflow4": settings.workflow4_source,
+        "workflow5": settings.workflow5_source,
+        "workflow6": settings.workflow6_source,
+    }
+    return [
+        (workflow_id, sources[workflow_id] / "config/config.yaml")
+        for workflow_id in sources
+        if workflow_id in workflow_ids
+    ]
 
 
 def _run_config_paths(state: dict[str, Any]) -> list[tuple[str, Path]]:
     run_dir = Path(str(state.get("run_dir", "")))
-    spec = state.get("execution_spec") or {}
     if (run_dir / "workflows").is_dir():
+        workflow_by_phase = {
+            "upstream": "workflow1",
+            "virus-identification": "workflow2",
+            "host-identification": "workflow3",
+            "microbial-profile": "workflow4",
+            "virus-quantification": "workflow5",
+            "virus-annotation": "workflow6",
+        }
         paths = []
-        for phase in ("upstream", "classification"):
-            path = run_dir / "workflows" / phase / "config" / "config.yaml"
+        for phase_dir in sorted((run_dir / "workflows").iterdir()):
+            path = phase_dir / "config" / "config.yaml"
             if path.is_file():
-                paths.append((phase, path))
+                paths.append((workflow_by_phase.get(phase_dir.name, phase_dir.name), path))
         return paths
     path = run_dir / "workflow" / "config" / "config.yaml"
     if path.is_file():
-        phase = (
-            "classification"
-            if spec.get("adapter") == "virus_classification"
-            else "upstream"
-        )
-        return [(phase, path)]
+        return [("analysis", path)]
     return []
 
 
 def _input_records(spec: dict[str, Any]) -> list[dict[str, Any]]:
-    data = spec["inputs"][0]["data"]
-    return data.get("runs") or data.get("samples") or []
+    return [
+        record
+        for item in spec.get("inputs") or []
+        for record in item.get("records") or []
+    ]
 
 
 def _input_paths(spec: dict[str, Any]) -> list[str]:
     paths: list[str] = []
     for record in _input_records(spec):
-        for key in ("read1", "read2", "path"):
-            if isinstance(record.get(key), str):
-                paths.append(record[key])
+        for role, value in (record.get("files") or {}).items():
+            if role in {"taxonomy", "table", "workspace", "sample_list"}:
+                continue
+            if isinstance(value, str) and Path(value).is_file():
+                paths.append(value)
     return paths
 
 
@@ -325,13 +338,13 @@ def build_run_resource_profile(
     database_signature, database_versions = _database_profile(_run_config_paths(state))
     sequences, bases = _telemetry_input_metrics(telemetry)
     records = _input_records(spec)
-    input_type = spec["inputs"][0]["type"]
+    input_type = "+".join(item["type"] for item in spec.get("inputs") or [])
     return {
         "version": 1,
         "workflow_signature": workflow_signature,
         "rules": rules,
         "input_type": input_type,
-        "viral_type": spec.get("viral_type") or "",
+        "viral_type": (spec.get("options") or {}).get("viral_type") or "",
         "database_signature": database_signature,
         "database_versions": database_versions,
         "sequences": sequences,
@@ -486,9 +499,6 @@ class ResourceCalibrator:
 
     def _planning_profile(self, spec: dict[str, Any]) -> dict[str, Any]:
         stats = [self._cached_file_stats(path) for path in _input_paths(spec)]
-        kinds = {kind for kind, _sequences, _bases in stats}
-        if len(kinds) != 1:
-            raise ValueError("analysis inputs do not share one sequence format")
         sequences = sum(item[1] for item in stats)
         bases = sum(item[2] for item in stats)
         workflow_signature, rules = _workflow_signature(spec)
@@ -496,12 +506,12 @@ class ResourceCalibrator:
             _source_config_paths(spec, self.settings)
         )
         sample_count = len(_input_records(spec))
-        input_type = spec["inputs"][0]["type"]
+        input_type = "+".join(item["type"] for item in spec.get("inputs") or [])
         return {
             "workflow_signature": workflow_signature,
             "rules": rules,
             "input_type": input_type,
-            "viral_type": spec.get("viral_type") or "",
+            "viral_type": (spec.get("options") or {}).get("viral_type") or "",
             "database_signature": database_signature,
             "database_versions": database_versions,
             "sequences": sequences,
@@ -773,8 +783,10 @@ class ResourceCalibrator:
         if isinstance(spec, dict):
             try:
                 workflow_signature, rules = _workflow_signature(spec)
-                input_type = spec["inputs"][0]["type"]
-                viral_type = spec.get("viral_type") or ""
+                input_type = "+".join(
+                    item["type"] for item in spec.get("inputs") or []
+                )
+                viral_type = (spec.get("options") or {}).get("viral_type") or ""
                 sample_count = len(_input_records(spec))
                 database_signature, database_versions = _database_profile(
                     _run_config_paths(state)

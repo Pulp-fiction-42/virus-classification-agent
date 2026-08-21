@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from adaptive_routing import normalize_routing_request
+from pipeline_spec import (
+    ExecutionSpecError,
+    normalize_execution_spec,
+    selected_rules,
+    validate_plan_rules,
+)
 
 
 WORKFLOW1_RULES = (
@@ -70,14 +74,6 @@ WORKFLOW2_SUMMARY_RULES = (
     "summarize_tables",
     "summarize_sequences",
 )
-ADAPTIVE_RULES = ("adaptive_screen", "adaptive_route")
-SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-
-
-class ExecutionSpecError(ValueError):
-    """Raised when a workflow execution specification is invalid."""
-
-
 @dataclass(frozen=True)
 class AdapterSettings:
     workflow1_source: Path
@@ -85,6 +81,18 @@ class AdapterSettings:
     snakemake: str
     seqkit: str
     cores: int
+    workflow3_source: Path = Path(
+        "/data/user/guojindan/Projects/Workflows/workflow3_hostid"
+    )
+    workflow4_source: Path = Path(
+        "/data/user/guojindan/Projects/Workflows/workflow4_kraken_bracken"
+    )
+    workflow5_source: Path = Path(
+        "/data/user/guojindan/Projects/Workflows/workflow5_virus_quantification"
+    )
+    workflow6_source: Path = Path(
+        "/data/user/guojindan/Projects/Workflows/workflow6_virus_annotation"
+    )
 
     @classmethod
     def from_env(cls) -> AdapterSettings:
@@ -99,6 +107,30 @@ class AdapterSettings:
                 os.getenv(
                     "BIOAGENT_WORKFLOW2_SOURCE",
                     "/data/user/guojindan/Projects/Workflows/workflow2_virusid_2026db",
+                )
+            ),
+            workflow3_source=Path(
+                os.getenv(
+                    "BIOAGENT_WORKFLOW3_SOURCE",
+                    "/data/user/guojindan/Projects/Workflows/workflow3_hostid",
+                )
+            ),
+            workflow4_source=Path(
+                os.getenv(
+                    "BIOAGENT_WORKFLOW4_SOURCE",
+                    "/data/user/guojindan/Projects/Workflows/workflow4_kraken_bracken",
+                )
+            ),
+            workflow5_source=Path(
+                os.getenv(
+                    "BIOAGENT_WORKFLOW5_SOURCE",
+                    "/data/user/guojindan/Projects/Workflows/workflow5_virus_quantification",
+                )
+            ),
+            workflow6_source=Path(
+                os.getenv(
+                    "BIOAGENT_WORKFLOW6_SOURCE",
+                    "/data/user/guojindan/Projects/Workflows/workflow6_virus_annotation",
                 )
             ),
             snakemake=os.getenv(
@@ -131,209 +163,6 @@ class PreparedExecution:
     selected_rules: tuple[str, ...]
 
 
-def _required_id(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not SAFE_ID_RE.fullmatch(value):
-        raise ExecutionSpecError(f"{field} must contain only letters, digits, ._-")
-    return value
-
-
-def _absolute_path(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not Path(value).is_absolute():
-        raise ExecutionSpecError(f"{field} must be an absolute path")
-    return value
-
-
-def _normalize_records(
-    raw_input: dict[str, Any],
-    *,
-    expected_type: str,
-    collection_name: str,
-    fields: tuple[str, ...],
-) -> dict[str, Any]:
-    input_id = _required_id(raw_input.get("id"), "input.id")
-    if raw_input.get("type") != expected_type:
-        raise ExecutionSpecError(f"execution input must have type {expected_type}")
-    data = raw_input.get("data")
-    records = data.get(collection_name) if isinstance(data, dict) else None
-    if not isinstance(records, list) or not records:
-        raise ExecutionSpecError(f"input.data.{collection_name} must not be empty")
-
-    normalized_records = []
-    seen_ids: set[tuple[str, ...]] = set()
-    for index, record in enumerate(records):
-        if not isinstance(record, dict):
-            raise ExecutionSpecError(f"input record {index} must be an object")
-        normalized: dict[str, str] = {}
-        for field in fields:
-            value = record.get(field)
-            normalized[field] = (
-                _absolute_path(value, f"input record {index}.{field}")
-                if field in {"read1", "read2", "path"}
-                else _required_id(value, f"input record {index}.{field}")
-            )
-        identity = tuple(
-            normalized[field] for field in fields if field in {"run_id", "sample_id"}
-        )
-        if identity in seen_ids:
-            raise ExecutionSpecError("execution input contains duplicate records")
-        seen_ids.add(identity)
-        normalized_records.append(normalized)
-
-    return {
-        "id": input_id,
-        "type": expected_type,
-        "data": {collection_name: normalized_records},
-    }
-
-
-def _normalize_workflow1(raw: dict[str, Any]) -> dict[str, Any]:
-    entry_rule = raw.get("entry_rule")
-    exit_rule = raw.get("exit_rule")
-    if entry_rule not in WORKFLOW1_RULES or exit_rule not in WORKFLOW1_RULES:
-        raise ExecutionSpecError("unsupported workflow1 rule boundary")
-    if WORKFLOW1_RULES.index(entry_rule) > WORKFLOW1_RULES.index(exit_rule):
-        raise ExecutionSpecError("entry_rule must not follow exit_rule")
-
-    inputs = raw.get("inputs")
-    if not isinstance(inputs, list) or len(inputs) != 1:
-        raise ExecutionSpecError("workflow1 requires exactly one typed input")
-    raw_input = inputs[0]
-    if not isinstance(raw_input, dict):
-        raise ExecutionSpecError("execution input must be an object")
-    expected_type, collection_name, fields = WORKFLOW1_INPUTS[entry_rule]
-    normalized_input = _normalize_records(
-        raw_input,
-        expected_type=expected_type,
-        collection_name=collection_name,
-        fields=fields,
-    )
-    return {
-        "adapter": "workflow1",
-        "entry_rule": entry_rule,
-        "exit_rule": exit_rule,
-        "inputs": [normalized_input],
-    }
-
-
-def _normalize_virus_classification(raw: dict[str, Any]) -> dict[str, Any]:
-    viral_type = raw.get("viral_type", "RNA+DNA")
-    if viral_type not in WORKFLOW2_CANDIDATE_RULES:
-        raise ExecutionSpecError("viral_type must be RNA, DNA, or RNA+DNA")
-    inputs = raw.get("inputs")
-    if not isinstance(inputs, list) or len(inputs) != 1:
-        raise ExecutionSpecError(
-            "virus_classification requires exactly one typed input"
-        )
-    raw_input = inputs[0]
-    if not isinstance(raw_input, dict):
-        raise ExecutionSpecError("execution input must be an object")
-
-    input_type = raw_input.get("type")
-    if input_type == "raw_paired_reads":
-        normalized_input = _normalize_records(
-            raw_input,
-            expected_type="raw_paired_reads",
-            collection_name="runs",
-            fields=("run_id", "sample_id", "read1", "read2"),
-        )
-    elif input_type == "contigs_fasta":
-        normalized_input = _normalize_records(
-            raw_input,
-            expected_type="contigs_fasta",
-            collection_name="samples",
-            fields=("sample_id", "path"),
-        )
-    else:
-        raise ExecutionSpecError(
-            "virus_classification requires raw_paired_reads or contigs_fasta"
-        )
-    return {
-        "adapter": "virus_classification",
-        "viral_type": viral_type,
-        "inputs": [normalized_input],
-    }
-
-
-def _normalize_adaptive_virus_analysis(raw: dict[str, Any]) -> dict[str, Any]:
-    normalized = _normalize_virus_classification(raw)
-    if normalized["inputs"][0]["type"] != "raw_paired_reads":
-        raise ExecutionSpecError("adaptive_virus_analysis requires raw_paired_reads")
-    try:
-        routing = normalize_routing_request(raw.get("routing"))
-    except ValueError as exc:
-        raise ExecutionSpecError(str(exc)) from exc
-    return {
-        **normalized,
-        "adapter": "adaptive_virus_analysis",
-        "routing": routing,
-    }
-
-
-def full_analysis_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    """Return the existing deterministic full-classification spec for route B."""
-    normalized = normalize_execution_spec(spec)
-    if normalized["adapter"] != "adaptive_virus_analysis":
-        return normalized
-    return {
-        "adapter": "virus_classification",
-        "viral_type": normalized["viral_type"],
-        "inputs": normalized["inputs"],
-    }
-
-
-def normalize_execution_spec(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ExecutionSpecError("missing execution_spec")
-    adapter = raw.get("adapter")
-    if adapter == "workflow1":
-        return _normalize_workflow1(raw)
-    if adapter == "virus_classification":
-        return _normalize_virus_classification(raw)
-    if adapter == "adaptive_virus_analysis":
-        return _normalize_adaptive_virus_analysis(raw)
-    raise ExecutionSpecError("unsupported workflow adapter")
-
-
-def normalize_plan_execution_spec(
-    raw: Any, steps: list[dict[str, Any]]
-) -> dict[str, Any]:
-    """Normalize a plan spec, inferring only unambiguous workflow1 boundaries."""
-    candidate = raw
-    if (
-        isinstance(raw, dict)
-        and raw.get("adapter") == "workflow1"
-        and (raw.get("entry_rule") is None or raw.get("exit_rule") is None)
-    ):
-        planned_rules = tuple(
-            rule
-            for step in steps
-            for rule in (step.get("rules") or [])
-            if isinstance(rule, str)
-        )
-        inferred: tuple[str, str] | None = None
-        if planned_rules:
-            for start in range(len(WORKFLOW1_RULES)):
-                selected = WORKFLOW1_RULES[start : start + len(planned_rules)]
-                if selected == planned_rules:
-                    inferred = (selected[0], selected[-1])
-                    break
-        if inferred is None:
-            raise ExecutionSpecError(
-                "workflow1 steps must be one non-empty contiguous rule segment"
-            )
-
-        candidate = dict(raw)
-        for field, value in zip(("entry_rule", "exit_rule"), inferred):
-            explicit = candidate.get(field)
-            if explicit is not None and explicit != value:
-                raise ExecutionSpecError(f"{field} conflicts with steps[].rules")
-            candidate[field] = value
-
-    spec = normalize_execution_spec(candidate)
-    validate_plan_rules(spec, steps)
-    return spec
-
-
 def _workflow2_rules(
     viral_type: str, *, rename_contigs: bool = True
 ) -> tuple[str, ...]:
@@ -348,42 +177,6 @@ def _workflow2_rules(
         *WORKFLOW2_EVIDENCE_RULES,
         *WORKFLOW2_SUMMARY_RULES,
     )
-
-
-def selected_rules(spec: dict[str, Any]) -> tuple[str, ...]:
-    if spec["adapter"] == "workflow1":
-        entry_index = WORKFLOW1_RULES.index(spec["entry_rule"])
-        exit_index = WORKFLOW1_RULES.index(spec["exit_rule"])
-        return WORKFLOW1_RULES[entry_index : exit_index + 1]
-    adaptive = ADAPTIVE_RULES if spec["adapter"] == "adaptive_virus_analysis" else ()
-    upstream = (
-        WORKFLOW1_RULES if spec["inputs"][0]["type"] == "raw_paired_reads" else ()
-    )
-    return (
-        *adaptive,
-        *upstream,
-        *_workflow2_rules(
-            spec["viral_type"],
-            rename_contigs=spec["inputs"][0]["type"] == "contigs_fasta",
-        ),
-    )
-
-
-def validate_plan_rules(
-    spec: dict[str, Any], steps: list[dict[str, Any]]
-) -> tuple[str, ...]:
-    planned_rules = tuple(
-        rule
-        for step in steps
-        for rule in (step.get("rules") or [])
-        if isinstance(rule, str)
-    )
-    expected = selected_rules(spec)
-    if planned_rules != expected:
-        raise ExecutionSpecError(
-            "steps[].rules must exactly match the selected execution flow"
-        )
-    return expected
 
 
 def _copy_workflow(source: Path, destination: Path) -> None:
@@ -401,25 +194,24 @@ def _copy_workflow(source: Path, destination: Path) -> None:
             "results",
             "example",
             "test",
+            "test_collection",
             "__pycache__",
         ),
     )
+    shared_test_collection = source / "test_collection"
+    if shared_test_collection.is_dir():
+        (destination / "test_collection").symlink_to(
+            shared_test_collection, target_is_directory=True
+        )
 
 
 def _input_records(spec: dict[str, Any]) -> list[dict[str, str]]:
-    data = spec["inputs"][0]["data"]
-    if spec["adapter"] == "workflow1":
-        collection_name = WORKFLOW1_INPUTS[spec["entry_rule"]][1]
-    else:
-        collection_name = (
-            "runs" if spec["inputs"][0]["type"] == "raw_paired_reads" else "samples"
-        )
-    return data[collection_name]
+    return spec["records"]
 
 
-def _source(path: str) -> Path:
+def _source(path: str, *, must_exist: bool = True) -> Path:
     source = Path(path).resolve()
-    if not source.is_file():
+    if must_exist and not source.is_file():
         raise ExecutionSpecError(f"workflow input does not exist: {source}")
     return source
 
@@ -486,8 +278,8 @@ def _prepare_workflow1_inputs(
             sample_ids.append(sample_id)
             sample_lines.append(f"{sample_id} {sample_id} {read1} {read2}")
             root = results_dir / "merge" / sample_id
-            _link(read1, root / "cleanreads_r1.fq")
-            _link(read2, root / "cleanreads_r2.fq")
+            _link(read1, root / "cleanreads_r1.fq.gz")
+            _link(read2, root / "cleanreads_r2.fq.gz")
             _placeholder(results_dir, root / "cleanreads_r1.fq.stat.txt")
             _placeholder(results_dir, root / "cleanreads_r2.fq.stat.txt")
     else:
@@ -560,8 +352,8 @@ def _workflow1_targets(
             root = results_dir / "merge" / sample_id
             targets.extend(
                 [
-                    root / "cleanreads_r1.fq",
-                    root / "cleanreads_r2.fq",
+                    root / "cleanreads_r1.fq.gz",
+                    root / "cleanreads_r2.fq.gz",
                     root / "cleanreads_r1.fq.stat.txt",
                     root / "cleanreads_r2.fq.stat.txt",
                 ]
@@ -616,6 +408,7 @@ def _prepare_workflow1_phase(
     run_dir: Path,
     *,
     phase_id: str = "upstream",
+    phase_rules: tuple[str, ...] = (),
 ) -> tuple[PreparedPhase, list[str]]:
     workflow_dir = run_dir / "workflows" / phase_id
     results_dir = run_dir / "results" / phase_id
@@ -642,7 +435,7 @@ def _prepare_workflow1_phase(
             config_path=config_path,
             targets=targets,
         ),
-        selected_rules=selected_rules(spec),
+        selected_rules=phase_rules,
     )
     return phase, sample_ids
 
@@ -692,55 +485,80 @@ def _rewrite_workflow2_config(
     return config_path
 
 
-def _prepare_workflow2_phase(
-    spec: dict[str, Any],
+def _workflow_stages(spec: dict[str, Any], workflow_id: str) -> list[dict[str, Any]]:
+    return [stage for stage in spec["stages"] if stage["workflow_id"] == workflow_id]
+
+
+def _phase_rules(stages: list[dict[str, Any]]) -> tuple[str, ...]:
+    return tuple(rule for stage in stages for rule in stage["rules"])
+
+
+def _context_item(
+    context: dict[str, dict[str, Any]], artifact_type: str
+) -> dict[str, Any]:
+    item = context.get(artifact_type)
+    if item is None:
+        raise ExecutionSpecError(f"compiled artifact is unavailable: {artifact_type}")
+    return item
+
+
+def _rewrite_top_level(config_path: Path, replacements: dict[str, str]) -> Path:
+    lines = []
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        key = line.split(":", 1)[0] if line and not line[0].isspace() else None
+        lines.append(replacements.get(key, line))
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config_path
+
+
+def _materialize_workspace(source: str, destination: Path) -> None:
+    root = Path(source).resolve()
+    if not root.is_dir():
+        raise ExecutionSpecError(f"workflow input directory does not exist: {root}")
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif path.is_file() and not target.exists():
+            _link(path, target)
+
+
+def _copy_sample_list(source: str, workflow_dir: Path) -> Path:
+    source_path = _source(source)
+    destination = workflow_dir / "data/samples.txt"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_path, destination)
+    return destination
+
+
+def _sample_ids_from_list(path: Path) -> set[str]:
+    return {
+        line.split()[0]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.split()
+    }
+
+
+def _new_phase(
     settings: AdapterSettings,
     run_dir: Path,
     *,
-    upstream_results: Path | None = None,
-    upstream_sample_ids: list[str] | None = None,
+    phase_id: str,
+    workflow_id: str,
+    source: Path,
+    targets: list[Path],
+    rules: tuple[str, ...],
+    configure: Any,
 ) -> PreparedPhase:
-    phase_id = "classification"
     workflow_dir = run_dir / "workflows" / phase_id
     results_dir = run_dir / "results" / phase_id
     results_dir.mkdir(parents=True, exist_ok=True)
-    _copy_workflow(settings.workflow2_source, workflow_dir)
-
-    input_path = workflow_dir / "data" / "contigs_list.txt"
-    input_path.parent.mkdir(parents=True, exist_ok=True)
-    if upstream_results is not None:
-        sample_ids = upstream_sample_ids or []
-        lines = [
-            str(
-                upstream_results
-                / "assembly"
-                / sample_id
-                / f"{sample_id}.contigs.1kb.renamed.fa"
-            )
-            for sample_id in sample_ids
-        ]
-        rename_contigs = False
-    else:
-        lines = [
-            f"{record['sample_id']} {_source(record['path'])}"
-            for record in _input_records(spec)
-        ]
-        rename_contigs = True
-    input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    config_path = _rewrite_workflow2_config(
-        workflow_dir,
-        results_dir,
-        viral_type=spec["viral_type"],
-        rename_contigs=rename_contigs,
-    )
-    targets = [
-        str(results_dir / "summary" / "sequences" / "rep_vert_viruses.fna"),
-        str(results_dir / "summary" / "sequences" / "vert_viruses.fna"),
-    ]
+    _copy_workflow(source, workflow_dir)
+    config_path = configure(workflow_dir, results_dir)
     return PreparedPhase(
         id=phase_id,
-        workflow_id="workflow2",
+        workflow_id=workflow_id,
         workflow_dir=workflow_dir,
         results_dir=results_dir,
         command=_snakemake_command(
@@ -749,13 +567,483 @@ def _prepare_workflow2_phase(
             phase_id=phase_id,
             workflow_dir=workflow_dir,
             config_path=config_path,
-            targets=targets,
+            targets=[str(path) for path in targets],
         ),
-        selected_rules=_workflow2_rules(
-            spec["viral_type"],
-            rename_contigs=rename_contigs,
-        ),
+        selected_rules=rules,
     )
+
+
+def _prepare_pipeline_workflow1(
+    spec: dict[str, Any], settings: AdapterSettings, run_dir: Path, context: dict[str, dict[str, Any]]
+) -> tuple[PreparedPhase, dict[str, dict[str, Any]]]:
+    stages = _workflow_stages(spec, "workflow1")
+    first, last = stages[0], stages[-1]
+    input_type = next(iter(first["bindings"].values()))
+    source_input = _context_item(context, input_type)
+    entry_rule = {
+        "raw_paired_reads": "fastp",
+        "qc_paired_reads": "bowtie2",
+        "clean_run_paired_reads": "merge",
+        "clean_sample_paired_reads": "megahit",
+        "assembled_contigs": "rename_filter",
+    }[input_type]
+    exit_rule = {
+        "read_qc": "fastp",
+        "rrna_filter": "bowtie2",
+        "sample_merge": "merge",
+        "assembly": "megahit",
+        "contig_filter": "rename_filter",
+    }[last["id"]]
+    records = []
+    for record in source_input["records"]:
+        files = record["files"]
+        if input_type == "assembled_contigs":
+            records.append({"sample_id": record["sample_id"], "path": files["fasta"]})
+        else:
+            records.append(
+                {
+                    "run_id": record.get("run_id", record["sample_id"]),
+                    "sample_id": record["sample_id"],
+                    "read1": files["read1"],
+                    "read2": files["read2"],
+                }
+            )
+    legacy = {"entry_rule": entry_rule, "exit_rule": exit_rule, "records": records}
+    phase, sample_ids = _prepare_workflow1_phase(
+        legacy,
+        settings,
+        run_dir,
+        phase_id="upstream",
+        phase_rules=_phase_rules(stages),
+    )
+    run_ids = [record.get("run_id", record["sample_id"]) for record in records]
+    produced: dict[str, dict[str, Any]] = {}
+    if any(stage["id"] == "read_qc" for stage in stages):
+        produced["qc_paired_reads"] = {
+            "type": "qc_paired_reads",
+            "records": [
+                {
+                    "run_id": record["run_id"],
+                    "sample_id": record["sample_id"],
+                    "files": {
+                        "read1": str(phase.results_dir / "filter" / record["run_id"] / "01_fastp_r1.fq.gz"),
+                        "read2": str(phase.results_dir / "filter" / record["run_id"] / "01_fastp_r2.fq.gz"),
+                    },
+                }
+                for record in records
+            ],
+        }
+    if any(stage["id"] == "rrna_filter" for stage in stages):
+        produced["clean_run_paired_reads"] = {
+            "type": "clean_run_paired_reads",
+            "records": [
+                {
+                    "run_id": run_id,
+                    "sample_id": next(record["sample_id"] for record in records if record.get("run_id", record["sample_id"]) == run_id),
+                    "files": {
+                        "read1": str(phase.results_dir / "filter" / run_id / "cleanreads_r1.fq.gz"),
+                        "read2": str(phase.results_dir / "filter" / run_id / "cleanreads_r2.fq.gz"),
+                    },
+                }
+                for run_id in dict.fromkeys(run_ids)
+            ],
+        }
+    if any(stage["id"] == "sample_merge" for stage in stages):
+        produced["clean_sample_paired_reads"] = {
+            "type": "clean_sample_paired_reads",
+            "records": [
+                {
+                    "sample_id": sample_id,
+                    "files": {
+                        "read1": str(phase.results_dir / "merge" / sample_id / "cleanreads_r1.fq.gz"),
+                        "read2": str(phase.results_dir / "merge" / sample_id / "cleanreads_r2.fq.gz"),
+                    },
+                }
+                for sample_id in sample_ids
+            ],
+        }
+    if any(stage["id"] == "assembly" for stage in stages):
+        produced["assembled_contigs"] = {
+            "type": "assembled_contigs",
+            "records": [
+                {"sample_id": sample_id, "files": {"fasta": str(phase.results_dir / "assembly" / sample_id / f"{sample_id}.contigs.fa")}}
+                for sample_id in sample_ids
+            ],
+        }
+    if any(stage["id"] == "contig_filter" for stage in stages):
+        produced["filtered_contigs"] = {
+            "type": "filtered_contigs",
+            "records": [
+                {"sample_id": sample_id, "files": {"fasta": str(phase.results_dir / "assembly" / sample_id / f"{sample_id}.contigs.1kb.renamed.fa")}}
+                for sample_id in sample_ids
+            ],
+        }
+    return phase, produced
+
+
+def _workflow2_targets(stage_id: str, results: Path, viral_type: str) -> list[Path]:
+    if stage_id == "virus_sequence_prep":
+        return [results / "Assembly/orfs.full.faa", results / "Assembly/contigs.full.fna"]
+    if stage_id == "virus_candidate_search":
+        types = ("rna", "dna") if viral_type == "RNA+DNA" else (viral_type.lower(),)
+        return [results / f"output_{kind}/Iteration_5/hmmsearch.domtblout" for kind in types]
+    if stage_id == "virus_candidate_extract":
+        return [
+            results / "downstream/sequences/coverage.csv",
+            results / "downstream/sequences/putative_viralcontigs/putative_viralcontigs.fna",
+            results / "downstream/sequences/putative_markerproteins/putative_markerproteins.faa",
+        ]
+    if stage_id == "virus_evidence":
+        return [
+            results / "downstream/cluster/cluster_summary.csv",
+            results / "downstream/sequences/checkv/quality_summary.tsv",
+            results / "downstream/blast/nr/nr_result.csv",
+            results / "downstream/blast/nt/nt_result.csv",
+            results / "downstream/blast/vhdb/vhdb_result.csv",
+            results / "downstream/blast/hmmsearch_RdRpscan/rdrpscan_result.csv",
+        ]
+    return [
+        results / "summary/sequences/rep_vert_viruses.fna",
+        results / "summary/sequences/vert_viruses.fna",
+    ]
+
+
+def _prepare_pipeline_workflow2(
+    spec: dict[str, Any], settings: AdapterSettings, run_dir: Path, context: dict[str, dict[str, Any]]
+) -> tuple[PreparedPhase, dict[str, dict[str, Any]]]:
+    stages = _workflow_stages(spec, "workflow2")
+    first, last = stages[0], stages[-1]
+    input_type = next(iter(first["bindings"].values()))
+    source_input = _context_item(context, input_type)
+    viral_type = spec["options"]["viral_type"]
+
+    def configure(workflow_dir: Path, results_dir: Path) -> Path:
+        input_path = workflow_dir / "data/contigs_list.txt"
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+        rename_contigs = input_type in {"contigs_fasta", "assembled_contigs"}
+        if input_type in {"filtered_contigs", "contigs_fasta", "assembled_contigs"}:
+            records = source_input["records"]
+            if rename_contigs:
+                lines = [
+                    f"{record['sample_id']} "
+                    f"{_source(record['files']['fasta'], must_exist=not source_input.get('_generated'))}"
+                    for record in records
+                ]
+            else:
+                lines = [
+                    str(
+                        _source(
+                            record["files"]["fasta"],
+                            must_exist=not source_input.get("_generated"),
+                        )
+                    )
+                    for record in records
+                ]
+        elif input_type == "virus_prepared_sequences":
+            files = source_input["records"][0]["files"]
+            contigs = _source(files["contigs"])
+            orfs = _source(files["orfs"])
+            _link(contigs, results_dir / "Assembly/contigs.full.fna")
+            _link(orfs, results_dir / "Assembly/orfs.full.faa")
+            _link(contigs, results_dir / "Assembly/rename_contigs/input.renamed_contigs.fna")
+            _link(orfs, results_dir / "Assembly/getorf/input.orfs.faa")
+            lines = [str(contigs)]
+            rename_contigs = False
+        elif input_type == "virus_candidates":
+            files = source_input["records"][0]["files"]
+            _link(_source(files["contigs"]), results_dir / "downstream/sequences/putative_viralcontigs/putative_viralcontigs.fna")
+            _link(_source(files["proteins"]), results_dir / "downstream/sequences/putative_markerproteins/putative_markerproteins.faa")
+            _link(_source(files["coverage"]), results_dir / "downstream/sequences/coverage.csv")
+            _link(
+                _source(files["nucl2prot"]),
+                results_dir / "downstream/sequences/nucl2prot.tsv",
+            )
+            lines = [str(_source(files["contigs"]))]
+            rename_contigs = False
+        else:
+            files = source_input["records"][0]["files"]
+            _materialize_workspace(files["workspace"], results_dir)
+            candidate = results_dir / "Assembly/contigs.full.fna"
+            lines = [str(candidate)]
+            rename_contigs = False
+        input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return _rewrite_workflow2_config(
+            workflow_dir,
+            results_dir,
+            viral_type=viral_type,
+            rename_contigs=rename_contigs,
+        )
+
+    phase = _new_phase(
+        settings,
+        run_dir,
+        phase_id="virus-identification",
+        workflow_id="workflow2",
+        source=settings.workflow2_source,
+        targets=_workflow2_targets(last["id"], run_dir / "results/virus-identification", viral_type),
+        rules=_phase_rules(stages),
+        configure=configure,
+    )
+    workspace_record = {"files": {"workspace": str(phase.results_dir)}}
+    produced = {
+        "virus_prepared_sequences": {"type": "virus_prepared_sequences", "records": [{"files": {"contigs": str(phase.results_dir / "Assembly/contigs.full.fna"), "orfs": str(phase.results_dir / "Assembly/orfs.full.faa")}}]},
+        "virus_search_results": {"type": "virus_search_results", "records": [workspace_record]},
+        "virus_candidates": {"type": "virus_candidates", "records": [{"files": {"contigs": str(phase.results_dir / "downstream/sequences/putative_viralcontigs/putative_viralcontigs.fna"), "proteins": str(phase.results_dir / "downstream/sequences/putative_markerproteins/putative_markerproteins.faa"), "coverage": str(phase.results_dir / "downstream/sequences/coverage.csv"), "nucl2prot": str(phase.results_dir / "downstream/sequences/nucl2prot.tsv")}}]},
+        "virus_evidence_bundle": {"type": "virus_evidence_bundle", "records": [workspace_record]},
+        "virus_summary_bundle": {"type": "virus_summary_bundle", "records": [{"files": {"fasta": str(phase.results_dir / "summary/sequences/vert_viruses.fna"), "table": str(phase.results_dir / "summary/tables/viruses.xlsx")}}]},
+    }
+    return phase, {stage["produces"]: produced[stage["produces"]] for stage in stages}
+
+
+def _paired_records(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return item["records"]
+
+
+def _contig_records(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return item["records"]
+
+
+def _prepare_pipeline_workflow3(
+    spec: dict[str, Any], settings: AdapterSettings, run_dir: Path, context: dict[str, dict[str, Any]]
+) -> tuple[PreparedPhase, dict[str, dict[str, Any]]]:
+    stages = _workflow_stages(spec, "workflow3")
+    first = stages[0]
+
+    def configure(workflow_dir: Path, results_dir: Path) -> Path:
+        later = [
+            value
+            for value in first["bindings"].values()
+            if value.endswith("_bundle")
+        ]
+        if later:
+            sample_lists = []
+            for artifact_type in later:
+                bundle = _context_item(context, artifact_type)["records"][0]["files"]
+                _materialize_workspace(bundle["workspace"], results_dir)
+                sample_lists.append(_source(bundle["sample_list"]))
+            if any(
+                _sample_ids_from_list(path) != _sample_ids_from_list(sample_lists[0])
+                for path in sample_lists[1:]
+            ):
+                raise ExecutionSpecError("host bundle sample sets must match")
+            sample_list = _copy_sample_list(str(sample_lists[0]), workflow_dir)
+        else:
+            paired_type = next((value for stage in stages for value in stage["bindings"].values() if "paired_reads" in value), None)
+            contig_type = next((value for stage in stages for value in stage["bindings"].values() if value in {"filtered_contigs", "assembled_contigs", "contigs_fasta"}), None)
+            paired = _paired_records(_context_item(context, paired_type)) if paired_type else []
+            contigs = _contig_records(_context_item(context, contig_type)) if contig_type else []
+            paired_by_sample = {record["sample_id"]: record for record in paired}
+            contigs_by_sample = {record["sample_id"]: record for record in contigs}
+            sample_ids = sorted(set(paired_by_sample) | set(contigs_by_sample))
+            lines = []
+            for sample_id in sample_ids:
+                pair = paired_by_sample.get(sample_id)
+                contig = contigs_by_sample.get(sample_id)
+                fallback = (pair or contig)["files"]
+                read1 = pair["files"]["read1"] if pair else fallback["fasta"]
+                read2 = pair["files"]["read2"] if pair else fallback["fasta"]
+                fasta = contig["files"]["fasta"] if contig else read1
+                lines.append(f"{sample_id} {read1} {read2} {fasta}")
+            sample_list = workflow_dir / "data/samples.txt"
+            sample_list.parent.mkdir(parents=True, exist_ok=True)
+            sample_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return _rewrite_top_level(
+            workflow_dir / "config/config.yaml",
+            {"samplelist": f'samplelist: "{sample_list}"', "outdir": f'outdir: "{results_dir}"'},
+        )
+
+    target_map = {
+        "host_mapping": ["EukaMarker_Mapping/1.sortedbam/{sample}_sorted.bam"],
+        "host_coverage": ["EukaMarker_Mapping/2.filteredcoverage_q0/{sample}_coverage.txt"],
+        "host_blast": ["EukaMarker_megablast/3.check_milestone/{sample}.done"],
+        "host_integrate": ["depths.txt", "blastresult.full.txt"],
+        "host_summary": ["HostIdentification_result.xlsx", "CYTB.fasta", "COI.fasta", "ND1.fasta"],
+    }
+    sample_ids: list[str] = []
+    for item in context.values():
+        sample_ids.extend(record.get("sample_id") for record in item.get("records", []) if record.get("sample_id"))
+    sample_ids = list(dict.fromkeys(sample_ids)) or ["input"]
+    targets: list[Path] = []
+    for stage in stages:
+        if stage["is_deliverable"] or stage == stages[-1]:
+            for template in target_map[stage["id"]]:
+                if "{sample}" in template:
+                    targets.extend(run_dir / "results/host-identification" / template.format(sample=sample) for sample in sample_ids)
+                else:
+                    targets.append(run_dir / "results/host-identification" / template)
+    phase = _new_phase(settings, run_dir, phase_id="host-identification", workflow_id="workflow3", source=settings.workflow3_source, targets=targets, rules=_phase_rules(stages), configure=configure)
+    workspace = {"files": {"workspace": str(phase.results_dir), "sample_list": str(phase.workflow_dir / "data/samples.txt")}}
+    produced = {
+        "host_alignment_bundle": {"type": "host_alignment_bundle", "records": [workspace]},
+        "host_coverage_bundle": {"type": "host_coverage_bundle", "records": [workspace]},
+        "host_blast_bundle": {"type": "host_blast_bundle", "records": [workspace]},
+        "host_evidence_bundle": {"type": "host_evidence_bundle", "records": [workspace]},
+        "host_summary_bundle": {"type": "host_summary_bundle", "records": [{"files": {"report": str(phase.results_dir / "HostIdentification_result.xlsx")}}]},
+    }
+    return phase, {stage["produces"]: produced[stage["produces"]] for stage in stages}
+
+
+def _prepare_pipeline_workflow4(
+    spec: dict[str, Any], settings: AdapterSettings, run_dir: Path, context: dict[str, dict[str, Any]]
+) -> tuple[PreparedPhase, dict[str, dict[str, Any]]]:
+    stages = _workflow_stages(spec, "workflow4")
+    first = stages[0]
+
+    def configure(workflow_dir: Path, results_dir: Path) -> Path:
+        input_type = next(iter(first["bindings"].values()))
+        item = _context_item(context, input_type)
+        if input_type in {"kraken_profiles", "bracken_profiles"}:
+            files = item["records"][0]["files"]
+            _materialize_workspace(files["workspace"], results_dir)
+            sample_list = _copy_sample_list(files["sample_list"], workflow_dir)
+        else:
+            lines = [f"{record['sample_id']} {record['files']['read1']} {record['files']['read2']}" for record in item["records"]]
+            sample_list = workflow_dir / "data/samples.txt"
+            sample_list.parent.mkdir(parents=True, exist_ok=True)
+            sample_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return _rewrite_top_level(workflow_dir / "config/config.yaml", {"sample_list": f'sample_list: "{sample_list}"', "outdir": f'outdir: "{results_dir}"'})
+
+    sample_ids = [record.get("sample_id") for item in context.values() for record in item.get("records", []) if record.get("sample_id")]
+    sample_ids = list(dict.fromkeys(sample_ids)) or ["input"]
+    target_map = {
+        "microbe_classify": [f"results/kraken2/{sample}.report" for sample in sample_ids],
+        "microbe_abundance": [f"results/bracken/{sample}_{level}.txt" for sample in sample_ids for level in ("species", "genus", "family")],
+        "microbe_summary": [f"results/summary/combined_{level}.txt" for level in ("species", "genus", "family")],
+    }
+    targets = [run_dir / "results/microbial-profile" / value for value in target_map[stages[-1]["id"]]]
+    phase = _new_phase(settings, run_dir, phase_id="microbial-profile", workflow_id="workflow4", source=settings.workflow4_source, targets=targets, rules=_phase_rules(stages), configure=configure)
+    workspace = {"files": {"workspace": str(phase.results_dir), "sample_list": str(phase.workflow_dir / "data/samples.txt")}}
+    produced = {
+        "kraken_profiles": {"type": "kraken_profiles", "records": [workspace]},
+        "bracken_profiles": {"type": "bracken_profiles", "records": [workspace]},
+        "microbe_summary_bundle": {"type": "microbe_summary_bundle", "records": [{"files": {"workspace": str(phase.results_dir)}}]},
+    }
+    return phase, {stage["produces"]: produced[stage["produces"]] for stage in stages}
+
+
+def _reference_path(item: dict[str, Any]) -> str:
+    files = item["records"][0]["files"]
+    return files.get("fasta") or files.get("contigs")
+
+
+def _prepare_pipeline_workflow5(
+    spec: dict[str, Any], settings: AdapterSettings, run_dir: Path, context: dict[str, dict[str, Any]]
+) -> tuple[PreparedPhase, dict[str, dict[str, Any]]]:
+    stages = _workflow_stages(spec, "workflow5")
+    first = stages[0]
+
+    def configure(workflow_dir: Path, results_dir: Path) -> Path:
+        if first["id"] == "virus_read_mapping":
+            paired_type, reference_type = first["bindings"].values()
+            paired = _context_item(context, paired_type)
+            reference = _context_item(context, reference_type)
+            lines = [f"{record['sample_id']} {record['files']['read1']} {record['files']['read2']}" for record in paired["records"]]
+            sample_list = workflow_dir / "data/samples.txt"
+            sample_list.parent.mkdir(parents=True, exist_ok=True)
+            sample_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            reference_path = _reference_path(reference)
+        else:
+            input_type = next(iter(first["bindings"].values()))
+            files = _context_item(context, input_type)["records"][0]["files"]
+            _materialize_workspace(files["workspace"], results_dir)
+            sample_list = _copy_sample_list(files["sample_list"], workflow_dir)
+            reference_path = files.get("reference") or str(results_dir / "reference.fna")
+            if not Path(reference_path).exists():
+                _placeholder(results_dir, Path(reference_path))
+        return _rewrite_top_level(workflow_dir / "config/config.yaml", {"sample_list": f'sample_list: "{sample_list}"', "reference_fasta": f'reference_fasta: "{reference_path}"', "outdir": f'outdir: "{results_dir}"'})
+
+    target_map = {
+        "virus_read_mapping": ["results/summary/cleanreads_count.txt", "results/coverage/{sample}.samtools.coverage"],
+        "virus_coverage": ["results/coverage/filtered.coverage"],
+        "virus_rpm": ["results/summary/rpm.csv", "results/summary/summary.tsv"],
+    }
+    sample_ids = [record.get("sample_id") for item in context.values() for record in item.get("records", []) if record.get("sample_id")]
+    sample_ids = list(dict.fromkeys(sample_ids)) or ["input"]
+    targets = []
+    for template in target_map[stages[-1]["id"]]:
+        if "{sample}" in template:
+            targets.extend(run_dir / "results/virus-quantification" / template.format(sample=sample) for sample in sample_ids)
+        else:
+            targets.append(run_dir / "results/virus-quantification" / template)
+    phase = _new_phase(settings, run_dir, phase_id="virus-quantification", workflow_id="workflow5", source=settings.workflow5_source, targets=targets, rules=_phase_rules(stages), configure=configure)
+    if first["id"] == "virus_read_mapping":
+        reference_type = list(first["bindings"].values())[1]
+        reference = _reference_path(_context_item(context, reference_type))
+    else:
+        reference = _context_item(
+            context, next(iter(first["bindings"].values()))
+        )["records"][0]["files"].get("reference")
+    workspace = {
+        "files": {
+            "workspace": str(phase.results_dir),
+            "sample_list": str(phase.workflow_dir / "data/samples.txt"),
+            "reference": reference,
+        }
+    }
+    produced = {
+        "virus_mapping_bundle": {"type": "virus_mapping_bundle", "records": [workspace]},
+        "virus_coverage_bundle": {"type": "virus_coverage_bundle", "records": [{"files": {"workspace": str(phase.results_dir), "sample_list": str(phase.workflow_dir / "data/samples.txt")}}]},
+        "virus_quantification_bundle": {"type": "virus_quantification_bundle", "records": [{"files": {"rpm": str(phase.results_dir / "results/summary/rpm.csv"), "summary": str(phase.results_dir / "results/summary/summary.tsv")}}]},
+    }
+    return phase, {stage["produces"]: produced[stage["produces"]] for stage in stages}
+
+
+def _prepare_pipeline_workflow6(
+    spec: dict[str, Any], settings: AdapterSettings, run_dir: Path, context: dict[str, dict[str, Any]]
+) -> tuple[PreparedPhase, dict[str, dict[str, Any]]]:
+    stages = _workflow_stages(spec, "workflow6")
+    first = stages[0]
+
+    def configure(workflow_dir: Path, results_dir: Path) -> Path:
+        if first["id"] == "virus_quality":
+            virus_type, taxonomy_type = first["bindings"].values()
+            input_fasta = _reference_path(_context_item(context, virus_type))
+            taxonomy = _context_item(context, taxonomy_type)["records"][0]["files"]["taxonomy"]
+        else:
+            input_type = next(iter(first["bindings"].values()))
+            files = _context_item(context, input_type)["records"][0]["files"]
+            _materialize_workspace(files["workspace"], results_dir)
+            input_fasta = str(results_dir / "results/checkv/filtered_viral_gt50.fna")
+            taxonomy = files["taxonomy"]
+        taxonomy_source = _source(taxonomy)
+        taxonomy = workflow_dir / "data/taxonomy.tsv"
+        taxonomy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(taxonomy_source, taxonomy)
+        return _rewrite_top_level(workflow_dir / "config/config.yaml", {"input_fasta": f'input_fasta: "{input_fasta}"', "taxonomy_tsv": f'taxonomy_tsv: "{taxonomy}"', "outdir": f'outdir: "{results_dir}"'})
+
+    target_map = {
+        "virus_quality": ["results/checkv/filtered_viral_gt50.fna"],
+        "annotation_strategy": ["results/summary/strategy.tsv", "results/structure/vigor_input.fna", "results/structure/prodigal_input.fna"],
+        "structure_annotation": ["results/structure/all_predicted_proteins.faa"],
+        "functional_annotation": ["results/function/dramv/annotations.tsv"],
+        "annotation_delivery": ["results/summary/annotation_summary.csv", "results/summary/consistency_report.tsv", "results/genbank/DONE", "results/review/review_ids.txt"],
+    }
+    targets = [run_dir / "results/virus-annotation" / value for value in target_map[stages[-1]["id"]]]
+    phase = _new_phase(settings, run_dir, phase_id="virus-annotation", workflow_id="workflow6", source=settings.workflow6_source, targets=targets, rules=_phase_rules(stages), configure=configure)
+    workspace = {
+        "files": {
+            "workspace": str(phase.results_dir),
+            "taxonomy": str(phase.workflow_dir / "data/taxonomy.tsv"),
+        }
+    }
+    produced = {
+        "virus_quality_bundle": {"type": "virus_quality_bundle", "records": [workspace]},
+        "annotation_strategy_bundle": {"type": "annotation_strategy_bundle", "records": [workspace]},
+        "structure_annotation_bundle": {"type": "structure_annotation_bundle", "records": [workspace]},
+        "functional_annotation_bundle": {"type": "functional_annotation_bundle", "records": [workspace]},
+        "annotation_delivery_bundle": {"type": "annotation_delivery_bundle", "records": [workspace]},
+    }
+    return phase, {stage["produces"]: produced[stage["produces"]] for stage in stages}
+
+
+PHASE_PREPARERS = {
+    "workflow1": _prepare_pipeline_workflow1,
+    "workflow2": _prepare_pipeline_workflow2,
+    "workflow3": _prepare_pipeline_workflow3,
+    "workflow4": _prepare_pipeline_workflow4,
+    "workflow5": _prepare_pipeline_workflow5,
+    "workflow6": _prepare_pipeline_workflow6,
+}
 
 
 def prepare_execution(
@@ -766,50 +1054,24 @@ def prepare_execution(
 ) -> PreparedExecution:
     settings = settings or AdapterSettings.from_env()
     spec = normalize_execution_spec(execution_spec or state.get("execution_spec"))
-    if spec["adapter"] == "adaptive_virus_analysis":
-        raise ExecutionSpecError(
-            "adaptive execution must select a route before preparation"
-        )
-    expected_rules = (
-        selected_rules(spec)
-        if execution_spec is not None
-        else validate_plan_rules(spec, state.get("steps") or [])
-    )
+    if spec["policy"].get("adaptive") and execution_spec is None:
+        raise ExecutionSpecError("adaptive execution must select a route before preparation")
+    expected_rules = selected_rules(spec) if execution_spec is not None else validate_plan_rules(spec, state.get("steps") or [])
     run_dir = Path(state["run_dir"]).resolve()
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
-
-    if spec["adapter"] == "workflow1":
-        phase, _sample_ids = _prepare_workflow1_phase(spec, settings, run_dir)
-        phases = (phase,)
-        workflow_id = "workflow1"
-    elif spec["inputs"][0]["type"] == "raw_paired_reads":
-        upstream_spec = {
-            "adapter": "workflow1",
-            "entry_rule": "fastp",
-            "exit_rule": "rename_filter",
-            "inputs": spec["inputs"],
-        }
-        upstream, sample_ids = _prepare_workflow1_phase(
-            upstream_spec,
-            settings,
-            run_dir,
-        )
-        classification = _prepare_workflow2_phase(
-            spec,
-            settings,
-            run_dir,
-            upstream_results=upstream.results_dir,
-            upstream_sample_ids=sample_ids,
-        )
-        phases = (upstream, classification)
-        workflow_id = "virus_classification"
-    else:
-        phases = (_prepare_workflow2_phase(spec, settings, run_dir),)
-        workflow_id = "virus_classification"
-
+    context = {item["type"]: item for item in spec["inputs"]}
+    phases: list[PreparedPhase] = []
+    for workflow_id in PHASE_PREPARERS:
+        if not _workflow_stages(spec, workflow_id):
+            continue
+        phase, produced = PHASE_PREPARERS[workflow_id](spec, settings, run_dir, context)
+        phases.append(phase)
+        for artifact in produced.values():
+            artifact["_generated"] = True
+        context.update(produced)
     return PreparedExecution(
-        workflow_id=workflow_id,
-        phases=phases,
+        workflow_id="analysis_pipeline",
+        phases=tuple(phases),
         seqkit=settings.seqkit,
         selected_rules=expected_rules,
     )

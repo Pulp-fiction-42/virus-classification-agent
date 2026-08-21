@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,14 +29,13 @@ from resource_calibration import (
     ResourceCalibrator,
     build_run_resource_profile,
 )
+from pipeline_spec import selected_rules
 from workflow_adapters import (
     AdapterSettings,
     PreparedExecution,
     PreparedPhase,
     WORKFLOW1_RULES,
-    full_analysis_spec,
     prepare_execution,
-    selected_rules,
 )
 
 
@@ -329,6 +329,39 @@ truepos_vert_viruses_rep.to_csv(
         raise ValueError("workflow2 summarize outputs could not be instrumented")
     summarize_text = summarize_text[:index] + addition + summarize_text[index:]
     summarize_path.write_text(summarize_text, encoding="utf-8")
+
+
+def _instrument_generic_workflow(workflow_dir: Path, benchmark_dir: Path) -> None:
+    """Add benchmark files to run-local workflow3-6 rule copies."""
+    for rules_path in sorted((workflow_dir / "rules").glob("*.smk")):
+        lines = rules_path.read_text(encoding="utf-8").splitlines()
+        output: list[str] = []
+        current_rule: str | None = None
+        current_has_benchmark = False
+        current_wildcard: str | None = None
+        for line in lines:
+            if match := re.match(r"^rule\s+([A-Za-z0-9_]+):", line):
+                current_rule = match.group(1)
+                current_has_benchmark = False
+                current_wildcard = None
+            elif current_rule and line.lstrip().startswith("benchmark:"):
+                current_has_benchmark = True
+            if current_rule and current_wildcard is None:
+                wildcard_match = re.search(r"\{(sample|sample_index|part)\}", line)
+                if wildcard_match:
+                    current_wildcard = wildcard_match.group(1)
+            if current_rule and line.lstrip().startswith("shell:") and not current_has_benchmark:
+                indent = line[: len(line) - len(line.lstrip())]
+                suffix = f".{{{current_wildcard}}}" if current_wildcard else ""
+                output.extend(
+                    [
+                        f"{indent}benchmark:",
+                        f'{indent}    "{benchmark_dir / f"{current_rule}{suffix}.jsonl"}"',
+                    ]
+                )
+                current_has_benchmark = True
+            output.append(line)
+        rules_path.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
 def _sample_paths(workflow_dir: Path) -> list[Path]:
@@ -802,25 +835,40 @@ def _workflow1_report_data(
     rrna_alignment_percents: list[float] | None = None,
 ) -> dict[str, Any]:
     spec = state.get("execution_spec") or {}
-    if (
-        spec.get("adapter") == "virus_classification"
-        and ((spec.get("inputs") or [{}])[0]).get("type") == "raw_paired_reads"
-    ):
-        spec = {
-            "adapter": "workflow1",
-            "entry_rule": "fastp",
-            "exit_rule": "rename_filter",
-            "inputs": spec.get("inputs"),
-        }
-    entry_rule = spec.get("entry_rule")
-    exit_rule = spec.get("exit_rule")
-    upstream_results = run_dir / "results" / "upstream"
-    selected = list(WORKFLOW1_RULES)[
-        WORKFLOW1_RULES.index(entry_rule) : WORKFLOW1_RULES.index(exit_rule) + 1
+    upstream_stages = [
+        stage
+        for stage in spec.get("stages") or []
+        if stage.get("workflow_id") == "workflow1"
     ]
-    data = (spec.get("inputs") or [{}])[0].get("data") or {}
-    records = data.get("runs") or data.get("samples") or []
-    records = [record for record in records if isinstance(record, dict)]
+    selected = [rule for stage in upstream_stages for rule in stage.get("rules") or []]
+    entry_rule = selected[0] if selected else None
+    exit_rule = selected[-1] if selected else None
+    upstream_results = run_dir / "results" / "upstream"
+    source_input = next(
+        (
+            item
+            for item in spec.get("inputs") or []
+            if item.get("type")
+            in {
+                "raw_paired_reads",
+                "qc_paired_reads",
+                "clean_run_paired_reads",
+                "clean_sample_paired_reads",
+                "assembled_contigs",
+            }
+        ),
+        {},
+    )
+    records = []
+    for record in source_input.get("records") or []:
+        files = record.get("files") or {}
+        records.append(
+            {
+                **{key: value for key, value in record.items() if key != "files"},
+                **files,
+                **({"path": files["fasta"]} if files.get("fasta") else {}),
+            }
+        )
     step_status = {
         rule: step.get("status", "pending")
         for step in state.get("steps", [])
@@ -889,7 +937,7 @@ def _workflow1_report_data(
             "sample_id": sample_id,
             "run_ids": run_ids,
             "input": {
-                "type": ((spec.get("inputs") or [{}])[0]).get("type"),
+                "type": source_input.get("type"),
                 "stage": {
                     "fastp": "raw",
                     "bowtie2": "post_fastp",
@@ -1107,17 +1155,52 @@ def _read_csv_records(path: Path) -> list[dict[str, Any]]:
         return []
 
 
+def _read_tsv_records(path: Path) -> list[dict[str, Any]]:
+    try:
+        with path.open(encoding="utf-8", newline="") as stream:
+            return [dict(row) for row in csv.DictReader(stream, delimiter="\t")]
+    except (OSError, UnicodeError, csv.Error):
+        return []
+
+
+def _top_taxa(path: Path) -> dict[str, dict[str, Any]]:
+    rows = _read_tsv_records(path)
+    if not rows:
+        return {}
+    fraction_columns = [
+        column for column in rows[0] if column.endswith("_frac")
+    ]
+    top: dict[str, dict[str, Any]] = {}
+    for column in fraction_columns:
+        sample_id = column.removesuffix("_frac")
+        best_row = None
+        best_fraction = -1.0
+        for row in rows:
+            try:
+                fraction = float(row.get(column) or 0)
+            except ValueError:
+                continue
+            if fraction > best_fraction:
+                best_row, best_fraction = row, fraction
+        if best_row is not None:
+            top[sample_id] = {
+                "name": best_row.get("name"),
+                "taxonomy_id": best_row.get("taxonomy_id"),
+                "fraction": best_fraction,
+            }
+    return top
+
+
 def _classification_report_data(
     state: dict[str, Any],
     run_dir: Path,
 ) -> dict[str, Any]:
     spec = state.get("execution_spec") or {}
-    input_data = (spec.get("inputs") or [{}])[0]
-    records = (
-        (input_data.get("data") or {}).get("runs")
-        or (input_data.get("data") or {}).get("samples")
-        or []
-    )
+    records = [
+        record
+        for item in spec.get("inputs") or []
+        for record in item.get("records") or []
+    ]
     sample_ids = list(
         dict.fromkeys(
             str(record["sample_id"])
@@ -1126,7 +1209,7 @@ def _classification_report_data(
         )
     )
     sample_prefixes = sorted(sample_ids, key=len, reverse=True)
-    tables_dir = run_dir / "results" / "classification" / "summary" / "tables"
+    tables_dir = run_dir / "results" / "virus-identification" / "summary" / "tables"
     candidates = _read_csv_records(tables_dir / "virus_candidates.csv")
     representatives = _read_csv_records(tables_dir / "virus_representatives.csv")
     vertebrate_candidates = _read_csv_records(
@@ -1160,8 +1243,8 @@ def _classification_report_data(
 
     return {
         "schema_version": 1,
-        "viral_type": spec.get("viral_type"),
-        "input_type": input_data.get("type"),
+        "viral_type": (spec.get("options") or {}).get("viral_type"),
+        "input_type": ",".join(item.get("type", "") for item in spec.get("inputs") or []),
         "sample_ids": sample_ids,
         "candidate_count": len(candidates),
         "representative_count": len(representatives),
@@ -1185,7 +1268,7 @@ def _classification_report_data(
             "病毒候选序列（FASTA）": str(
                 run_dir
                 / "results"
-                / "classification"
+                / "virus-identification"
                 / "downstream"
                 / "sequences"
                 / "putative_viralcontigs"
@@ -1194,7 +1277,7 @@ def _classification_report_data(
             "脊椎动物病毒序列（FASTA）": str(
                 run_dir
                 / "results"
-                / "classification"
+                / "virus-identification"
                 / "summary"
                 / "sequences"
                 / "vert_viruses.fna"
@@ -1202,12 +1285,143 @@ def _classification_report_data(
             "脊椎动物代表序列（FASTA）": str(
                 run_dir
                 / "results"
-                / "classification"
+                / "virus-identification"
                 / "summary"
                 / "sequences"
                 / "rep_vert_viruses.fna"
             ),
         },
+    }
+
+
+def _line_count(path: Path, *, header: bool = True) -> int:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            count = sum(1 for line in stream if line.strip())
+    except OSError:
+        return 0
+    return max(0, count - (1 if header and count else 0))
+
+
+def _fasta_count(path: Path) -> int:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return sum(1 for line in stream if line.startswith(">"))
+    except OSError:
+        return 0
+
+
+def _xlsx_row_count(path: Path) -> int:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            sheet = archive.read("xl/worksheets/sheet1.xml")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return 0
+    return max(0, sheet.count(b"<row") - 1)
+
+
+def _pipeline_report_data(
+    state: dict[str, Any], run_dir: Path, telemetry: dict[str, Any]
+) -> dict[str, Any]:
+    spec = state.get("execution_spec") or {}
+    stage_ids = {stage.get("id") for stage in spec.get("stages") or []}
+    sections: dict[str, Any] = {}
+    if stage_ids.intersection(
+        {"read_qc", "rrna_filter", "sample_merge", "assembly", "contig_filter"}
+    ):
+        sections["upstream"] = _workflow1_report_data(
+            state,
+            run_dir,
+            telemetry.get("sequence_metrics") or [],
+            telemetry.get("fastp") or [],
+            telemetry.get("rrna_alignment_percents") or [],
+        )
+    if "virus_summary" in stage_ids:
+        sections["virus_identification"] = _classification_report_data(state, run_dir)
+    if stage_ids.intersection(
+        {"host_mapping", "host_coverage", "host_blast", "host_integrate", "host_summary"}
+    ):
+        root = run_dir / "results/host-identification"
+        report = root / "HostIdentification_result.xlsx"
+        sections["host_identification"] = {
+            "sample_count": len(
+                {
+                    record.get("sample_id")
+                    for item in spec.get("inputs") or []
+                    for record in item.get("records") or []
+                    if record.get("sample_id")
+                }
+            ),
+            "identified_result_count": _xlsx_row_count(report),
+            "report": str(report),
+        }
+    if stage_ids.intersection(
+        {"microbe_classify", "microbe_abundance", "microbe_summary"}
+    ):
+        root = run_dir / "results/microbial-profile/results/summary"
+        sections["microbial_profile"] = {
+            level: {
+                "taxa_count": _line_count(root / f"combined_{level}.txt"),
+                "top_taxa": _top_taxa(root / f"combined_{level}.txt"),
+                "table": str(root / f"combined_{level}.txt"),
+            }
+            for level in ("species", "genus", "family")
+        }
+    if stage_ids.intersection({"virus_read_mapping", "virus_coverage", "virus_rpm"}):
+        rpm_path = run_dir / "results/virus-quantification/results/summary/rpm.csv"
+        rows = _read_csv_records(rpm_path)
+        rpm_values = [
+            float(row["RPM"])
+            for row in rows
+            if isinstance(row.get("RPM"), (int, float))
+        ]
+        sections["virus_quantification"] = {
+            "record_count": len(rows),
+            "sample_count": len({row.get("sample_id") for row in rows if row.get("sample_id")}),
+            "reference_count": len({row.get("reference_id") for row in rows if row.get("reference_id")}),
+            "max_rpm": max(rpm_values, default=None),
+            "table": str(rpm_path),
+        }
+    if stage_ids.intersection(
+        {"virus_quality", "annotation_strategy", "structure_annotation", "functional_annotation", "annotation_delivery"}
+    ):
+        root = run_dir / "results/virus-annotation/results"
+        strategy_path = root / "summary/strategy.tsv"
+        strategy_rows = _read_tsv_records(strategy_path)
+        strategy_distribution: dict[str, int] = {}
+        for row in strategy_rows:
+            strategy = row.get("strategy") or "unknown"
+            strategy_distribution[strategy] = strategy_distribution.get(strategy, 0) + 1
+        annotation_source = next(
+            (
+                item
+                for item in spec.get("inputs") or []
+                if item.get("type")
+                in {"virus_reference_fasta", "virus_candidates", "virus_summary_bundle"}
+            ),
+            None,
+        )
+        annotation_input = None
+        if annotation_source:
+            files = annotation_source["records"][0]["files"]
+            annotation_input = files.get("fasta") or files.get("contigs")
+        sections["virus_annotation"] = {
+            "input_sequence_count": (
+                _fasta_count(Path(annotation_input)) if annotation_input else None
+            ),
+            "filtered_sequence_count": _fasta_count(root / "checkv/filtered_viral_gt50.fna"),
+            "strategy_distribution": strategy_distribution,
+            "functional_annotation_count": _line_count(root / "function/dramv/annotations.tsv"),
+            "consistency_warning_count": _line_count(root / "summary/consistency_report.tsv"),
+            "summary": str(root / "summary/annotation_summary.csv"),
+        }
+    return {
+        "schema_version": 3,
+        "kind": "analysis_pipeline",
+        "deliverables": spec.get("deliverables") or [],
+        "sections": sections,
+        "stages": telemetry.get("stages") or [],
+        "manifest": telemetry.get("manifest") or {},
     }
 
 
@@ -1587,7 +1801,7 @@ def _terminal_adaptive_state(
     state["report"] = {
         "status": "ready" if report_available else "unavailable",
         "available": report_available,
-        "schema_version": 2,
+        "schema_version": 3,
         "telemetry": str(state_path.parent / "telemetry.json"),
     }
     telemetry.update(
@@ -1610,8 +1824,19 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     routing_path = bioagent_dir / "routing.json"
     log_path = Path(state["execution"]["log"]).resolve()
     spec = state["execution_spec"]
-    routing_request = spec["routing"]
-    full_spec = full_analysis_spec(spec)
+    policy = spec["policy"]
+    routing_request = {
+        "mode": policy["requested_mode"],
+        **(
+            {"deadline_seconds": policy["deadline_seconds"]}
+            if "deadline_seconds" in policy
+            else {}
+        ),
+    }
+    full_spec = {
+        **spec,
+        "policy": {"mode": "standard"},
+    }
     calibrator = ResourceCalibrator(
         Path(
             state.get("resource_history_db")
@@ -1624,6 +1849,15 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     routing_record: dict[str, Any] = {
         "version": 2,
         "run_id": state.get("run_id"),
+        "requested_mode": policy["requested_mode"],
+        "effective_mode": policy["effective_mode"],
+        "short_circuit_scope": "pipeline",
+        "applicability_reason": policy["applicability_reason"],
+        **(
+            {"deadline_seconds": policy["deadline_seconds"]}
+            if "deadline_seconds" in policy
+            else {}
+        ),
         "request": routing_request,
         "phase": "screening_admission",
         "started_at": started_at,
@@ -1638,7 +1872,7 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         "version": 3,
         "run_id": state.get("run_id"),
         "chat_id": state.get("openwebui_chat_id"),
-        "workflow_id": "adaptive_virus_analysis",
+        "workflow_id": "analysis_pipeline",
         "started_at": started_at,
         "routing": routing_record,
         "stages": [],
@@ -1648,7 +1882,7 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         "fastp": [],
         "manifest": {"files": [], "omitted": 0},
     }
-    state["workflow_id"] = "adaptive_virus_analysis"
+    state["workflow_id"] = "analysis_pipeline"
     state["routing"] = routing_record
     state["execution"].update({"status": "running", "started_at": started_at})
     _set_step_status(state, "adaptive_screen", "running")
@@ -1752,8 +1986,8 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         state["routing"] = routing_record
         telemetry["routing"] = routing_record
         telemetry["delivery_report"] = {
-            "schema_version": 2,
-            "kind": "adaptive_alert",
+            "schema_version": 3,
+            "kind": "analysis_pipeline",
             "report_kind": "preliminary_screen",
             "routing": routing_record,
             "screening": screening,
@@ -1777,8 +2011,8 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         state["routing"] = routing_record
         telemetry["routing"] = routing_record
         telemetry["delivery_report"] = {
-            "schema_version": 2,
-            "kind": "adaptive_alert",
+            "schema_version": 3,
+            "kind": "analysis_pipeline",
             "report_kind": decision["report_kind"],
             "routing": routing_record,
             "screening": screening,
@@ -1835,7 +2069,7 @@ def run(args: argparse.Namespace) -> int:
     state = _read_state(state_path)
     state.setdefault("execution", {})["pid"] = os.getpid()
     _write_json_atomic(state_path, state)
-    if (state.get("execution_spec") or {}).get("adapter") == "adaptive_virus_analysis":
+    if (state.get("execution_spec") or {}).get("policy", {}).get("adaptive"):
         return _run_adaptive(args, state)
     run_dir = Path(state["run_dir"]).resolve()
     if state_path != run_dir / ".bioagent" / "state.json":
@@ -1925,8 +2159,10 @@ def run(args: argparse.Namespace) -> int:
             phase_benchmarks.mkdir(parents=True, exist_ok=True)
             if phase.workflow_id == "workflow1":
                 _instrument_workflow1(phase.workflow_dir, phase_benchmarks)
-            else:
+            elif phase.workflow_id == "workflow2":
                 _instrument_workflow2(phase.workflow_dir, phase_benchmarks)
+            else:
+                _instrument_generic_workflow(phase.workflow_dir, phase_benchmarks)
         telemetry["input_collection"] = _collect_input_stats(
             prepared.seqkit,
             prepared.phases[0].workflow_dir,
@@ -2223,45 +2459,10 @@ def run(args: argparse.Namespace) -> int:
         state["report"] = {
             "status": "ready" if returncode == 0 else "unavailable",
             "available": returncode == 0,
-            "schema_version": 2,
+            "schema_version": 3,
             "telemetry": str(telemetry_path),
         }
-        if workflow_id == "workflow1":
-            telemetry["delivery_report"] = {
-                "schema_version": 2,
-                "kind": "upstream",
-                "stages": telemetry["stages"],
-                "upstream": _workflow1_report_data(
-                    state,
-                    run_dir,
-                    telemetry["sequence_metrics"],
-                    telemetry["fastp"],
-                    telemetry["rrna_alignment_percents"],
-                ),
-            }
-        else:
-            has_upstream = (
-                ((spec.get("inputs") or [{}])[0]).get("type") == "raw_paired_reads"
-            )
-            telemetry["delivery_report"] = {
-                "schema_version": 2,
-                "kind": "virus_classification",
-                "stages": telemetry["stages"],
-                **(
-                    {
-                        "upstream": _workflow1_report_data(
-                            state,
-                            run_dir,
-                            telemetry["sequence_metrics"],
-                            telemetry["fastp"],
-                            telemetry["rrna_alignment_percents"],
-                        )
-                    }
-                    if has_upstream
-                    else {}
-                ),
-                "classification": _classification_report_data(state, run_dir),
-            }
+        telemetry["delivery_report"] = _pipeline_report_data(state, run_dir, telemetry)
         telemetry["resource_profile"] = build_run_resource_profile(
             state,
             telemetry,

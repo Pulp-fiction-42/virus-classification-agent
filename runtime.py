@@ -72,9 +72,9 @@ except (
 
 import config
 from resource_calibration import ResourceCalibrator
-from workflow_adapters import (
+from pipeline_spec import (
+    canonical_steps,
     ExecutionSpecError,
-    full_analysis_spec,
     normalize_execution_spec,
     normalize_plan_execution_spec,
     validate_plan_rules,
@@ -236,7 +236,12 @@ class SessionManager:
             self.resource_history_path,
             self.analysis_run_root,
         )
-        self.resource_calibrator.backfill()
+        self._resource_backfill = threading.Thread(
+            target=self.resource_calibrator.backfill,
+            name="bioagent-resource-backfill",
+            daemon=True,
+        )
+        self._resource_backfill.start()
         self.client_factory = client_factory
         self.runner_launcher = runner_launcher or self._launch_runner_process
         self.idle_timeout_seconds = idle_timeout_seconds
@@ -705,58 +710,25 @@ class SessionManager:
         *,
         routing_request: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        if not isinstance(raw_plan, dict) or not isinstance(
-            raw_plan.get("steps"), list
-        ):
-            return None
-
-        steps: list[dict[str, Any]] = []
-        for raw_step in raw_plan["steps"]:
-            if not isinstance(raw_step, dict):
-                continue
-            label = raw_step.get("label")
-            if not isinstance(label, str) or not label.strip():
-                continue
-            step: dict[str, Any] = {
-                "id": f"step_{len(steps) + 1}",
-                "label": label.strip(),
-            }
-            tool = raw_step.get("tool")
-            if isinstance(tool, str) and tool.strip():
-                step["tool"] = tool.strip()
-            rules = raw_step.get("rules")
-            if isinstance(rules, list):
-                normalized_rules = [
-                    rule.strip()
-                    for rule in rules
-                    if isinstance(rule, str) and rule.strip()
-                ]
-                if normalized_rules:
-                    step["rules"] = normalized_rules
-            steps.append(step)
-
-        if not steps:
+        if not isinstance(raw_plan, dict):
             return None
 
         execution_spec = None
         execution_error = None
-        raw_execution_spec = raw_plan.get("execution_spec")
-        raw_execution_spec, steps = self._apply_analysis_routing(
-            raw_execution_spec,
-            steps,
-            routing_request,
+        raw_execution_spec = self._apply_analysis_routing(
+            raw_plan.get("execution_spec"), routing_request
         )
         try:
-            execution_spec = normalize_plan_execution_spec(raw_execution_spec, steps)
+            execution_spec = normalize_plan_execution_spec(raw_execution_spec, [])
         except ExecutionSpecError as exc:
             execution_error = exc
+        steps = canonical_steps(execution_spec) if execution_spec else []
 
         run_id = self._new_run_id()
         run_dir = self.analysis_run_root / run_id
         is_deep = bool(
             execution_spec
-            and execution_spec.get("adapter") == "adaptive_virus_analysis"
-            and (execution_spec.get("routing") or {}).get("mode") == "deep"
+            and execution_spec["policy"].get("requested_mode") == "deep"
         )
         plan: dict[str, Any] = {
             "type": "analysis_plan",
@@ -780,15 +752,15 @@ class SessionManager:
         }
         if execution_spec is not None:
             plan["execution_spec"] = execution_spec
-            if execution_spec.get("adapter") == "adaptive_virus_analysis":
-                plan["routing"] = {
-                    **execution_spec["routing"],
-                    "sample_fraction": 0.05,
-                    "available_routes": ["A", "B"],
-                }
+            plan["routing"] = {
+                **execution_spec["policy"],
+                "available_routes": ["A", "B"]
+                if execution_spec["policy"].get("adaptive")
+                else [],
+            }
             try:
                 plan["resource_estimate"] = self.resource_calibrator.estimate(
-                    full_analysis_spec(execution_spec)
+                    execution_spec
                 )
             except Exception:
                 pass
@@ -803,50 +775,11 @@ class SessionManager:
     @staticmethod
     def _apply_analysis_routing(
         raw_execution_spec: Any,
-        steps: list[dict[str, Any]],
         routing_request: dict[str, Any] | None,
-    ) -> tuple[Any, list[dict[str, Any]]]:
+    ) -> Any:
         if not routing_request or not isinstance(raw_execution_spec, dict):
-            return raw_execution_spec, steps
-        if raw_execution_spec.get("adapter") not in {
-            "virus_classification",
-            "adaptive_virus_analysis",
-        }:
-            return raw_execution_spec, steps
-
-        candidate = {**raw_execution_spec, "routing": routing_request}
-        try:
-            normalized = normalize_execution_spec(candidate)
-        except ExecutionSpecError:
-            return candidate, steps
-        if normalized["inputs"][0]["type"] != "raw_paired_reads":
-            return candidate, steps
-
-        adaptive_spec = {
-            **normalized,
-            "adapter": "adaptive_virus_analysis",
-            "routing": routing_request,
-        }
-        planned_rules = tuple(
-            rule
-            for step in steps
-            for rule in (step.get("rules") or [])
-            if isinstance(rule, str)
-        )
-        if planned_rules[:2] != ("adaptive_screen", "adaptive_route"):
-            steps = [
-                {
-                    "label": "5% 快速初筛",
-                    "tool": "Kraken2",
-                    "rules": ["adaptive_screen"],
-                },
-                {"label": "自适应路由决策", "rules": ["adaptive_route"]},
-                *steps,
-            ]
-        return adaptive_spec, [
-            {**step, "id": f"step_{index}"}
-            for index, step in enumerate(steps, start=1)
-        ]
+            return raw_execution_spec
+        return {**raw_execution_spec, "policy": routing_request}
 
     @staticmethod
     def _execution_blocking_reason(error: ExecutionSpecError) -> str:
@@ -934,6 +867,17 @@ class SessionManager:
                     "label": step["label"],
                     **({"tool": step["tool"]} if step.get("tool") else {}),
                     **({"rules": step["rules"]} if step.get("rules") else {}),
+                    **(
+                        {"depends_on": step["depends_on"]}
+                        if isinstance(step.get("depends_on"), list)
+                        else {}
+                    ),
+                    **(
+                        {"produces": step["produces"]}
+                        if step.get("produces")
+                        else {}
+                    ),
+                    "is_deliverable": step.get("is_deliverable") is True,
                     "status": "pending",
                 }
                 for step in plan.get("steps", [])
