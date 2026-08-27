@@ -110,8 +110,10 @@ SDK_EXECUTE_PERMISSION_MODE = "bypassPermissions"
 
 PLAN_PROMPT_PREFIX = """当前是 BioAgent 方案模式，不是 Claude Code Plan Mode。
 不要调用 EnterPlanMode 或 ExitPlanMode，不要创建或修改任何 plan 文件。
-如果用户要求生成、重新生成或调整分析方案，必须在回复末尾输出 analysis_plan 控制块；不得只返回文字方案。"""
+如果用户要求生成、重新生成或调整分析方案，必须在回复末尾输出 analysis_plan 控制块；不得只返回文字方案。
+execution_spec.inputs 只能引用 AUTHORITATIVE ANALYSIS DATASET 中已有的 id 和 type；不要输出路径、records、文件角色、run_id 或 sample_id。"""
 ANALYSIS_PLAN_BLOCK_RE = re.compile(r"```analysis_plan\s*([\s\S]*?)```", re.IGNORECASE)
+
 
 class SessionError(RuntimeError):
     """Base error for an SDK-backed chat session."""
@@ -309,20 +311,26 @@ class SessionManager:
         messages: list[dict],
         chat_id: str | None,
         routing_request: dict[str, Any] | None = None,
+        dataset_context: dict[str, Any] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         normalized_chat_id = self._validate_chat_id(chat_id)
         session = await self._get_or_create_session(normalized_chat_id)
 
         async with session.lock:
             if session.mode == EXECUTE_MODE:
-                async for event in self.start_execution(normalized_chat_id, None):
+                async for event in self.start_execution(
+                    normalized_chat_id, None, dataset_context
+                ):
                     yield event
                 session.last_used_at = time.time()
                 return
 
             user_prompt = self._prompt_for_session(messages, session)
             prompt = self._prefixed_prompt(
-                session.mode, user_prompt, routing_request=routing_request
+                session.mode,
+                user_prompt,
+                routing_request=routing_request,
+                dataset_context=dataset_context,
             )
             session.last_used_at = time.time()
             await session.client.query(prompt)
@@ -343,13 +351,17 @@ class SessionManager:
                     self._record_result(normalized_chat_id, session, message)
 
             if not result_seen:
-                raise SessionStateError("Claude Agent SDK ended without a ResultMessage")
+                raise SessionStateError(
+                    "Claude Agent SDK ended without a ResultMessage"
+                )
 
             visible_parts, hidden_text = control_filter.finish()
             for visible_text in visible_parts:
                 yield TextDelta(visible_text)
             trailing_text, analysis_plan = self._extract_analysis_plan(
-                hidden_text, routing_request=routing_request
+                hidden_text,
+                routing_request=routing_request,
+                dataset_context=dataset_context,
             )
             if trailing_text:
                 yield TextDelta(f"\n\n{trailing_text}")
@@ -361,13 +373,22 @@ class SessionManager:
             session.last_used_at = time.time()
 
     async def start_execution(
-        self, chat_id: str | None, assistant_message_id: str | None
+        self,
+        chat_id: str | None,
+        assistant_message_id: str | None,
+        dataset_context: dict[str, Any] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         normalized_chat_id = self._validate_chat_id(chat_id)
         async with self._execution_lock:
             plan = self._load_analysis_plan(normalized_chat_id)
             if not plan or plan.get("ready_to_execute") is not True:
                 yield TextDelta("请先生成可执行分析方案，再确认启动分析。")
+                return
+
+            try:
+                self._validate_execution_dataset(plan, dataset_context)
+            except SessionStateError as exc:
+                yield TextDelta(str(exc))
                 return
 
             try:
@@ -387,13 +408,7 @@ class SessionManager:
                     or state.get("openwebui_chat_id") != normalized_chat_id
                 ):
                     raise SessionStateError("现有分析状态与当前方案不匹配。")
-                if not state.get("assistant_message_id") and assistant_message_id:
-                    state["assistant_message_id"] = assistant_message_id
-                    self._write_json_atomic(state_path, state)
-                execution = state.get("execution") or {}
-                status = str(execution.get("status") or "running")
-                yield TextDelta("该分析任务已经启动，正在同步当前状态。")
-                yield OutputItemAdded(self._analysis_run_item(plan, status))
+                yield TextDelta("该分析任务已经启动，不能重复创建运行。")
                 return
 
             state = self._write_initial_run_state(
@@ -417,9 +432,7 @@ class SessionManager:
                 state["technical_report"].update(
                     {"status": "unavailable", "available": False}
                 )
-                state["report"].update(
-                    {"status": "unavailable", "available": False}
-                )
+                state["report"].update({"status": "unavailable", "available": False})
                 self._write_json_atomic(state_path, state)
                 yield TextDelta(f"分析任务启动失败：{exc}")
                 yield OutputItemAdded(self._analysis_run_item(plan, "failed"))
@@ -588,6 +601,7 @@ class SessionManager:
         mode: str,
         prompt: str,
         routing_request: dict[str, Any] | None = None,
+        dataset_context: dict[str, Any] | None = None,
     ) -> str:
         if mode != PLAN_MODE:
             raise SessionStateError("执行模式不应调用 Claude")
@@ -597,7 +611,14 @@ class SessionManager:
             if routing_request
             else ""
         )
-        return f"{PLAN_PROMPT_PREFIX}{routing_text}\n\nUSER REQUEST:\n{prompt}"
+        dataset_text = (
+            "\n\nAUTHORITATIVE ANALYSIS DATASET (paths are resolved by runtime):\n"
+            + json.dumps(dataset_context.get("summary"), ensure_ascii=False)
+            if isinstance(dataset_context, dict)
+            and isinstance(dataset_context.get("summary"), dict)
+            else "\n\nAUTHORITATIVE ANALYSIS DATASET: none"
+        )
+        return f"{PLAN_PROMPT_PREFIX}{routing_text}{dataset_text}\n\nUSER REQUEST:\n{prompt}"
 
     @staticmethod
     def _sdk_permission_mode(mode: str) -> str:
@@ -719,6 +740,7 @@ class SessionManager:
         text: str,
         *,
         routing_request: dict[str, Any] | None = None,
+        dataset_context: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any] | None]:
         matches = list(ANALYSIS_PLAN_BLOCK_RE.finditer(text))
         visible = ANALYSIS_PLAN_BLOCK_RE.sub("", text).strip()
@@ -730,7 +752,11 @@ class SessionManager:
                 raw_plan = json.loads(match.group(1))
             except json.JSONDecodeError:
                 continue
-            plan = self._build_analysis_plan(raw_plan, routing_request=routing_request)
+            plan = self._build_analysis_plan(
+                raw_plan,
+                routing_request=routing_request,
+                dataset_context=dataset_context,
+            )
             if plan:
                 return visible, plan
         return visible, None
@@ -740,6 +766,7 @@ class SessionManager:
         raw_plan: Any,
         *,
         routing_request: dict[str, Any] | None = None,
+        dataset_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not isinstance(raw_plan, dict):
             return None
@@ -750,6 +777,9 @@ class SessionManager:
             raw_plan.get("execution_spec"), routing_request
         )
         try:
+            raw_execution_spec = self._bind_dataset_inputs(
+                raw_execution_spec, dataset_context
+            )
             execution_spec = normalize_plan_execution_spec(raw_execution_spec, [])
         except ExecutionSpecError as exc:
             execution_error = exc
@@ -758,8 +788,7 @@ class SessionManager:
         run_id = self._new_run_id()
         run_dir = self.analysis_run_root / run_id
         is_deep = bool(
-            execution_spec
-            and execution_spec["policy"].get("requested_mode") == "deep"
+            execution_spec and execution_spec["policy"].get("requested_mode") == "deep"
         )
         plan: dict[str, Any] = {
             "type": "analysis_plan",
@@ -772,6 +801,8 @@ class SessionManager:
                 raw_plan.get("ready_to_execute") is not False
                 and execution_spec is not None
                 and not is_deep
+                and isinstance(dataset_context, dict)
+                and dataset_context.get("status") == "ready"
             ),
             "run": {
                 "run_id": run_id,
@@ -780,6 +811,11 @@ class SessionManager:
                 "log_path": str(run_dir / ".bioagent" / "execution.log"),
             },
             "steps": steps,
+            **(
+                {"dataset": dataset_context}
+                if isinstance(dataset_context, dict)
+                else {}
+            ),
         }
         if execution_spec is not None:
             plan["execution_spec"] = execution_spec
@@ -799,9 +835,127 @@ class SessionManager:
                 plan["blocking_reason"] = (
                     "深度探索路径暂未开放，请选择智能、紧急或标准模式。"
                 )
+            elif dataset_context.get("status") != "ready":
+                plan["blocking_reason"] = self._dataset_blocking_reason(
+                    str(dataset_context.get("status") or "missing")
+                )
         elif execution_error is not None:
             plan["blocking_reason"] = self._execution_blocking_reason(execution_error)
         return plan
+
+    @staticmethod
+    def _bind_dataset_inputs(
+        raw_execution_spec: Any,
+        dataset_context: dict[str, Any] | None,
+    ) -> Any:
+        if not isinstance(dataset_context, dict):
+            raise ExecutionSpecError("missing authoritative analysis dataset")
+        artifacts = dataset_context.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ExecutionSpecError("analysis dataset has no assigned artifacts")
+        if not isinstance(raw_execution_spec, dict):
+            return raw_execution_spec
+
+        by_id = {
+            artifact.get("id"): artifact
+            for artifact in artifacts
+            if isinstance(artifact, dict) and isinstance(artifact.get("id"), str)
+        }
+        requested = raw_execution_spec.get("inputs")
+        references = (
+            requested if isinstance(requested, list) and requested else artifacts
+        )
+        bound_inputs = []
+        for reference in references:
+            if not isinstance(reference, dict):
+                raise ExecutionSpecError("dataset input references must be objects")
+            artifact = by_id.get(reference.get("id"))
+            if artifact is None or reference.get("type") != artifact.get("type"):
+                raise ExecutionSpecError("unknown analysis dataset artifact reference")
+            records = []
+            for record in artifact.get("records", []):
+                if not isinstance(record, dict):
+                    raise ExecutionSpecError("analysis dataset records must be objects")
+                files = record.get("files")
+                if not isinstance(files, dict):
+                    raise ExecutionSpecError(
+                        "analysis dataset record files are missing"
+                    )
+                records.append(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key not in {"record_id", "files"}
+                    }
+                    | {
+                        "files": {
+                            role: value.get("path")
+                            for role, value in files.items()
+                            if isinstance(value, dict)
+                        }
+                    }
+                )
+            bound_inputs.append(
+                {"id": artifact["id"], "type": artifact["type"], "records": records}
+            )
+        return {**raw_execution_spec, "inputs": bound_inputs}
+
+    @staticmethod
+    def _dataset_blocking_reason(status: str) -> str:
+        return {
+            "checking": "数据集正在执行全量预检，完成前不能启动分析。",
+            "needs_review": "数据集的配对或样本关系需要人工确认。",
+            "invalid": "数据集未通过格式或配对预检。",
+            "stale": "数据集文件在预检后发生变化，请建立新 revision。",
+            "missing": "请先建立并选择数据集。",
+        }.get(status, "数据集尚未满足执行条件。")
+
+    def _validate_execution_dataset(
+        self,
+        plan: dict[str, Any],
+        current: dict[str, Any] | None,
+    ) -> None:
+        planned = plan.get("dataset")
+        if not isinstance(planned, dict) or not isinstance(current, dict):
+            raise SessionStateError("当前方案没有可验证的数据集，请重新建立方案。")
+        if planned.get("id") != current.get("id") or planned.get(
+            "revision"
+        ) != current.get("revision"):
+            raise SessionStateError(
+                "当前数据集 revision 与方案不一致，请重新生成方案。"
+            )
+        if current.get("status") != "ready":
+            raise SessionStateError(
+                self._dataset_blocking_reason(str(current.get("status")))
+            )
+        if planned.get("artifacts") != current.get("artifacts"):
+            raise SessionStateError("数据集内容与方案快照不一致，请重新生成方案。")
+        for artifact in current.get("artifacts", []):
+            for record in artifact.get("records", []):
+                for value in (record.get("files") or {}).values():
+                    if not isinstance(value, dict) or not isinstance(
+                        value.get("path"), str
+                    ):
+                        raise SessionStateError("数据集缺少有效文件指纹。")
+                    path = Path(value["path"]).resolve()
+                    if not self._is_under_analysis_root(path):
+                        raise SessionStateError("数据集文件不在 BIOAGENT_RUN_ROOT 内。")
+                    try:
+                        stat = path.stat()
+                    except OSError as exc:
+                        raise SessionStateError(
+                            "数据集文件已不可用，请重新预检。"
+                        ) from exc
+                    actual = {
+                        "device": stat.st_dev,
+                        "inode": stat.st_ino,
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                    }
+                    if actual != value.get("fingerprint"):
+                        raise SessionStateError(
+                            "数据集文件在预检后发生变化，请建立新 revision。"
+                        )
 
     @staticmethod
     def _apply_analysis_routing(
@@ -890,6 +1044,7 @@ class SessionManager:
             "openwebui_chat_id": chat_id,
             "assistant_message_id": assistant_message_id,
             "title": plan.get("title"),
+            "dataset": plan.get("dataset"),
             "plan": plan,
             "execution_spec": execution_spec,
             "steps": [
@@ -903,11 +1058,7 @@ class SessionManager:
                         if isinstance(step.get("depends_on"), list)
                         else {}
                     ),
-                    **(
-                        {"produces": step["produces"]}
-                        if step.get("produces")
-                        else {}
-                    ),
+                    **({"produces": step["produces"]} if step.get("produces") else {}),
                     "is_deliverable": step.get("is_deliverable") is True,
                     "status": "pending",
                 }

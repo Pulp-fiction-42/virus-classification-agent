@@ -43,8 +43,8 @@ class FakeSessions:
     async def ensure_session(self, chat_id):
         self.ensure_calls.append(chat_id)
 
-    async def stream_turn(self, messages, chat_id, routing=None):
-        self.persistent_calls.append((messages, chat_id, routing))
+    async def stream_turn(self, messages, chat_id, routing=None, dataset_context=None):
+        self.persistent_calls.append((messages, chat_id, routing, dataset_context))
         if self.fail:
             raise SessionStateError(
                 "无法创建分析运行目录：/tmp/run，请检查 BIOAGENT_RUN_ROOT 写权限"
@@ -59,8 +59,8 @@ class FakeSessions:
             raise SessionStateError("task failed")
         yield TextDelta("ephemeral")
 
-    async def start_execution(self, chat_id, message_id):
-        self.execute_calls.append((chat_id, message_id))
+    async def start_execution(self, chat_id, message_id, dataset_context=None):
+        self.execute_calls.append((chat_id, message_id, dataset_context))
         yield TextDelta("started")
         yield OutputItemAdded(
             {
@@ -158,11 +158,42 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         body = await response_text(response)
 
-        self.assertEqual(fake.execute_calls, [(chat_id, "assistant-message")])
+        self.assertEqual(fake.execute_calls, [(chat_id, "assistant-message", None)])
         self.assertEqual(fake.mode_calls, [])
         self.assertEqual(fake.ensure_calls, [])
         self.assertEqual(fake.persistent_calls, [])
         self.assertIn('"type": "analysis_run"', body)
+
+    async def test_dataset_context_is_forwarded_to_plan_and_execute(self):
+        fake = FakeSessions()
+        adapter.sessions = fake
+        chat_id = "11111111-1111-1111-1111-111111111111"
+        dataset = {"id": "dataset-1", "revision": 2, "status": "ready"}
+
+        plan_response = await adapter.chat(
+            ChatRequest(
+                messages=[{"role": "user", "content": "plan"}],
+                metadata={"chat_meta": {"analysis_dataset": dataset}},
+            ),
+            request_with_headers(x_openwebui_chat_id=chat_id),
+        )
+        await response_text(plan_response)
+        execute_response = await adapter.chat(
+            ChatRequest(
+                messages=[{"role": "user", "content": "execute"}],
+                metadata={
+                    "chat_meta": {
+                        "analysis_mode": "execute",
+                        "analysis_dataset": dataset,
+                    }
+                },
+            ),
+            request_with_headers(x_openwebui_chat_id=chat_id),
+        )
+        await response_text(execute_response)
+
+        self.assertEqual(fake.persistent_calls[0][3], dataset)
+        self.assertEqual(fake.execute_calls[0][2], dataset)
 
     async def test_streaming_and_non_streaming_preserve_markdown_boundaries(self):
         fake = FakeSessions(text_parts=["开始检查。", "\n\n## 检查完成"])

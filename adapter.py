@@ -83,6 +83,13 @@ def analysis_mode(req: ChatRequest) -> str | None:
     return mode if mode in {PLAN_MODE, EXECUTE_MODE} else None
 
 
+def analysis_dataset(req: ChatRequest) -> dict[str, Any] | None:
+    metadata = req.metadata if isinstance(req.metadata, dict) else {}
+    chat_meta = metadata.get("chat_meta")
+    dataset = chat_meta.get("analysis_dataset") if isinstance(chat_meta, dict) else None
+    return dataset if isinstance(dataset, dict) else None
+
+
 def error_sse(exc: Exception, response_id: str) -> str:
     payload = {
         "id": response_id,
@@ -156,6 +163,7 @@ async def chat(req: ChatRequest, request: Request):
     message_id = request.headers.get("X-OpenWebUI-Message-Id")
     task = background_task(req, request)
     routing = analysis_routing(req)
+    dataset = analysis_dataset(req)
     requested_mode = analysis_mode(req)
     command = latest_user_text(req.messages)
     response_id = completion_id()
@@ -187,12 +195,14 @@ async def chat(req: ChatRequest, request: Request):
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
-                else sessions.start_execution(chat_id, message_id)
+                else sessions.start_execution(chat_id, message_id, dataset)
                 if requested_mode == EXECUTE_MODE
                 else (
-                    sessions.stream_turn(req.messages, chat_id, routing)
+                    sessions.stream_turn(req.messages, chat_id, routing, dataset)
                     if routing
-                    else sessions.stream_turn(req.messages, chat_id)
+                    else sessions.stream_turn(
+                        req.messages, chat_id, dataset_context=dataset
+                    )
                 )
             )
             parts = []
@@ -221,12 +231,14 @@ async def chat(req: ChatRequest, request: Request):
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
-                else sessions.start_execution(chat_id, message_id)
+                else sessions.start_execution(chat_id, message_id, dataset)
                 if requested_mode == EXECUTE_MODE
                 else (
-                    sessions.stream_turn(req.messages, chat_id, routing)
+                    sessions.stream_turn(req.messages, chat_id, routing, dataset)
                     if routing
-                    else sessions.stream_turn(req.messages, chat_id)
+                    else sessions.stream_turn(
+                        req.messages, chat_id, dataset_context=dataset
+                    )
                 )
             )
             async for event in events:

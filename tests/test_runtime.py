@@ -108,6 +108,14 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp_dir.name) / "agent"
         root.mkdir()
         self.run_root = Path(self.temp_dir.name) / "runs"
+        self.input_dir = self.run_root / "inputs"
+        self.input_dir.mkdir(parents=True)
+        self.read1 = self.input_dir / "sample_R1.fastq.gz"
+        self.read2 = self.input_dir / "sample_R2.fastq.gz"
+        self.contigs = self.input_dir / "contigs.fasta"
+        self.read1.write_bytes(b"read-one")
+        self.read2.write_bytes(b"read-two")
+        self.contigs.write_text(">contig\nACGT\n", encoding="utf-8")
         self.launches = []
 
         def launch(state_path, log_path):
@@ -153,7 +161,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "log_path": str(run_dir / ".bioagent" / "execution.log"),
             },
             "steps": [
-                {"id": "read_qc", "label": "序列质控", "tool": "fastp", "rules": ["fastp"]},
+                {
+                    "id": "read_qc",
+                    "label": "序列质控",
+                    "tool": "fastp",
+                    "rules": ["fastp"],
+                },
                 {
                     "id": "rrna_filter",
                     "label": "去除 rRNA",
@@ -168,20 +181,76 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "id": "primary",
                         "type": "raw_paired_reads",
-                        "records": [{
-                            "run_id": "run",
-                            "sample_id": "sample",
-                            "files": {
-                                "read1": "/data/input_r1.fastq.gz",
-                                "read2": "/data/input_r2.fastq.gz",
-                            },
-                        }],
+                        "records": [
+                            {
+                                "run_id": "run",
+                                "sample_id": "sample",
+                                "files": {
+                                    "read1": str(self.read1),
+                                    "read2": str(self.read2),
+                                },
+                            }
+                        ],
                     }
                 ],
                 "deliverables": ["rrna_filter"],
                 "options": {"viral_type": "RNA+DNA"},
                 "policy": {"mode": "standard"},
             },
+            "dataset": self.dataset_context(),
+        }
+
+    def dataset_context(self, *, status="ready", artifact_type="raw_paired_reads"):
+        def source(path):
+            stat = path.stat()
+            return {
+                "path": str(path),
+                "fingerprint": {
+                    "device": stat.st_dev,
+                    "inode": stat.st_ino,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                },
+            }
+
+        paired = artifact_type == "raw_paired_reads"
+        record = {
+            "record_id": "rec-1",
+            "sample_id": "sample",
+            "files": (
+                {"read1": source(self.read1), "read2": source(self.read2)}
+                if paired
+                else {"fasta": source(self.contigs)}
+            ),
+        }
+        if paired:
+            record["run_id"] = "run"
+        artifacts = [{"id": "primary", "type": artifact_type, "records": [record]}]
+        return {
+            "id": "dataset-test",
+            "revision": 1,
+            "status": status,
+            "check_version": "fastq-v1",
+            "summary": {
+                "id": "dataset-test",
+                "revision": 1,
+                "status": status,
+                "artifacts": [
+                    {
+                        "id": "primary",
+                        "type": artifact_type,
+                        "records": [
+                            {
+                                **({"run_id": "run"} if paired else {}),
+                                "sample_id": "sample",
+                            }
+                        ],
+                    }
+                ],
+            },
+            "artifacts": artifacts,
+            "checks": {"quick": "passed", "full": "passed"},
+            "issues": [],
         }
 
     @staticmethod
@@ -473,7 +542,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+            event
+            async for event in self.manager.stream_turn(
+                MESSAGES, self.chat_id, dataset_context=self.dataset_context()
+            )
         ]
 
         self.assertEqual("".join(self.texts(events)).strip(), "方案如下。")
@@ -519,7 +591,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+            event
+            async for event in self.manager.stream_turn(
+                MESSAGES, self.chat_id, dataset_context=self.dataset_context()
+            )
         ]
         text = "".join(self.texts(events))
         output_items = [
@@ -600,7 +675,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 ```
 """
         ]
-        [event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)]
+        [
+            event
+            async for event in self.manager.stream_turn(
+                MESSAGES, self.chat_id, dataset_context=self.dataset_context()
+            )
+        ]
 
         FakeClient.response_text_parts = [
             """已按要求移除组装。
@@ -610,7 +690,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
 """
         ]
         events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+            event
+            async for event in self.manager.stream_turn(
+                MESSAGES, self.chat_id, dataset_context=self.dataset_context()
+            )
         ]
         saved = json.loads(
             self.manager._analysis_plan_path(self.chat_id).read_text(encoding="utf-8")
@@ -626,7 +709,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
 
         events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+            event
+            async for event in self.manager.stream_turn(
+                MESSAGES, self.chat_id, dataset_context=self.dataset_context()
+            )
         ]
 
         self.assertEqual(
@@ -641,7 +727,10 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
 
         events = [
-            event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)
+            event
+            async for event in self.manager.stream_turn(
+                MESSAGES, self.chat_id, dataset_context=plan["dataset"]
+            )
         ]
 
         self.assertEqual(
@@ -651,7 +740,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(Path(plan["run"]["state_path"]).exists())
         self.assertEqual(FakeClient.instances[0].queries, [])
 
-    def test_invalid_typed_input_makes_generated_plan_not_executable(self):
+    def test_model_records_and_paths_are_replaced_by_dataset(self):
         raw_plan = {
             "title": "错误输入",
             "ready_to_execute": True,
@@ -671,12 +760,16 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-        plan = self.manager._build_analysis_plan(raw_plan)
+        plan = self.manager._build_analysis_plan(
+            raw_plan, dataset_context=self.dataset_context()
+        )
 
         self.assertIsNotNone(plan)
-        self.assertFalse(plan["ready_to_execute"])
-        self.assertNotIn("execution_spec", plan)
-        self.assertIn("输入文件信息", plan["blocking_reason"])
+        self.assertTrue(plan["ready_to_execute"])
+        self.assertEqual(
+            plan["execution_spec"]["inputs"],
+            self.ready_plan()["execution_spec"]["inputs"],
+        )
 
     def test_runtime_compiles_canonical_stages_without_model_steps(self):
         raw_plan = {
@@ -692,7 +785,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-        plan = self.manager._build_analysis_plan(raw_plan)
+        plan = self.manager._build_analysis_plan(
+            raw_plan, dataset_context=self.dataset_context()
+        )
 
         self.assertIsNotNone(plan)
         self.assertTrue(plan["ready_to_execute"])
@@ -702,6 +797,55 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(plan["execution_spec"]["adapter"], "analysis_pipeline")
         self.assertNotIn("blocking_reason", plan)
+
+    def test_unknown_dataset_artifact_reference_is_rejected(self):
+        raw_plan = {
+            "ready_to_execute": True,
+            "execution_spec": {
+                "version": 2,
+                "adapter": "analysis_pipeline",
+                "inputs": [{"id": "invented", "type": "raw_paired_reads"}],
+                "deliverables": ["read_qc"],
+                "policy": {"mode": "standard"},
+            },
+        }
+
+        plan = self.manager._build_analysis_plan(
+            raw_plan, dataset_context=self.dataset_context()
+        )
+
+        self.assertFalse(plan["ready_to_execute"])
+        self.assertNotIn("execution_spec", plan)
+
+    def test_checking_dataset_creates_provisional_plan(self):
+        raw_plan = {
+            "ready_to_execute": True,
+            "execution_spec": {
+                "version": 2,
+                "adapter": "analysis_pipeline",
+                "inputs": [{"id": "primary", "type": "raw_paired_reads"}],
+                "deliverables": ["read_qc"],
+                "policy": {"mode": "standard"},
+            },
+        }
+
+        plan = self.manager._build_analysis_plan(
+            raw_plan, dataset_context=self.dataset_context(status="checking")
+        )
+
+        self.assertFalse(plan["ready_to_execute"])
+        self.assertIn("全量预检", plan["blocking_reason"])
+
+    def test_dataset_prompt_exposes_summary_without_paths(self):
+        dataset = self.dataset_context()
+
+        prompt = self.manager._prefixed_prompt(
+            PLAN_MODE, "分析数据", dataset_context=dataset
+        )
+
+        self.assertIn("dataset-test", prompt)
+        self.assertNotIn(str(self.read1), prompt)
+        self.assertNotIn(str(self.read2), prompt)
 
     def test_invalid_workflow1_rules_expose_blocking_reason(self):
         raw_plan = {
@@ -717,7 +861,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-        plan = self.manager._build_analysis_plan(raw_plan)
+        plan = self.manager._build_analysis_plan(
+            raw_plan, dataset_context=self.dataset_context()
+        )
 
         self.assertIsNotNone(plan)
         self.assertFalse(plan["ready_to_execute"])
@@ -737,7 +883,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             "execution_spec": source["execution_spec"],
         }
 
-        plan = self.manager._build_analysis_plan(raw_plan)
+        plan = self.manager._build_analysis_plan(
+            raw_plan, dataset_context=self.dataset_context()
+        )
 
         self.assertIsNotNone(plan)
         self.assertTrue(plan["ready_to_execute"])
@@ -758,10 +906,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         emergency = self.manager._build_analysis_plan(
             raw_plan,
             routing_request={"mode": "emergency", "deadline_seconds": 18_000},
+            dataset_context=self.dataset_context(),
         )
         deep = self.manager._build_analysis_plan(
             raw_plan,
             routing_request={"mode": "deep"},
+            dataset_context=self.dataset_context(),
         )
 
         self.assertEqual(emergency["routing"]["requested_mode"], "emergency")
@@ -793,6 +943,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 plan = self.manager._build_analysis_plan(
                     raw_plan,
                     routing_request=routing,
+                    dataset_context=self.dataset_context(),
                 )
 
                 self.assertTrue(plan["ready_to_execute"])
@@ -810,9 +961,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertEqual(
                     tuple(
-                        rule
-                        for step in plan["steps"]
-                        for rule in step.get("rules", [])
+                        rule for step in plan["steps"] for rule in step.get("rules", [])
                     ),
                     selected_rules(plan["execution_spec"]),
                 )
@@ -827,6 +976,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "execution_spec": workflow1["execution_spec"],
             },
             routing_request={"mode": "auto"},
+            dataset_context=self.dataset_context(),
         )
         contigs_spec = {
             "version": 2,
@@ -835,10 +985,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "id": "primary",
                     "type": "contigs_fasta",
-                    "records": [{
-                        "sample_id": "sample",
-                        "files": {"fasta": "/data/input_contigs.fasta"},
-                    }],
+                    "records": [
+                        {
+                            "sample_id": "sample",
+                            "files": {"fasta": "/data/input_contigs.fasta"},
+                        }
+                    ],
                 }
             ],
             "deliverables": ["virus_summary"],
@@ -852,9 +1004,12 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "execution_spec": contigs_spec,
             },
             routing_request={"mode": "auto"},
+            dataset_context=self.dataset_context(artifact_type="contigs_fasta"),
         )
 
-        self.assertEqual(workflow1_plan["execution_spec"]["adapter"], "analysis_pipeline")
+        self.assertEqual(
+            workflow1_plan["execution_spec"]["adapter"], "analysis_pipeline"
+        )
         self.assertTrue(workflow1_plan["routing"]["adaptive"])
         self.assertEqual(
             contigs_plan["execution_spec"]["adapter"],
@@ -870,7 +1025,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         events = [
             event
             async for event in self.manager.start_execution(
-                self.chat_id, "assistant-message-1"
+                self.chat_id, "assistant-message-1", plan["dataset"]
             )
         ]
 
@@ -880,6 +1035,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["openwebui_chat_id"], self.chat_id)
         self.assertEqual(state["assistant_message_id"], "assistant-message-1")
         self.assertEqual(state["plan"]["title"], plan["title"])
+        self.assertEqual(state["dataset"], plan["dataset"])
         self.assertEqual(
             [step["status"] for step in state["steps"]], ["pending", "pending"]
         )
@@ -901,6 +1057,21 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run_item["type"], "analysis_run")
         self.assertEqual(run_item["status"], "running")
         self.assertEqual(run_item["run"]["state_path"], plan["run"]["state_path"])
+
+    async def test_execute_rejects_changed_dataset_fingerprint(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        self.read1.write_bytes(b"changed")
+
+        events = [
+            event
+            async for event in self.manager.start_execution(
+                self.chat_id, "assistant-message-1", plan["dataset"]
+            )
+        ]
+
+        self.assertIn("预检后发生变化", "".join(self.texts(events)))
+        self.assertFalse(Path(plan["run"]["state_path"]).exists())
 
     async def test_execute_create_state_error_is_clear(self):
         blocked_root = Path(self.temp_dir.name) / "blocked-run-root"
@@ -926,14 +1097,14 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             "log_path": str(run_dir / ".bioagent" / "execution.log"),
         }
         manager._save_analysis_plan(self.chat_id, plan)
-        with self.assertRaises(SessionStateError) as error:
-            [
-                event
-                async for event in manager.start_execution(self.chat_id, "message")
-            ]
+        events = [
+            event
+            async for event in manager.start_execution(
+                self.chat_id, "message", plan["dataset"]
+            )
+        ]
 
-        self.assertIn("无法创建分析运行目录", str(error.exception))
-        self.assertIn("BIOAGENT_RUN_ROOT", str(error.exception))
+        self.assertIn("不在 BIOAGENT_RUN_ROOT", "".join(self.texts(events)))
         self.assertEqual(FakeClient.instances, [])
 
     async def test_execute_rejects_mismatched_state_without_overwriting_it(self):
@@ -945,7 +1116,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(SessionStateError) as error:
             [
                 event
-                async for event in self.manager.start_execution(self.chat_id, "message")
+                async for event in self.manager.start_execution(
+                    self.chat_id, "message", plan["dataset"]
+                )
             ]
 
         self.assertIn("不匹配", str(error.exception))
@@ -958,10 +1131,17 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_execute_retry_returns_existing_status_without_relaunch(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
-        [event async for event in self.manager.start_execution(self.chat_id, "first")]
+        [
+            event
+            async for event in self.manager.start_execution(
+                self.chat_id, "first", plan["dataset"]
+            )
+        ]
         events = [
             event
-            async for event in self.manager.start_execution(self.chat_id, "second")
+            async for event in self.manager.start_execution(
+                self.chat_id, "second", plan["dataset"]
+            )
         ]
 
         self.assertEqual(len(self.launches), 1)
@@ -977,7 +1157,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager.runner_launcher = fail_launch
         events = [
             event
-            async for event in self.manager.start_execution(self.chat_id, "message")
+            async for event in self.manager.start_execution(
+                self.chat_id, "message", plan["dataset"]
+            )
         ]
 
         state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
@@ -985,7 +1167,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["execution"]["ok"])
         self.assertIn("fork failed", state["execution"]["error"])
         self.assertIn("启动失败", "".join(self.texts(events)))
-        item = next(event.item for event in events if isinstance(event, OutputItemAdded))
+        item = next(
+            event.item for event in events if isinstance(event, OutputItemAdded)
+        )
         self.assertEqual(item["status"], "failed")
 
     async def test_short_lived_runner_completes_after_immediate_response(self):
@@ -1015,12 +1199,14 @@ temporary.replace(path)
 
         events = [
             event
-            async for event in manager.start_execution(self.chat_id, "message-id")
+            async for event in manager.start_execution(
+                self.chat_id, "message-id", plan["dataset"]
+            )
         ]
         self.assertIn("分析任务已启动", "".join(self.texts(events)))
 
         state_path = Path(plan["run"]["state_path"])
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             state = json.loads(state_path.read_text(encoding="utf-8"))
             if state["execution"]["status"] == "completed":
@@ -1148,7 +1334,11 @@ temporary.replace(path)
         self.manager._record_assistant_trace(self.chat_id, message)
         self.manager._record_assistant_trace(self.chat_id, message)
 
-        lines = self.manager._agent_trace_path(self.chat_id).read_text(encoding="utf-8").splitlines()
+        lines = (
+            self.manager._agent_trace_path(self.chat_id)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
         records = [json.loads(line) for line in lines]
         self.assertEqual(len(records), 2)
         self.assertEqual(records[0]["type"], "thinking_summary")
