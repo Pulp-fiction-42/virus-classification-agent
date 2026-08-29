@@ -108,10 +108,10 @@ EXECUTE_MODE = "execute"
 SDK_PLAN_PERMISSION_MODE = "dontAsk"
 SDK_EXECUTE_PERMISSION_MODE = "bypassPermissions"
 
-PLAN_PROMPT_PREFIX = """当前是 BioAgent 方案模式，不是 Claude Code Plan Mode。
-不要调用 EnterPlanMode 或 ExitPlanMode，不要创建或修改任何 plan 文件。
-如果用户要求生成、重新生成或调整分析方案，必须在回复末尾输出 analysis_plan 控制块；不得只返回文字方案。
-execution_spec.inputs 只能引用 AUTHORITATIVE ANALYSIS DATASET 中已有的 id 和 type；不要输出路径、records、文件角色、run_id 或 sample_id。"""
+PLAN_PROMPT_PREFIX = """当前是 BioAgent 咨询对话。
+分析目标、病毒类型、路由模式与执行方案由界面控制器和确定性 planner 管理。
+你只能解释当前数据集与方案，或引导用户操作目标卡片；不得输出 analysis_plan、修改方案、切换模式或启动分析。
+不要调用 EnterPlanMode 或 ExitPlanMode，不要创建或修改任何 plan 文件。"""
 ANALYSIS_PLAN_BLOCK_RE = re.compile(r"```analysis_plan\s*([\s\S]*?)```", re.IGNORECASE)
 
 
@@ -312,38 +312,30 @@ class SessionManager:
         chat_id: str | None,
         routing_request: dict[str, Any] | None = None,
         dataset_context: dict[str, Any] | None = None,
+        plan_context: dict[str, Any] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         normalized_chat_id = self._validate_chat_id(chat_id)
         session = await self._get_or_create_session(normalized_chat_id)
 
         async with session.lock:
-            if session.mode == EXECUTE_MODE:
-                async for event in self.start_execution(
-                    normalized_chat_id, None, dataset_context
-                ):
-                    yield event
-                session.last_used_at = time.time()
-                return
-
             user_prompt = self._prompt_for_session(messages, session)
             prompt = self._prefixed_prompt(
                 session.mode,
                 user_prompt,
                 routing_request=routing_request,
                 dataset_context=dataset_context,
+                plan_context=plan_context,
             )
             session.last_used_at = time.time()
             await session.client.query(prompt)
 
             result_seen = False
-            control_filter = TrailingControlBlockFilter("```analysis_plan")
             text_stream = MarkdownTextStream()
             async for message in session.client.receive_response():
                 if isinstance(message, StreamEvent):
                     text = text_stream.push(message.event)
                     if text:
-                        for visible_text in control_filter.push(text):
-                            yield TextDelta(visible_text)
+                        yield TextDelta(text)
                 elif isinstance(message, AssistantMessage):
                     self._record_assistant_trace(normalized_chat_id, message)
                 elif isinstance(message, ResultMessage):
@@ -354,20 +346,6 @@ class SessionManager:
                 raise SessionStateError(
                     "Claude Agent SDK ended without a ResultMessage"
                 )
-
-            visible_parts, hidden_text = control_filter.finish()
-            for visible_text in visible_parts:
-                yield TextDelta(visible_text)
-            trailing_text, analysis_plan = self._extract_analysis_plan(
-                hidden_text,
-                routing_request=routing_request,
-                dataset_context=dataset_context,
-            )
-            if trailing_text:
-                yield TextDelta(f"\n\n{trailing_text}")
-            if analysis_plan:
-                self._save_analysis_plan(normalized_chat_id, analysis_plan)
-                yield OutputItemAdded(analysis_plan)
 
             session.bootstrapped = True
             session.last_used_at = time.time()
@@ -440,6 +418,61 @@ class SessionManager:
 
             yield TextDelta("分析任务已启动，进度与结果将在状态区自动更新。")
             yield OutputItemAdded(self._analysis_run_item(plan, "running"))
+
+    async def launch_deterministic_plan(
+        self, plan: dict[str, Any], chat_id: str
+    ) -> dict[str, Any]:
+        """Validate and launch a backend-owned immutable plan revision."""
+
+        normalized_chat_id = self._validate_chat_id(chat_id)
+        async with self._execution_lock:
+            dataset = plan.get("dataset")
+            self._validate_execution_dataset(plan, dataset)
+            try:
+                execution_spec = normalize_execution_spec(plan.get("execution_spec"))
+                validate_plan_rules(execution_spec, plan.get("steps") or [])
+            except ExecutionSpecError as exc:
+                raise SessionStateError(f"分析方案执行区段无效：{exc}") from exc
+            plan["execution_spec"] = execution_spec
+
+            run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
+            state_path = Path(str(run.get("state_path", ""))).resolve()
+            if state_path.exists():
+                _, state = self._read_run_state(plan)
+                if (
+                    state.get("run_id") != run.get("run_id")
+                    or state.get("openwebui_chat_id") != normalized_chat_id
+                    or state.get("plan_ref") != plan.get("plan_ref")
+                ):
+                    raise SessionStateError("现有分析状态与当前方案不匹配。")
+                return self._analysis_run_item(
+                    plan, str((state.get("execution") or {}).get("status") or "running")
+                )
+
+            state = self._write_initial_run_state(plan, normalized_chat_id, None)
+            try:
+                self.runner_launcher(
+                    state_path, state_path.parent / "runner-process.log"
+                )
+            except Exception as exc:
+                state["execution"].update(
+                    {
+                        "status": "failed",
+                        "ok": False,
+                        "returncode": -1,
+                        "error": f"无法启动分析进程：{exc}",
+                        "finished_at": datetime.now()
+                        .astimezone()
+                        .isoformat(timespec="seconds"),
+                    }
+                )
+                state["technical_report"].update(
+                    {"status": "unavailable", "available": False}
+                )
+                state["report"].update({"status": "unavailable", "available": False})
+                self._write_json_atomic(state_path, state)
+                raise SessionStateError(f"分析任务启动失败：{exc}") from exc
+            return self._analysis_run_item(plan, "running")
 
     async def stream_ephemeral_turn(
         self, messages: list[dict]
@@ -602,23 +635,28 @@ class SessionManager:
         prompt: str,
         routing_request: dict[str, Any] | None = None,
         dataset_context: dict[str, Any] | None = None,
+        plan_context: dict[str, Any] | None = None,
     ) -> str:
-        if mode != PLAN_MODE:
-            raise SessionStateError("执行模式不应调用 Claude")
         routing_text = (
-            "\n\nANALYSIS ROUTING UI SETTINGS (authoritative):\n"
+            "\n\nCURRENT ANALYSIS ROUTING (read-only):\n"
             + json.dumps(routing_request, ensure_ascii=False)
             if routing_request
             else ""
         )
         dataset_text = (
-            "\n\nAUTHORITATIVE ANALYSIS DATASET (paths are resolved by runtime):\n"
+            "\n\nCURRENT ANALYSIS DATASET SUMMARY (read-only):\n"
             + json.dumps(dataset_context.get("summary"), ensure_ascii=False)
             if isinstance(dataset_context, dict)
             and isinstance(dataset_context.get("summary"), dict)
             else "\n\nAUTHORITATIVE ANALYSIS DATASET: none"
         )
-        return f"{PLAN_PROMPT_PREFIX}{routing_text}{dataset_text}\n\nUSER REQUEST:\n{prompt}"
+        plan_text = (
+            "\n\nCURRENT DETERMINISTIC PLAN (read-only):\n"
+            + json.dumps(plan_context, ensure_ascii=False)
+            if plan_context
+            else ""
+        )
+        return f"{PLAN_PROMPT_PREFIX}{routing_text}{dataset_text}{plan_text}\n\nUSER REQUEST:\n{prompt}"
 
     @staticmethod
     def _sdk_permission_mode(mode: str) -> str:
@@ -1043,6 +1081,14 @@ class SessionManager:
             "run_dir": str(run_dir),
             "openwebui_chat_id": chat_id,
             "assistant_message_id": assistant_message_id,
+            "plan_ref": plan.get("plan_ref"),
+            "goals": plan.get("goals"),
+            "options": plan.get("options"),
+            "planner_version": plan.get("planner_version"),
+            "decision_trace": [
+                *(plan.get("decision_trace") or []),
+                {"kind": "confirmation", "plan_ref": plan.get("plan_ref")},
+            ],
             "title": plan.get("title"),
             "dataset": plan.get("dataset"),
             "plan": plan,

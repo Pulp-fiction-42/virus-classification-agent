@@ -12,9 +12,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from deterministic_planner import DeterministicPlanner, PlannerError
+
 from runtime import (
-    EXECUTE_MODE,
-    PLAN_MODE,
     InvalidSessionError,
     OutputItemAdded,
     SessionError,
@@ -26,6 +26,7 @@ from runtime import (
 
 app = FastAPI()
 sessions = SessionManager()
+planner = DeterministicPlanner(sessions)
 log = logging.getLogger(__name__)
 
 
@@ -34,6 +35,22 @@ class ChatRequest(BaseModel):
     messages: list[dict]
     stream: bool = True
     metadata: dict[str, Any] | None = None
+
+
+class CompilePlanRequest(BaseModel):
+    dataset: dict[str, Any]
+    goals: list[str]
+    options: dict[str, Any] | None = None
+    routing: dict[str, Any] | None = None
+
+
+class StartRunRequest(BaseModel):
+    plan: dict[str, Any]
+    dataset: dict[str, Any]
+    chat_id: str
+    plan_id: str
+    plan_revision: int
+    run_id: str
 
 
 def completion_id() -> str:
@@ -76,18 +93,20 @@ def analysis_routing(req: ChatRequest) -> dict[str, Any] | None:
     return routing if isinstance(routing, dict) else None
 
 
-def analysis_mode(req: ChatRequest) -> str | None:
-    metadata = req.metadata if isinstance(req.metadata, dict) else {}
-    chat_meta = metadata.get("chat_meta")
-    mode = chat_meta.get("analysis_mode") if isinstance(chat_meta, dict) else None
-    return mode if mode in {PLAN_MODE, EXECUTE_MODE} else None
-
-
 def analysis_dataset(req: ChatRequest) -> dict[str, Any] | None:
     metadata = req.metadata if isinstance(req.metadata, dict) else {}
     chat_meta = metadata.get("chat_meta")
     dataset = chat_meta.get("analysis_dataset") if isinstance(chat_meta, dict) else None
     return dataset if isinstance(dataset, dict) else None
+
+
+def analysis_plan_summary(req: ChatRequest) -> dict[str, Any] | None:
+    metadata = req.metadata if isinstance(req.metadata, dict) else {}
+    chat_meta = metadata.get("chat_meta")
+    plan = (
+        chat_meta.get("analysis_plan_summary") if isinstance(chat_meta, dict) else None
+    )
+    return plan if isinstance(plan, dict) else None
 
 
 def error_sse(exc: Exception, response_id: str) -> str:
@@ -102,23 +121,6 @@ def error_sse(exc: Exception, response_id: str) -> str:
         },
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def latest_user_text(messages: list[dict]) -> str:
-    for message in reversed(messages):
-        if message.get("role") == "user":
-            content = message.get("content")
-            if isinstance(content, str):
-                return content.strip()
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text = item.get("text")
-                        if isinstance(text, str) and text.strip():
-                            parts.append(text.strip())
-                return "\n".join(parts).strip()
-    return ""
 
 
 def completion_response(content: str, response_id: str) -> JSONResponse:
@@ -156,52 +158,61 @@ async def list_models():
     }
 
 
+@app.post("/v1/analysis/plans/compile")
+async def compile_analysis_plan(req: CompilePlanRequest):
+    try:
+        return planner.compile(
+            dataset=req.dataset,
+            goals=req.goals,
+            options=req.options,
+            routing=req.routing,
+        )
+    except PlannerError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/analysis/runs/start")
+async def start_analysis_run(req: StartRunRequest):
+    try:
+        return await planner.start(
+            persisted_plan=req.plan,
+            dataset=req.dataset,
+            chat_id=req.chat_id,
+            plan_id=req.plan_id,
+            plan_revision=req.plan_revision,
+            run_id=req.run_id,
+        )
+    except PlannerError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SessionStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat(req: ChatRequest, request: Request):
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
-    message_id = request.headers.get("X-OpenWebUI-Message-Id")
     task = background_task(req, request)
     routing = analysis_routing(req)
     dataset = analysis_dataset(req)
-    requested_mode = analysis_mode(req)
-    command = latest_user_text(req.messages)
+    plan_summary = analysis_plan_summary(req)
     response_id = completion_id()
-
-    if not task and command in {"/plan", "/execute"}:
-        mode = PLAN_MODE if command == "/plan" else EXECUTE_MODE
-        try:
-            await sessions.set_mode(chat_id, mode)
-        except InvalidSessionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except SessionStateError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        content = f"已切换到 {mode} mode"
-        if not req.stream:
-            return completion_response(content, response_id)
-        return streaming_text_response(content, response_id)
-
-    if not task and requested_mode == PLAN_MODE:
-        try:
-            await sessions.set_mode(chat_id, requested_mode)
-        except InvalidSessionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except SessionStateError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if not req.stream:
         try:
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
-                else sessions.start_execution(chat_id, message_id, dataset)
-                if requested_mode == EXECUTE_MODE
                 else (
-                    sessions.stream_turn(req.messages, chat_id, routing, dataset)
+                    sessions.stream_turn(
+                        req.messages, chat_id, routing, dataset, plan_summary
+                    )
                     if routing
                     else sessions.stream_turn(
-                        req.messages, chat_id, dataset_context=dataset
+                        req.messages,
+                        chat_id,
+                        dataset_context=dataset,
+                        plan_context=plan_summary,
                     )
                 )
             )
@@ -218,7 +229,7 @@ async def chat(req: ChatRequest, request: Request):
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return completion_response(content, response_id)
 
-    if not task and requested_mode != EXECUTE_MODE:
+    if not task:
         try:
             await sessions.ensure_session(chat_id)
         except InvalidSessionError as exc:
@@ -231,13 +242,16 @@ async def chat(req: ChatRequest, request: Request):
             events = (
                 sessions.stream_ephemeral_turn(req.messages)
                 if task
-                else sessions.start_execution(chat_id, message_id, dataset)
-                if requested_mode == EXECUTE_MODE
                 else (
-                    sessions.stream_turn(req.messages, chat_id, routing, dataset)
+                    sessions.stream_turn(
+                        req.messages, chat_id, routing, dataset, plan_summary
+                    )
                     if routing
                     else sessions.stream_turn(
-                        req.messages, chat_id, dataset_context=dataset
+                        req.messages,
+                        chat_id,
+                        dataset_context=dataset,
+                        plan_context=plan_summary,
                     )
                 )
             )

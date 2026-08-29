@@ -6,8 +6,9 @@ import unittest
 from starlette.requests import Request
 
 import adapter
-from adapter import ChatRequest, error_sse
-from runtime import OutputItemAdded, SessionStateError, TextDelta
+from adapter import ChatRequest, CompilePlanRequest, StartRunRequest, error_sse
+from deterministic_planner import PlannerError
+from runtime import SessionStateError, TextDelta
 
 
 def request_with_headers(**headers: str) -> Request:
@@ -37,21 +38,22 @@ class FakeSessions:
         self.persistent_calls = []
         self.ephemeral_calls = []
         self.ensure_calls = []
-        self.mode_calls = []
-        self.execute_calls = []
 
     async def ensure_session(self, chat_id):
         self.ensure_calls.append(chat_id)
 
-    async def stream_turn(self, messages, chat_id, routing=None, dataset_context=None):
-        self.persistent_calls.append((messages, chat_id, routing, dataset_context))
+    async def stream_turn(
+        self, messages, chat_id, routing=None, dataset_context=None, plan_context=None
+    ):
+        self.persistent_calls.append(
+            (messages, chat_id, routing, dataset_context, plan_context)
+        )
         if self.fail:
             raise SessionStateError(
                 "无法创建分析运行目录：/tmp/run，请检查 BIOAGENT_RUN_ROOT 写权限"
             )
         for text in self.text_parts:
             yield TextDelta(text)
-        yield OutputItemAdded({"type": "analysis_plan", "id": "plan-test"})
 
     async def stream_ephemeral_turn(self, messages):
         self.ephemeral_calls.append(messages)
@@ -59,31 +61,67 @@ class FakeSessions:
             raise SessionStateError("task failed")
         yield TextDelta("ephemeral")
 
-    async def start_execution(self, chat_id, message_id, dataset_context=None):
-        self.execute_calls.append((chat_id, message_id, dataset_context))
-        yield TextDelta("started")
-        yield OutputItemAdded(
-            {
-                "type": "analysis_run",
-                "id": "analysis_run_test",
-                "status": "running",
-                "run": {"run_id": "test"},
-            }
-        )
-
-    async def set_mode(self, chat_id, mode):
-        self.mode_calls.append((chat_id, mode))
-
     async def close_all(self):
         return None
+
+
+class FakePlanner:
+    def __init__(self, *, fail: bool = False):
+        self.fail = fail
+        self.compile_calls = []
+        self.start_calls = []
+
+    def compile(self, **kwargs):
+        self.compile_calls.append(kwargs)
+        if self.fail:
+            raise PlannerError("invalid structured plan")
+        return {"planner_version": 1, **kwargs}
+
+    async def start(self, **kwargs):
+        self.start_calls.append(kwargs)
+        if self.fail:
+            raise PlannerError("persisted plan mismatch")
+        return {"type": "analysis_run", "status": "running"}
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.original_sessions = adapter.sessions
+        self.original_planner = adapter.planner
 
     def tearDown(self):
         adapter.sessions = self.original_sessions
+        adapter.planner = self.original_planner
+
+    async def test_compile_api_is_structured_and_model_free(self):
+        fake = FakePlanner()
+        adapter.planner = fake
+        result = await adapter.compile_analysis_plan(
+            CompilePlanRequest(
+                dataset={"id": "ds", "revision": 1, "status": "ready"},
+                goals=["virus_summary"],
+                options={"viral_type": "RNA"},
+                routing={"mode": "standard"},
+            )
+        )
+        self.assertEqual(result["planner_version"], 1)
+        self.assertEqual(fake.compile_calls[0]["goals"], ["virus_summary"])
+
+    async def test_start_api_forwards_backend_owned_run_reference(self):
+        fake = FakePlanner()
+        adapter.planner = fake
+        result = await adapter.start_analysis_run(
+            StartRunRequest(
+                plan={"goals": ["virus_summary"]},
+                dataset={"id": "ds", "revision": 1, "status": "ready"},
+                chat_id="00000000-0000-0000-0000-000000000001",
+                plan_id="pl_test",
+                plan_revision=3,
+                run_id="analysis-fixed",
+            )
+        )
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(fake.start_calls[0]["run_id"], "analysis-fixed")
 
     async def test_metadata_task_uses_ephemeral_session(self):
         fake = FakeSessions()
@@ -116,7 +154,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ephemeral", body)
         self.assertEqual(len(fake.ephemeral_calls), 1)
 
-    async def test_persistent_stream_includes_structured_plan(self):
+    async def test_persistent_stream_is_conversation_only(self):
         fake = FakeSessions()
         adapter.sessions = fake
         chat_id = "11111111-1111-1111-1111-111111111111"
@@ -128,14 +166,13 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
         body = await response_text(response)
         self.assertIn("persistent", body)
-        self.assertIn('"type": "response.output_item.added"', body)
-        self.assertIn('"type": "analysis_plan"', body)
-        self.assertNotIn('"type": "diagnostic_report"', body)
+        self.assertNotIn('"type": "response.output_item.added"', body)
+        self.assertNotIn('"type": "analysis_plan"', body)
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
         self.assertEqual(fake.ephemeral_calls, [])
 
-    async def test_execute_metadata_starts_runner_with_message_id(self):
+    async def test_execute_metadata_cannot_start_runner(self):
         fake = FakeSessions()
         adapter.sessions = fake
         chat_id = "11111111-1111-1111-1111-111111111111"
@@ -158,13 +195,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         body = await response_text(response)
 
-        self.assertEqual(fake.execute_calls, [(chat_id, "assistant-message", None)])
-        self.assertEqual(fake.mode_calls, [])
-        self.assertEqual(fake.ensure_calls, [])
-        self.assertEqual(fake.persistent_calls, [])
-        self.assertIn('"type": "analysis_run"', body)
+        self.assertEqual(fake.ensure_calls, [chat_id])
+        self.assertEqual(len(fake.persistent_calls), 1)
+        self.assertNotIn('"type": "analysis_run"', body)
 
-    async def test_dataset_context_is_forwarded_to_plan_and_execute(self):
+    async def test_dataset_context_is_forwarded_as_read_only_chat_context(self):
         fake = FakeSessions()
         adapter.sessions = fake
         chat_id = "11111111-1111-1111-1111-111111111111"
@@ -178,22 +213,23 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             request_with_headers(x_openwebui_chat_id=chat_id),
         )
         await response_text(plan_response)
-        execute_response = await adapter.chat(
+        self.assertEqual(fake.persistent_calls[0][3], dataset)
+
+    async def test_persisted_plan_summary_is_forwarded_as_read_only_chat_context(self):
+        fake = FakeSessions()
+        adapter.sessions = fake
+        chat_id = "11111111-1111-1111-1111-111111111111"
+        summary = {"goals": ["virus_summary"], "ready_to_execute": True}
+
+        response = await adapter.chat(
             ChatRequest(
-                messages=[{"role": "user", "content": "execute"}],
-                metadata={
-                    "chat_meta": {
-                        "analysis_mode": "execute",
-                        "analysis_dataset": dataset,
-                    }
-                },
+                messages=[{"role": "user", "content": "explain this plan"}],
+                metadata={"chat_meta": {"analysis_plan_summary": summary}},
             ),
             request_with_headers(x_openwebui_chat_id=chat_id),
         )
-        await response_text(execute_response)
-
-        self.assertEqual(fake.persistent_calls[0][3], dataset)
-        self.assertEqual(fake.execute_calls[0][2], dataset)
+        await response_text(response)
+        self.assertEqual(fake.persistent_calls[0][4], summary)
 
     async def test_streaming_and_non_streaming_preserve_markdown_boundaries(self):
         fake = FakeSessions(text_parts=["开始检查。", "\n\n## 检查完成"])

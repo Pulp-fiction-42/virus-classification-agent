@@ -224,7 +224,7 @@ def _validate_sample_alignment(
             )
 
 
-def normalize_execution_spec(raw: Any) -> dict[str, Any]:
+def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ExecutionSpecError("missing execution_spec")
     if raw.get("adapter") != "analysis_pipeline" or raw.get("version") != 2:
@@ -254,8 +254,10 @@ def normalize_execution_spec(raw: Any) -> dict[str, Any]:
     options = _normalize_options(raw.get("options"))
     stages, used_types = _compile(inputs, deliverables, options)
     unused = [item["id"] for item in inputs if item["type"] not in used_types]
-    if unused:
+    if unused and not allow_unused_inputs:
         raise ExecutionSpecError("unused execution inputs: " + ", ".join(unused))
+    if allow_unused_inputs:
+        inputs = [item for item in inputs if item["type"] in used_types]
     _validate_sample_alignment(inputs, used_types)
 
     raw_policy = raw.get("policy")
@@ -310,6 +312,16 @@ def normalize_execution_spec(raw: Any) -> dict[str, Any]:
         "policy": policy,
         "stages": stages,
     }
+
+
+def normalize_execution_spec(raw: Any) -> dict[str, Any]:
+    return _normalize_spec(raw, allow_unused_inputs=False)
+
+
+def compile_execution_spec(raw: Any) -> dict[str, Any]:
+    """Compile a dataset-sized input set into the minimal executable spec."""
+
+    return _normalize_spec(raw, allow_unused_inputs=True)
 
 
 def normalize_plan_execution_spec(

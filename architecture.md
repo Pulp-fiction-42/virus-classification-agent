@@ -22,9 +22,9 @@ MiniMax Anthropic-compatible API
 
 ### `adapter.py`
 
-- 暴露 `/v1/models` 和 `/v1/chat/completions`。
+- 暴露 `/v1/models`、`/v1/chat/completions`、确定性 plan compile 和 run start API。
 - 读取 Open WebUI 的 chat/task header。
-- 在普通 chat 流程前拦截 `/plan` 和 `/execute`。
+- 普通 chat 永远是咨询对话；规划和执行请求不进入模型链路。
 - 将 SDK 文本增量转换为 OpenAI SSE，或生成非流式 completion。
 - 不保存数据库会话，不访问 Open WebUI 存储。
 
@@ -34,7 +34,7 @@ MiniMax Anthropic-compatible API
 - 为每个 chat ID 创建并复用一个常驻 `ClaudeSDKClient`。
 - 用每个 session 自己的 `asyncio.Lock` 串行同一聊天的请求。
 - 新 session 以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段只预先允许只读的 `Read`、`Glob`、`Grep`。
-- `/plan` 调用 `set_permission_mode("dontAsk")`，并注入 BioAgent `analysis_plan` 协议以避开 Claude Code Plan/ExitPlanMode；`/execute` 调用 `set_permission_mode("bypassPermissions")`，并额外拼接执行提示和 runtime 分配的 run reservation，要求按既有方案执行、保持 Markdown 输出、更新 `.bioagent/state.json` 和 `.bioagent/execution.log`。
+- 对话使用 `dontAsk`，提示词明确禁止模型修改方案或启动分析。`DeterministicPlanner` 复用 catalog/compiler，执行前重编并把 backend plan reference 写入 state。
 - 成功 run 由固定 runner 写入版本化交付指标与报告可用状态；runtime 不发送报告 output item，Open WebUI 从 run 状态提供下载入口，后端按需确定性渲染分析报告，不接收模型生成的 HTML。
 - 方案中的资源数字不由模型生成。runtime 根据已验证的 execution spec、输入序列规模与 SQLite 历史索引生成 P50/P90、峰值内存、安全余量和置信度。
 - 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
@@ -65,7 +65,7 @@ MiniMax Anthropic-compatible API
 
 ### `.claude/skills/`
 
-Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 负责固定流程的保守匹配、plan 模式 `analysis_plan` 内部控制块、线性用户流程、一次用户确认后的直接执行以及 Bash 执行边界；分析报告不由模型撰写。
+Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 只说明固定流程能力和模型边界，不生成方案或执行控制块；分析报告不由模型撰写。
 
 ## 持久化
 

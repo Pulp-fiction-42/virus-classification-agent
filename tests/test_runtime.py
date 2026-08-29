@@ -499,6 +499,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("follow-up question", prompt)
         self.assertIn("不要调用 EnterPlanMode 或 ExitPlanMode", prompt)
 
+    @unittest.skip("model-authored plans are no longer parsed in phase two")
     async def test_plan_block_becomes_hidden_output_item(self):
         FakeClient.response_text_parts = [
             "方案如下。",
@@ -575,6 +576,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(saved["run"]["run_id"], item["run"]["run_id"])
 
+    @unittest.skip("model-authored plans are no longer parsed in phase two")
     async def test_split_plan_block_marker_does_not_leak(self):
         FakeClient.response_text_parts = [
             "方案会按阶段执行。\n``",
@@ -606,6 +608,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(output_items), 1)
         self.assertEqual(output_items[0]["title"], "拆分控制块")
 
+    @unittest.skip("model-authored plans are no longer parsed in phase two")
     async def test_message_boundary_before_plan_block_stays_hidden(self):
         FakeClient.response_events = self.assistant_text_events(
             ["方案如下。"],
@@ -636,6 +639,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(output_items), 1)
         self.assertEqual(output_items[0]["title"], "跨回合控制块")
 
+    @unittest.skip("model-authored plans are no longer parsed in phase two")
     async def test_text_after_plan_block_is_preserved_without_leaking_control_block(
         self,
     ):
@@ -667,6 +671,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(output_items), 1)
         self.assertFalse(output_items[0]["ready_to_execute"])
 
+    @unittest.skip("local plan reservations are no longer used in phase two")
     async def test_updated_plan_replaces_saved_reservation(self):
         FakeClient.response_text_parts = [
             """第一版。
@@ -705,6 +710,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([step["label"] for step in saved["steps"]], ["序列质控"])
         self.assertEqual(output_items[0]["run"]["run_id"], saved["run"]["run_id"])
 
+    @unittest.skip("chat execute mode is no longer an execution entry point")
     async def test_execute_without_ready_plan_does_not_query_client(self):
         await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
 
@@ -720,6 +726,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(FakeClient.instances[0].queries, [])
 
+    @unittest.skip("chat execute mode is no longer an execution entry point")
     async def test_execute_rejects_legacy_plan_without_execution_spec(self):
         plan = self.ready_plan()
         plan.pop("execution_spec")
@@ -1147,6 +1154,29 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.launches), 1)
         self.assertIn("已经启动", "".join(self.texts(events)))
 
+    async def test_deterministic_run_id_retry_launches_runner_once(self):
+        plan = self.ready_plan()
+        plan.update(
+            {
+                "plan_ref": {"id": "pl_test", "revision": 4},
+                "goals": ["contig_filter"],
+                "options": {"viral_type": "RNA+DNA"},
+                "planner_version": 1,
+                "decision_trace": [{"kind": "compiler", "planner_version": 1}],
+            }
+        )
+
+        first = await self.manager.launch_deterministic_plan(plan, self.chat_id)
+        second = await self.manager.launch_deterministic_plan(plan, self.chat_id)
+
+        state = json.loads(Path(plan["run"]["state_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "running")
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(state["plan_ref"], {"id": "pl_test", "revision": 4})
+        self.assertEqual(state["goals"], ["contig_filter"])
+        self.assertEqual(state["planner_version"], 1)
+
     async def test_execute_launch_error_is_terminal_and_visible(self):
         plan = self.ready_plan()
         self.manager._save_analysis_plan(self.chat_id, plan)
@@ -1356,19 +1386,18 @@ temporary.replace(path)
 
         self.assertFalse(self.manager._agent_trace_path(self.chat_id).exists())
 
-    def test_system_prompt_contains_analysis_plan_contract(self):
+    def test_system_prompt_contains_consultation_only_contract(self):
         legacy_contract = "analysis" + "_scheme"
         self.assertNotIn(legacy_contract, config.SYSTEM_PROMPT)
         self.assertIn("analysis_plan", config.SYSTEM_PROMPT)
-        self.assertIn("```analysis_plan", config.SYSTEM_PROMPT)
-        self.assertIn('"ready_to_execute"', config.SYSTEM_PROMPT)
-        self.assertIn("Do not include model-authored steps", config.SYSTEM_PROMPT)
-        self.assertIn('"execution_spec"', config.SYSTEM_PROMPT)
-        self.assertIn('"viral_type"', config.SYSTEM_PROMPT)
-        self.assertIn("analysis_pipeline version 2", config.SYSTEM_PROMPT)
-        self.assertIn("Do not create run directories", config.SYSTEM_PROMPT)
-        self.assertIn("Multiple deliverables are allowed", config.SYSTEM_PROMPT)
-        self.assertIn("final analysis_plan fenced block", config.SYSTEM_PROMPT)
+        self.assertIn("structured UI controls", config.SYSTEM_PROMPT)
+        self.assertIn("deterministic planner", config.SYSTEM_PROMPT)
+        self.assertIn(
+            "Never output an analysis_plan control block", config.SYSTEM_PROMPT
+        )
+        self.assertIn("Never claim that you changed a plan", config.SYSTEM_PROMPT)
+        self.assertNotIn("```analysis_plan", config.SYSTEM_PROMPT)
+        self.assertNotIn('"execution_spec"', config.SYSTEM_PROMPT)
         self.assertNotIn("RUNTIME RUNNER COMMAND", config.SYSTEM_PROMPT)
         self.assertNotIn("```diagnostic_report", config.SYSTEM_PROMPT)
         self.assertIn("ICTV virus taxonomy", config.SYSTEM_PROMPT)
@@ -1387,12 +1416,11 @@ temporary.replace(path)
         legacy_contract = "analysis" + "_scheme"
         self.assertNotIn(legacy_contract, skill)
         self.assertIn("analysis_plan", skill)
-        self.assertIn("Plan mode must not create run directories", skill)
-        self.assertIn("Do not output `analysis_plan` in execute mode", skill)
-        self.assertIn("technical choices are not user requirements", skill)
-        self.assertIn("Never execute a stage omitted from the latest plan", skill)
-        self.assertIn("execution_spec", skill)
-        self.assertIn("analysis_pipeline` version 2", skill)
+        self.assertIn("goal cards", skill)
+        self.assertIn("Standard/Emergency tabs are authoritative", skill)
+        self.assertIn("Never output `analysis_plan`", skill)
+        self.assertIn("Never claim that a plan was changed", skill)
+        self.assertNotIn("```analysis_plan", skill)
         self.assertIn("Multiple endpoints are allowed", skill)
         self.assertIn("${RUN_DIR}/.bioagent/state.json", skill)
         self.assertIn("${RUN_DIR}/.bioagent/execution.log", skill)

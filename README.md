@@ -4,11 +4,11 @@ BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime
 
 ## 本次改进
 
-- 引入 `/plan` 和 `/execute` 模式切换，并为 Open WebUI `chat_id` 保存持久 Claude SDK session 映射。
-- `plan` mode 使用 `dontAsk` permission mode，并注入 BioAgent 方案协议，避免进入 Claude Code Plan/ExitPlanMode；`execute` mode 在用户请求前追加 `遵循之前计划模式下生成的计划执行`。
-- 固定 Snakemake workflow gatekeeper 改为一次确认后直接执行，取消 dry-run 和第二次确认。
-- `plan` mode 只输出 `analysis_pipeline` v2 的输入、交付物、选项和策略；runtime 从静态 artifact/stage DAG 编译 canonical steps。任一公开阶段可作为入口或终点，多分支复用共同上游，并由 workflow 1–6 的 run-local phase 顺序执行。
-- `standard` 直接执行；`auto`/`emergency` 在适用的双端 reads 上执行 5% Kraken2 初筛，并以整个 pipeline 为短路范围。纯中间产物输入自动降级为标准模式。
+- 新增无模型 `/v1/analysis/plans/compile`，由六类目标、病毒类型和 Standard/Emergency 控制直接编译 `analysis_pipeline` v2。
+- 新增 `/v1/analysis/runs/start`，执行前重编 persisted plan、检查 canonical dataset fingerprint，并以固定 run ID 幂等启动 runner。
+- 普通 MiniMax 对话只解释数据集和方案，不再输出 `analysis_plan`、切换执行模式或启动 runner。
+- 多目标共享上游，中间 artifact 选择最短依赖闭包，额外 dataset artifact 不进入 execution spec。
+- `standard` 直接执行；`emergency` 在适用的双端 reads 上执行 5% Kraken2 初筛并停止，纯中间产物输入自动降级为标准模式。
 - 集成 TaxonAgent MCP Server；遇到 ICTV 病毒分类、划界标准、marker gene 或 genome type 查询时，runtime 可自动调用 `ictv_family_info`。
 
 ## 结构
@@ -50,11 +50,9 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map
 ## Agent 能力
 
 - 会话开始时通过 `setting_sources=["project"]`、`skills="all"` 加载 `.claude/skills/`。
-- 默认 `/plan`：活动 SDK permission mode 为 `dontAsk`，并注入只输出 BioAgent `analysis_plan`、禁止 EnterPlanMode/ExitPlanMode 和 plan 文件的 runtime prompt。
-- `/execute`：调用 `set_permission_mode("bypassPermissions")`，并在用户消息前额外注入执行提示和 runtime 分配的 run reservation，要求按既有方案执行、保持 Markdown 输出、更新 `.bioagent/state.json` 和 `.bioagent/execution.log`。
+- 对话 session 使用 `dontAsk` permission mode，只提供解释和科研问答；planner 与 runner 不经过 Claude session。
 - 成功执行由 runner 写入 state v3、telemetry v3 与 `analysis_pipeline` schema v3 报告数据；Open WebUI 根据 run 状态提供任务区下载入口，并由后端按需确定性生成自包含 HTML。模型不撰写报告。
-- `/plan` 和 `/execute` 命令由 adapter 拦截，不发送给 Claude，不污染对话上下文。
-- 固定 Snakemake 工作流的识别和一次确认后直接执行规则位于 `bioinformatics-workflow-gatekeeper` Skill。
+- 固定 Snakemake 工作流说明边界位于 `bioinformatics-workflow-gatekeeper` Skill；Skill 不生成执行控制块。
 - ICTV 相关问题通过 MCP Streamable HTTP 调用 TaxonAgent，工具权限为 `mcp__taxonagent__*`。
 
 ## TaxonAgent MCP 集成
@@ -90,13 +88,6 @@ Server 启动后监听 `0.0.0.0:8765`，MCP endpoint 为 `/mcp`。BioAgent adapt
 - 当前只暴露 `ictv_family_info` 一个工具。
 - 首次调用通常需要 150–250 秒，因为 5090 上的 Ollama glm4 推理没有缓存。
 - MCP Server 目前需手动启动，尚未配置 systemd 守护。
-
-## 用户命令
-
-```text
-/plan
-/execute
-```
 
 ## cyclone 部署
 
