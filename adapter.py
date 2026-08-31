@@ -129,11 +129,7 @@ def error_sse(exc: Exception, response_id: str) -> str:
         "error": {
             "message": str(exc) or exc.__class__.__name__,
             "type": exc.__class__.__name__,
-            **(
-                {"code": exc.code}
-                if isinstance(exc, ConversationPublicError)
-                else {}
-            ),
+            **({"code": exc.code} if isinstance(exc, ConversationPublicError) else {}),
         },
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -180,6 +176,7 @@ async def analysis_health():
     return {
         "deterministic": {"status": "ready"},
         "conversation_model": {
+            "id": "BioAgent",
             "status": "ready" if config.MINIMAX_API_KEY else "unavailable",
             "provider": config.MODEL,
         },

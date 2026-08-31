@@ -307,6 +307,25 @@ truepos_vert_viruses.to_csv(
 truepos_vert_viruses_rep.to_csv(
     'summary/tables/vertebrate_virus_representatives.csv', index=False
 )
+
+taxonomy_priority = (
+    'nr_vote_vfamily', 'nr_svfamily', 'vhdb_svfamily',
+    'nr_svgenus', 'rdrpscan_svorder'
+)
+def bioagent_taxonomy(row):
+    for column in taxonomy_priority:
+        value = row.get(column)
+        text = '' if value != value else str(value).strip()
+        if text and text.lower() not in {'nan', 'none', '-'}:
+            return text
+    return 'Unclassified_viral_contig'
+
+taxonomy = truepos_vert_viruses.copy()
+taxonomy['seq_id'] = taxonomy['qseqid'].astype(str)
+taxonomy['taxonomy'] = taxonomy.apply(bioagent_taxonomy, axis=1)
+taxonomy[['seq_id', 'taxonomy']].drop_duplicates('seq_id').to_csv(
+    'summary/tables/taxonomy.tsv', sep='\\t', index=False
+)
 """,
         encoding="utf-8",
     )
@@ -323,6 +342,8 @@ truepos_vert_viruses_rep.to_csv(
         "'summary/tables/vertebrate_virus_candidates.csv'),\n"
         "\t\tvertebrate_representatives_csv = os.path.join(config['wdir'], "
         "'summary/tables/vertebrate_virus_representatives.csv'),\n"
+        "\t\ttaxonomy_tsv = os.path.join(config['wdir'], "
+        "'summary/tables/taxonomy.tsv'),\n"
     )
     index = summarize_text.find(marker)
     if index < 0:
@@ -350,7 +371,11 @@ def _instrument_generic_workflow(workflow_dir: Path, benchmark_dir: Path) -> Non
                 wildcard_match = re.search(r"\{(sample|sample_index|part)\}", line)
                 if wildcard_match:
                     current_wildcard = wildcard_match.group(1)
-            if current_rule and line.lstrip().startswith("shell:") and not current_has_benchmark:
+            if (
+                current_rule
+                and line.lstrip().startswith("shell:")
+                and not current_has_benchmark
+            ):
                 indent = line[: len(line) - len(line.lstrip())]
                 suffix = f".{{{current_wildcard}}}" if current_wildcard else ""
                 output.extend(
@@ -1167,9 +1192,7 @@ def _top_taxa(path: Path) -> dict[str, dict[str, Any]]:
     rows = _read_tsv_records(path)
     if not rows:
         return {}
-    fraction_columns = [
-        column for column in rows[0] if column.endswith("_frac")
-    ]
+    fraction_columns = [column for column in rows[0] if column.endswith("_frac")]
     top: dict[str, dict[str, Any]] = {}
     for column in fraction_columns:
         sample_id = column.removesuffix("_frac")
@@ -1244,7 +1267,9 @@ def _classification_report_data(
     return {
         "schema_version": 1,
         "viral_type": (spec.get("options") or {}).get("viral_type"),
-        "input_type": ",".join(item.get("type", "") for item in spec.get("inputs") or []),
+        "input_type": ",".join(
+            item.get("type", "") for item in spec.get("inputs") or []
+        ),
         "sample_ids": sample_ids,
         "candidate_count": len(candidates),
         "representative_count": len(representatives),
@@ -1311,6 +1336,15 @@ def _fasta_count(path: Path) -> int:
         return 0
 
 
+def _workflow6_input_is_empty(workflow_dir: Path) -> bool:
+    try:
+        config = (workflow_dir / "config/config.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    match = re.search(r'^input_fasta:\s*["\']?([^"\'\n]+)', config, re.MULTILINE)
+    return bool(match) and _fasta_count(Path(match.group(1).strip())) == 0
+
+
 def _xlsx_row_count(path: Path) -> int:
     try:
         with zipfile.ZipFile(path) as archive:
@@ -1339,7 +1373,13 @@ def _pipeline_report_data(
     if "virus_summary" in stage_ids:
         sections["virus_identification"] = _classification_report_data(state, run_dir)
     if stage_ids.intersection(
-        {"host_mapping", "host_coverage", "host_blast", "host_integrate", "host_summary"}
+        {
+            "host_mapping",
+            "host_coverage",
+            "host_blast",
+            "host_integrate",
+            "host_summary",
+        }
     ):
         root = run_dir / "results/host-identification"
         report = root / "HostIdentification_result.xlsx"
@@ -1377,17 +1417,33 @@ def _pipeline_report_data(
         ]
         sections["virus_quantification"] = {
             "record_count": len(rows),
-            "sample_count": len({row.get("sample_id") for row in rows if row.get("sample_id")}),
-            "reference_count": len({row.get("reference_id") for row in rows if row.get("reference_id")}),
+            "sample_count": len(
+                {row.get("sample_id") for row in rows if row.get("sample_id")}
+            ),
+            "reference_count": len(
+                {row.get("reference_id") for row in rows if row.get("reference_id")}
+            ),
             "max_rpm": max(rpm_values, default=None),
+            "representative_records": sorted(
+                rows,
+                key=lambda row: float(row.get("RPM") or 0),
+                reverse=True,
+            )[:50],
             "table": str(rpm_path),
         }
     if stage_ids.intersection(
-        {"virus_quality", "annotation_strategy", "structure_annotation", "functional_annotation", "annotation_delivery"}
+        {
+            "virus_quality",
+            "annotation_strategy",
+            "structure_annotation",
+            "functional_annotation",
+            "annotation_delivery",
+        }
     ):
         root = run_dir / "results/virus-annotation/results"
         strategy_path = root / "summary/strategy.tsv"
         strategy_rows = _read_tsv_records(strategy_path)
+        consistency_rows = _read_tsv_records(root / "summary/consistency_report.tsv")
         strategy_distribution: dict[str, int] = {}
         for row in strategy_rows:
             strategy = row.get("strategy") or "unknown"
@@ -1409,10 +1465,21 @@ def _pipeline_report_data(
             "input_sequence_count": (
                 _fasta_count(Path(annotation_input)) if annotation_input else None
             ),
-            "filtered_sequence_count": _fasta_count(root / "checkv/filtered_viral_gt50.fna"),
+            "filtered_sequence_count": _fasta_count(
+                root / "checkv/filtered_viral_gt50.fna"
+            ),
             "strategy_distribution": strategy_distribution,
-            "functional_annotation_count": _line_count(root / "function/dramv/annotations.tsv"),
-            "consistency_warning_count": _line_count(root / "summary/consistency_report.tsv"),
+            "functional_annotation_count": _line_count(
+                root / "function/dramv/annotations.tsv"
+            ),
+            "consistency_warning_count": len(consistency_rows),
+            "review_candidates": [
+                row
+                for row in consistency_rows
+                if str(row.get("status") or "").lower()
+                in {"warning", "review", "failed"}
+                or str(row.get("taxonomy_consistent") or "").lower() == "no"
+            ][:50],
             "summary": str(root / "summary/annotation_summary.csv"),
         }
     return {
@@ -1534,7 +1601,7 @@ def _special_evidence_source(
             return {"type": "xlsx_row_count", "path": relative}
 
     for level in ("species", "genus", "family"):
-        microbial = ((sections.get("microbial_profile") or {}).get(level) or {})
+        microbial = (sections.get("microbial_profile") or {}).get(level) or {}
         base = f"/sections/microbial_profile/{level}"
         relative = _relative_report_path(microbial.get("table"), run_dir)
         if pointer == f"{base}/taxa_count" and relative:
@@ -1555,7 +1622,10 @@ def _special_evidence_source(
     quant_sources = {
         "/sections/virus_quantification/record_count": ("count", None),
         "/sections/virus_quantification/sample_count": ("distinct_count", "sample_id"),
-        "/sections/virus_quantification/reference_count": ("distinct_count", "reference_id"),
+        "/sections/virus_quantification/reference_count": (
+            "distinct_count",
+            "reference_id",
+        ),
         "/sections/virus_quantification/max_rpm": ("max", "RPM"),
     }
     if pointer in quant_sources and quant_path:
@@ -1599,11 +1669,13 @@ def _special_evidence_source(
         sample_index, side, metric = int(match.group(1)), match.group(2), match.group(3)
         samples = upstream.get("samples") or []
         if sample_index < len(samples):
-            reports = ((samples[sample_index].get("fastp") or {}).get("reports") or [])
+            reports = (samples[sample_index].get("fastp") or {}).get("reports") or []
             if len(reports) == 1:
                 relative = _relative_report_path(reports[0], run_dir)
                 if relative:
-                    raw_side = "before_filtering" if side == "before" else "after_filtering"
+                    raw_side = (
+                        "before_filtering" if side == "before" else "after_filtering"
+                    )
                     raw_metric = "total_reads" if metric == "reads" else "total_bases"
                     return {
                         "type": "json",
@@ -1619,7 +1691,11 @@ def _report_conclusions(
     conclusions: list[dict[str, Any]] = []
 
     def add(text: str, pointers: list[str]) -> None:
-        evidence_ids = [evidence_by_pointer[pointer] for pointer in pointers if pointer in evidence_by_pointer]
+        evidence_ids = [
+            evidence_by_pointer[pointer]
+            for pointer in pointers
+            if pointer in evidence_by_pointer
+        ]
         if evidence_ids:
             conclusions.append(
                 {
@@ -1654,11 +1730,11 @@ def _report_conclusions(
                 else "未通过全部三项门槛，不形成高置信结论。"
             )
             add(
-                f'样本 {sample.get("sample_id") or "—"} 的 5% 初筛最高物种为 '
-                f'{top.get("name") or "—"}，命中 {top.get("reads") or 0} reads；'
-                f'样本占比 {float(sample.get("top_species_sample_fraction") or 0) * 100:.4f}%，'
-                f'病毒内占比 {float(sample.get("top_species_viral_fraction") or 0) * 100:.2f}%；'
-                f'{confidence_text}',
+                f"样本 {sample.get('sample_id') or '—'} 的 5% 初筛最高物种为 "
+                f"{top.get('name') or '—'}，命中 {top.get('reads') or 0} reads；"
+                f"样本占比 {float(sample.get('top_species_sample_fraction') or 0) * 100:.4f}%，"
+                f"病毒内占比 {float(sample.get('top_species_viral_fraction') or 0) * 100:.2f}%；"
+                f"{confidence_text}",
                 pointers,
             )
 
@@ -1669,20 +1745,34 @@ def _report_conclusions(
             sample_id = sample.get("sample_id") or "—"
             fastp = sample.get("fastp") or {}
             if isinstance(fastp.get("reads_retained_percent"), (int, float)):
-                pointer = f"/sections/upstream/samples/{index}/fastp/reads_retained_percent"
-                add(f'样本 {sample_id} 经 fastp 后 Reads 保留率为 {fastp["reads_retained_percent"]:.2f}%。', [pointer])
+                pointer = (
+                    f"/sections/upstream/samples/{index}/fastp/reads_retained_percent"
+                )
+                add(
+                    f"样本 {sample_id} 经 fastp 后 Reads 保留率为 {fastp['reads_retained_percent']:.2f}%。",
+                    [pointer],
+                )
             rrna = sample.get("rrna") or {}
             if isinstance(rrna.get("reads_retained_percent"), (int, float)):
-                pointer = f"/sections/upstream/samples/{index}/rrna/reads_retained_percent"
-                add(f'样本 {sample_id} 去 rRNA 后 Reads 保留率为 {rrna["reads_retained_percent"]:.2f}%。', [pointer])
+                pointer = (
+                    f"/sections/upstream/samples/{index}/rrna/reads_retained_percent"
+                )
+                add(
+                    f"样本 {sample_id} 去 rRNA 后 Reads 保留率为 {rrna['reads_retained_percent']:.2f}%。",
+                    [pointer],
+                )
             assembly = sample.get("assembly") or {}
             if isinstance(assembly.get("reads"), (int, float)):
                 pointers = [f"/sections/upstream/samples/{index}/assembly/reads"]
                 if isinstance(assembly.get("n50"), (int, float)):
                     pointers.append(f"/sections/upstream/samples/{index}/assembly/n50")
                 add(
-                    f'样本 {sample_id} 组装产生 {assembly.get("reads")} 条 Contigs'
-                    + (f'，N50 为 {assembly.get("n50")} bp。' if assembly.get("n50") is not None else '。'),
+                    f"样本 {sample_id} 组装产生 {assembly.get('reads')} 条 Contigs"
+                    + (
+                        f"，N50 为 {assembly.get('n50')} bp。"
+                        if assembly.get("n50") is not None
+                        else "。"
+                    ),
                     pointers,
                 )
 
@@ -1699,14 +1789,27 @@ def _report_conclusions(
         for index, item in enumerate(classification.get("representatives") or []):
             numeric_fields = [
                 field
-                for field in ("completeness", "contamination", "nr_pident", "approval_rate")
+                for field in (
+                    "completeness",
+                    "contamination",
+                    "nr_pident",
+                    "approval_rate",
+                )
                 if isinstance(item.get(field), (int, float))
             ]
             if numeric_fields:
-                label = item.get("nr_svfamily") or item.get("vhdb_svfamily") or item.get("nr_besthit") or "未定分类"
+                label = (
+                    item.get("nr_svfamily")
+                    or item.get("vhdb_svfamily")
+                    or item.get("nr_besthit")
+                    or "未定分类"
+                )
                 add(
-                    f'代表序列 {item.get("qseqid") or "—"} 的流程分类结果为 {label}；数值证据见引用。',
-                    [f"/sections/virus_identification/representatives/{index}/{field}" for field in numeric_fields],
+                    f"代表序列 {item.get('qseqid') or '—'} 的流程分类结果为 {label}；数值证据见引用。",
+                    [
+                        f"/sections/virus_identification/representatives/{index}/{field}"
+                        for field in numeric_fields
+                    ],
                 )
 
     simple_conclusions = [
@@ -1755,7 +1858,10 @@ def _attach_report_evidence(
             base, stage, metric = retention.groups()
             after_pointer = f"{base}/{stage}/after/{metric}"
             before_pointer = f"{base}/{stage}/before/{metric}"
-            if after_pointer in evidence_by_pointer and before_pointer in evidence_by_pointer:
+            if (
+                after_pointer in evidence_by_pointer
+                and before_pointer in evidence_by_pointer
+            ):
                 record["derivation"] = {
                     "operation": "percent",
                     "inputs": [
@@ -1775,9 +1881,7 @@ def _attach_report_evidence(
     delivery["conclusions"] = _report_conclusions(delivery, evidence_by_pointer)
     if isinstance(telemetry, dict):
         technical_snapshot = {
-            key: value
-            for key, value in telemetry.items()
-            if key != "delivery_report"
+            key: value for key, value in telemetry.items() if key != "delivery_report"
         }
         for pointer, value in _walk_numeric(technical_snapshot):
             evidence.append(
@@ -2125,18 +2229,11 @@ def _finish_routing_record(
         )
     except (KeyError, TypeError, ValueError):
         duration = None
-    deadline = (routing.get("request") or {}).get("deadline_seconds")
     routing.update(
         {
             "phase": phase,
             "finished_at": finished_at,
             "actual_duration_seconds": duration,
-            "deadline_met": (
-                duration <= deadline
-                if isinstance(duration, (int, float))
-                and isinstance(deadline, (int, float))
-                else None
-            ),
             "success": success,
         }
     )
@@ -2197,14 +2294,7 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     log_path = Path(state["execution"]["log"]).resolve()
     spec = state["execution_spec"]
     policy = spec["policy"]
-    routing_request = {
-        "mode": policy["requested_mode"],
-        **(
-            {"deadline_seconds": policy["deadline_seconds"]}
-            if "deadline_seconds" in policy
-            else {}
-        ),
-    }
+    routing_request = {"mode": policy["requested_mode"]}
     full_spec = {
         **spec,
         "policy": {"mode": "standard"},
@@ -2225,11 +2315,6 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         "effective_mode": policy["effective_mode"],
         "short_circuit_scope": "pipeline",
         "applicability_reason": policy["applicability_reason"],
-        **(
-            {"deadline_seconds": policy["deadline_seconds"]}
-            if "deadline_seconds" in policy
-            else {}
-        ),
         "request": routing_request,
         "phase": "screening_admission",
         "started_at": started_at,
@@ -2574,6 +2659,40 @@ def run(args: argparse.Namespace) -> int:
                 log_file.flush()
                 sys.stdout.write(header)
                 sys.stdout.flush()
+                if phase.workflow_id == "workflow6" and _workflow6_input_is_empty(
+                    phase.workflow_dir
+                ):
+                    phase_finished_at = _now()
+                    message = "No viral candidates; workflow6 skipped.\n"
+                    phase_log_path.write_text(message, encoding="utf-8")
+                    log_file.write(message)
+                    state["phases"][phase_index].update(
+                        {
+                            "status": "completed",
+                            "returncode": 0,
+                            "skipped": True,
+                            "reason": "no_viral_candidates",
+                            "finished_at": phase_finished_at,
+                        }
+                    )
+                    telemetry["phases"].append(
+                        {
+                            "id": phase.id,
+                            "workflow_id": phase.workflow_id,
+                            "workflow_dir": str(phase.workflow_dir),
+                            "results_dir": str(phase.results_dir),
+                            "command": [],
+                            "status": "completed",
+                            "returncode": 0,
+                            "skipped": True,
+                            "reason": "no_viral_candidates",
+                            "started_at": phase_started_at,
+                            "finished_at": phase_finished_at,
+                        }
+                    )
+                    _write_json_atomic(state_path, state)
+                    returncode = 0
+                    continue
                 with phase_log_path.open("w", encoding="utf-8") as phase_log:
                     process = subprocess.Popen(
                         phase.command,

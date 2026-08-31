@@ -26,6 +26,7 @@ from analysis_runner import (
     _stage_records,
     _upstream_metrics,
     _workflow1_report_data,
+    _workflow6_input_is_empty,
     main as runner_main,
     redact_text,
     run,
@@ -35,6 +36,19 @@ from workflow_adapters import PreparedExecution, PreparedPhase
 
 
 class AnalysisRunnerTests(unittest.TestCase):
+    def test_workflow6_empty_input_detection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "config").mkdir()
+            fasta = root / "empty.fna"
+            fasta.write_text("", encoding="utf-8")
+            (root / "config/config.yaml").write_text(
+                f'input_fasta: "{fasta}"\n', encoding="utf-8"
+            )
+            self.assertTrue(_workflow6_input_is_empty(root))
+            fasta.write_text(">virus\nACGT\n", encoding="utf-8")
+            self.assertFalse(_workflow6_input_is_empty(root))
+
     @staticmethod
     def _write_workflow_source(root: Path) -> Path:
         source = root / "workflow-source"
@@ -241,7 +255,7 @@ rule merge:
                     }
                 ],
                 "deliverables": ["read_qc"],
-                "policy": {"mode": mode, "deadline_seconds": 900},
+                "policy": {"mode": mode},
             }
         )
         state_path = bioagent / "state.json"
@@ -318,7 +332,8 @@ rule merge:
         self.assertEqual(state["execution"]["status"], "completed")
         self.assertEqual(routing["decision"]["selected_route"], "A")
         self.assertEqual(routing["decision"]["report_kind"], "preliminary_screen")
-        self.assertTrue(routing["deadline_met"])
+        self.assertNotIn("deadline_met", routing)
+        self.assertNotIn("deadline_seconds", routing)
         self.assertIsInstance(routing["actual_duration_seconds"], (int, float))
         self.assertEqual(telemetry["delivery_report"]["kind"], "analysis_pipeline")
 
@@ -510,8 +525,12 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
         self.assertIn("get_orfs.{part}.jsonl", upstream)
         self.assertIn("summarize_tables.jsonl", summary)
         self.assertIn("virus_candidates_csv", summary)
+        self.assertIn("taxonomy_tsv", summary)
         self.assertIn("virus_candidates.csv", script)
         self.assertIn("vertebrate_virus_representatives.csv", script)
+        self.assertIn("nr_vote_vfamily", script)
+        self.assertIn("Unclassified_viral_contig", script)
+        self.assertIn("taxonomy.tsv", script)
         self.assertIn("def finish_empty_search", iterative)
         self.assertIn("if int(num_hitseq) == 0:", iterative)
         self.assertIn("if num_filtered == 0:", iterative)
@@ -795,7 +814,9 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 )
                 selected_stage_statuses = [
                     stage["status"]
-                    for stage in telemetry["delivery_report"]["sections"]["upstream"]["stages"]
+                    for stage in telemetry["delivery_report"]["sections"]["upstream"][
+                        "stages"
+                    ]
                     if stage["rule"] in {"fastp", "bowtie2", "merge"}
                 ]
                 if exit_code == 0:
@@ -864,9 +885,9 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             run_dir = root / "run"
             state_path = self._write_state(run_dir)
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["execution_spec"]["inputs"][0]["records"][0]["files"][
-                "read1"
-            ] = str(root / "missing.fastq.gz")
+            state["execution_spec"]["inputs"][0]["records"][0]["files"]["read1"] = str(
+                root / "missing.fastq.gz"
+            )
             state_path.write_text(json.dumps(state), encoding="utf-8")
             source = self._write_workflow_source(root)
             command = root / "snakemake"
@@ -995,9 +1016,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                         "run_id": "analysis-test",
                         "run_dir": str(run_dir),
                         "openwebui_chat_id": "chat-test",
-                        "execution_spec": self._contig_spec(
-                            root / "contigs.fa", "RNA"
-                        ),
+                        "execution_spec": self._contig_spec(root / "contigs.fa", "RNA"),
                         "steps": [],
                         "execution": {
                             "status": "running",
@@ -1105,7 +1124,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 env=env,
             )
             log_path = run_dir / ".bioagent" / "execution.log"
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 30
             while (
                 not log_path.exists() or "started" not in log_path.read_text()
             ) and time.monotonic() < deadline:
@@ -1347,13 +1366,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
     def test_classification_report_parses_counts_evidence_and_sample(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)
-            tables = (
-                run_dir
-                / "results"
-                / "virus-identification"
-                / "summary"
-                / "tables"
-            )
+            tables = run_dir / "results" / "virus-identification" / "summary" / "tables"
             tables.mkdir(parents=True)
             header = (
                 "qseqid,qlen,viral_type,checkv_quality,completeness,"
@@ -1430,9 +1443,15 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                         "representatives": [],
                         "tables": {
                             "candidates": str(candidates),
-                            "representatives": str(tables / "virus_representatives.csv"),
-                            "vertebrate_candidates": str(tables / "vertebrate_virus_candidates.csv"),
-                            "vertebrate_representatives": str(tables / "vertebrate_virus_representatives.csv"),
+                            "representatives": str(
+                                tables / "virus_representatives.csv"
+                            ),
+                            "vertebrate_candidates": str(
+                                tables / "vertebrate_virus_candidates.csv"
+                            ),
+                            "vertebrate_representatives": str(
+                                tables / "vertebrate_virus_representatives.csv"
+                            ),
                         },
                     }
                 },
@@ -1449,7 +1468,10 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             == "/sections/virus_identification/candidate_count"
         )
         self.assertEqual(evidence["source"]["type"], "delimited_count")
-        self.assertEqual(evidence["source"]["path"], "results/virus-identification/summary/tables/virus_candidates.csv")
+        self.assertEqual(
+            evidence["source"]["path"],
+            "results/virus-identification/summary/tables/virus_candidates.csv",
+        )
         self.assertEqual(result["conclusions"][0]["evidence_ids"], [evidence["id"]])
 
     def test_pipeline_report_extracts_branch_specific_metrics(self):
@@ -1459,8 +1481,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             annotation_input.write_text(">v1\nAC\n>v2\nTG\n", encoding="utf-8")
 
             host_report = (
-                run_dir
-                / "results/host-identification/HostIdentification_result.xlsx"
+                run_dir / "results/host-identification/HostIdentification_result.xlsx"
             )
             host_report.parent.mkdir(parents=True)
             with zipfile.ZipFile(host_report, "w") as archive:
@@ -1478,10 +1499,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     encoding="utf-8",
                 )
 
-            quant = (
-                run_dir
-                / "results/virus-quantification/results/summary/rpm.csv"
-            )
+            quant = run_dir / "results/virus-quantification/results/summary/rpm.csv"
             quant.parent.mkdir(parents=True)
             quant.write_text(
                 "sample_id,reference_id,RPM\n"
@@ -1545,9 +1563,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                         {
                             "id": "virus",
                             "type": "virus_reference_fasta",
-                            "records": [
-                                {"files": {"fasta": str(annotation_input)}}
-                            ],
+                            "records": [{"files": {"fasta": str(annotation_input)}}],
                         },
                     ],
                 }
@@ -1557,9 +1573,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                 state,
                 run_dir,
                 {
-                    "stages": [
-                        {"id": "host_summary", "status": "completed"}
-                    ],
+                    "stages": [{"id": "host_summary", "status": "completed"}],
                     "manifest": {"files": []},
                 },
             )

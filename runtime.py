@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -111,6 +112,7 @@ from conversation_context import build_conversation_context
 from runtime_errors import ConversationPublicError, SessionStateError
 
 
+log = logging.getLogger(__name__)
 SDK_PLAN_PERMISSION_MODE = "dontAsk"
 
 PLAN_PROMPT_PREFIX = """当前是 BioAgent 咨询对话。
@@ -122,9 +124,13 @@ PLAN_PROMPT_PREFIX = """当前是 BioAgent 咨询对话。
 
 
 MODEL_TIMEOUT_MESSAGE = "对话模型请求超时，请重试；数据集、方案与执行功能不受影响。"
-MODEL_UNAVAILABLE_MESSAGE = "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
+MODEL_UNAVAILABLE_MESSAGE = (
+    "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
+)
 ACTION_INVALID_MESSAGE = "对话模型返回了无效的结构化结果，请重试；方案未发生变更。"
-KNOWLEDGE_PATCH_MESSAGE = "知识查询不能形成方案修改建议，请分开提出修改要求；方案未发生变更。"
+KNOWLEDGE_PATCH_MESSAGE = (
+    "知识查询不能形成方案修改建议，请分开提出修改要求；方案未发生变更。"
+)
 KNOWLEDGE_UNAVAILABLE_MESSAGE = "当前无法完成经验证的 ICTV 查询，请稍后重试。"
 
 ICTV_INTENT_PATTERN = re.compile(
@@ -258,11 +264,15 @@ class SessionManager:
                         knowledge_attempted,
                         knowledge_succeeded,
                         structured_output,
-                    ) = await self._collect_response(normalized_chat_id, session, prompt)
+                    ) = await self._collect_response(
+                        normalized_chat_id, session, prompt
+                    )
             except TimeoutError as exc:
                 error_code = "KNOWLEDGE_UNAVAILABLE" if ictv_intent else "MODEL_TIMEOUT"
                 error_message = (
-                    KNOWLEDGE_UNAVAILABLE_MESSAGE if ictv_intent else MODEL_TIMEOUT_MESSAGE
+                    KNOWLEDGE_UNAVAILABLE_MESSAGE
+                    if ictv_intent
+                    else MODEL_TIMEOUT_MESSAGE
                 )
                 yield OutputItemAdded(
                     action_trace_output(
@@ -274,7 +284,10 @@ class SessionManager:
                 )
                 raise ConversationPublicError(error_code, error_message) from exc
             except Exception as exc:
-                error_code = "KNOWLEDGE_UNAVAILABLE" if ictv_intent else "MODEL_UNAVAILABLE"
+                log.debug("BioAgent conversation model request failed", exc_info=True)
+                error_code = (
+                    "KNOWLEDGE_UNAVAILABLE" if ictv_intent else "MODEL_UNAVAILABLE"
+                )
                 error_message = (
                     KNOWLEDGE_UNAVAILABLE_MESSAGE
                     if ictv_intent
@@ -305,9 +318,7 @@ class SessionManager:
                         error_code=exc.code,
                     )
                 )
-                raise ConversationPublicError(
-                    exc.code, ACTION_INVALID_MESSAGE
-                ) from exc
+                raise ConversationPublicError(exc.code, ACTION_INVALID_MESSAGE) from exc
             if ictv_intent and not knowledge_succeeded:
                 yield OutputItemAdded(
                     action_trace_output(
@@ -392,7 +403,12 @@ class SessionManager:
                 self._record_result(chat_id, session, message)
         if not result_seen:
             raise SessionStateError("Claude Agent SDK ended without a ResultMessage")
-        return response_parts, knowledge_attempted, knowledge_succeeded, structured_output
+        return (
+            response_parts,
+            knowledge_attempted,
+            knowledge_succeeded,
+            structured_output,
+        )
 
     async def stream_ephemeral_turn(
         self, messages: list[dict]
@@ -449,6 +465,10 @@ class SessionManager:
         except ConversationPublicError:
             raise
         except Exception as exc:
+            log.debug(
+                "BioAgent conversation session initialization failed",
+                exc_info=True,
+            )
             raise ConversationPublicError(
                 "MODEL_UNAVAILABLE", MODEL_UNAVAILABLE_MESSAGE
             ) from exc
@@ -631,7 +651,10 @@ class SessionManager:
         if event.get("type") != "content_block_start":
             return None
         block = event.get("content_block")
-        if not isinstance(block, dict) or block.get("type") not in {"tool_use", "server_tool_use"}:
+        if not isinstance(block, dict) or block.get("type") not in {
+            "tool_use",
+            "server_tool_use",
+        }:
             return None
         name = str(block.get("name") or "")
         if not SessionManager._is_knowledge_tool_name(name):

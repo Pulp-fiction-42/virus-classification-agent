@@ -21,7 +21,7 @@ def _routing_summary(routing: object) -> dict[str, Any] | None:
         return None
     value = {
         key: routing[key]
-        for key in ("mode", "requested_mode", "effective_mode", "deadline_seconds", "reason")
+        for key in ("mode", "requested_mode", "effective_mode", "reason")
         if key in routing
     }
     return value or None

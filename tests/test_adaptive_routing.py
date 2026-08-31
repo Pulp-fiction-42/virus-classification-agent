@@ -79,7 +79,7 @@ class AdaptiveRoutingTests(unittest.TestCase):
             decide_route({"mode": "standard"}, high)["selected_route"], "B"
         )
 
-        emergency = decide_route({"mode": "emergency", "deadline_seconds": 900}, low)
+        emergency = decide_route({"mode": "emergency"}, low)
         self.assertEqual(emergency["selected_route"], "A")
         self.assertEqual(emergency["report_kind"], "preliminary_screen")
         self.assertIn("EMERGENCY_LOW_CONFIDENCE_REPORT", emergency["reason_codes"])
@@ -114,11 +114,14 @@ class AdaptiveRoutingTests(unittest.TestCase):
         self.assertTrue(snapshot["admission_ok"])
         self.assertEqual(snapshot["reason_codes"], [])
 
-    def test_emergency_default_deadline_and_deep_mode(self):
+    def test_contract_has_three_modes_and_no_deadline(self):
         self.assertEqual(
-            normalize_routing_request({"mode": "emergency"})["deadline_seconds"], 900
+            normalize_routing_request({"mode": "emergency"}), {"mode": "emergency"}
         )
-        self.assertEqual(normalize_routing_request({"mode": "deep"}), {"mode": "deep"})
+        with self.assertRaisesRegex(ValueError, "routing.mode"):
+            normalize_routing_request({"mode": "deep"})
+        with self.assertRaisesRegex(ValueError, "unsupported routing fields"):
+            normalize_routing_request({"mode": "emergency", "deadline_seconds": 900})
 
     def test_parses_species_inside_virus_clade(self):
         with tempfile.TemporaryDirectory() as temp_dir:

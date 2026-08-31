@@ -25,7 +25,7 @@ GOAL_LABELS = {
 }
 GOAL_ORDER = tuple(GOAL_LABELS)
 VIRAL_TYPES = {"RNA", "DNA", "RNA+DNA"}
-ROUTING_MODES = {"standard", "emergency"}
+ROUTING_MODES = {"auto", "standard", "emergency"}
 RUN_ID_RE = re.compile(r"^analysis-[A-Za-z0-9_.-]+$")
 
 
@@ -92,18 +92,14 @@ def _normalize_options(raw: Any) -> dict[str, str]:
 
 def _normalize_routing(raw: Any) -> dict[str, Any]:
     value = raw if isinstance(raw, dict) else {}
-    mode = value.get("mode", "standard")
+    mode = value.get("mode", "auto")
     if mode not in ROUTING_MODES:
-        raise PlannerError("routing mode must be standard or emergency")
-    deadline = value.get("deadline_seconds")
-    if mode == "emergency" and deadline is not None:
-        if (
-            isinstance(deadline, bool)
-            or not isinstance(deadline, (int, float))
-            or deadline <= 0
-        ):
-            raise PlannerError("deadline_seconds must be positive")
-        return {"mode": mode, "deadline_seconds": int(deadline)}
+        raise PlannerError("routing mode must be auto, standard, or emergency")
+    unsupported = set(value) - {"mode"}
+    if unsupported:
+        raise PlannerError(
+            "unsupported routing fields: " + ", ".join(sorted(unsupported))
+        )
     return {"mode": mode}
 
 
@@ -227,12 +223,6 @@ class DeterministicPlanner:
             options=persisted_plan.get("options"),
             routing={
                 "mode": (persisted_plan.get("routing") or {}).get("requested_mode"),
-                **(
-                    {"deadline_seconds": persisted_plan["routing"]["deadline_seconds"]}
-                    if isinstance(persisted_plan.get("routing"), dict)
-                    and "deadline_seconds" in persisted_plan["routing"]
-                    else {}
-                ),
             },
         )
         try:

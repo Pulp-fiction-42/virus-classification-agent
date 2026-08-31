@@ -114,7 +114,7 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
         emergency = self.compile(
             dataset(RAW),
             ["contig_filter"],
-            routing={"mode": "emergency", "deadline_seconds": 600},
+            routing={"mode": "emergency"},
         )
         self.assertTrue(emergency["routing"]["adaptive"])
         self.assertEqual(emergency["routing"]["available_routes"], ["A"])
@@ -122,7 +122,9 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             [step["id"] for step in emergency["steps"][:2]],
             ["adaptive_screen", "adaptive_route"],
         )
-        standard = self.compile(dataset(RAW), ["contig_filter"])
+        standard = self.compile(
+            dataset(RAW), ["contig_filter"], routing={"mode": "standard"}
+        )
         self.assertNotIn("adaptive_screen", [step["id"] for step in standard["steps"]])
         fallback = self.compile(
             dataset(CONTIGS),
@@ -146,7 +148,13 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PlannerError):
             self.compile(dataset(RAW), ["unknown"])
         with self.assertRaises(PlannerError):
-            self.compile(dataset(RAW), ["contig_filter"], routing={"mode": "auto"})
+            self.compile(dataset(RAW), ["contig_filter"], routing={"mode": "deep"})
+        with self.assertRaises(PlannerError):
+            self.compile(
+                dataset(RAW),
+                ["contig_filter"],
+                routing={"mode": "emergency", "deadline_seconds": 900},
+            )
 
     async def test_start_recompiles_and_passes_server_owned_run_paths(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])

@@ -92,9 +92,7 @@ class PipelineSpecTests(unittest.TestCase):
                 "virus_candidate_extract",
             ],
         )
-        self.assertEqual(
-            normalized["stages"][1]["rules"], ["rna_virusidentification"]
-        )
+        self.assertEqual(normalized["stages"][1]["rules"], ["rna_virusidentification"])
 
     def test_annotation_requires_taxonomy_as_an_independent_input(self):
         with self.assertRaisesRegex(ExecutionSpecError, "virus_taxonomy"):
@@ -104,6 +102,25 @@ class PipelineSpecTests(unittest.TestCase):
                     ["annotation_delivery"],
                 )
             )
+
+    def test_raw_reads_annotation_uses_generated_summary_taxonomy(self):
+        normalized = normalize_execution_spec(
+            pipeline(
+                [artifact_input("raw_paired_reads", self.root / "reads-annotation")],
+                ["annotation_delivery"],
+            )
+        )
+        self.assertEqual(
+            [stage["workflow_id"] for stage in normalized["stages"]],
+            ["workflow1"] * 5 + ["workflow2"] * 5 + ["workflow6"] * 5,
+        )
+        quality = next(
+            stage for stage in normalized["stages"] if stage["id"] == "virus_quality"
+        )
+        self.assertEqual(
+            quality["bindings"],
+            {"input_0": "virus_summary_bundle", "input_1": "virus_summary_bundle"},
+        )
 
     def test_schema_rejects_relative_paths_duplicate_ids_and_sample_mismatch(self):
         bad_path = artifact_input("contigs_fasta", self.root / "bad")
@@ -161,7 +178,7 @@ class PipelineSpecTests(unittest.TestCase):
             pipeline([reads], ["read_qc"], mode="emergency")
         )
         self.assertEqual(emergency["policy"]["effective_mode"], "emergency")
-        self.assertEqual(emergency["policy"]["deadline_seconds"], 900)
+        self.assertNotIn("deadline_seconds", emergency["policy"])
 
         fallback = normalize_execution_spec(
             pipeline([contigs], ["virus_summary"], mode="auto")

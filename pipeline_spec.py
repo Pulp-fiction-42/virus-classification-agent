@@ -148,12 +148,18 @@ def _select_stage(
     try:
         stage_bindings: dict[str, str] = {}
         for index, alternatives in enumerate(stage.requirements):
-            artifact_type = _choose_requirement(
-                alternatives, available, selected, bindings, visiting
-            )
-            key = (
-                "contigs" if stage.id == "virus_sequence_prep" else f"input_{index}"
-            )
+            if (
+                stage.id == "virus_quality"
+                and index == 1
+                and stage_bindings.get("input_0") == "virus_summary_bundle"
+                and "virus_taxonomy" not in available
+            ):
+                artifact_type = "virus_summary_bundle"
+            else:
+                artifact_type = _choose_requirement(
+                    alternatives, available, selected, bindings, visiting
+                )
+            key = "contigs" if stage.id == "virus_sequence_prep" else f"input_{index}"
             stage_bindings[key] = artifact_type
     finally:
         visiting.remove(stage_id)
@@ -172,9 +178,7 @@ def _compile(
         _select_stage(deliverable, available, selected, bindings, set())
 
     ordered = sorted(selected, key=STAGE_ORDER.__getitem__)
-    produced_by = {
-        STAGE_BY_ID[stage_id].produces: stage_id for stage_id in ordered
-    }
+    produced_by = {STAGE_BY_ID[stage_id].produces: stage_id for stage_id in ordered}
     stages: list[dict[str, Any]] = []
     for stage_id in ordered:
         stage = STAGE_BY_ID[stage_id]
@@ -239,7 +243,9 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
         raise ExecutionSpecError("execution input ids must be unique")
     types = [value["type"] for value in inputs]
     if len(types) != len(set(types)):
-        raise ExecutionSpecError("only one input bundle of each artifact type is allowed")
+        raise ExecutionSpecError(
+            "only one input bundle of each artifact type is allowed"
+        )
 
     raw_deliverables = raw.get("deliverables")
     if not isinstance(raw_deliverables, list) or not raw_deliverables:
@@ -262,22 +268,19 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
 
     raw_policy = raw.get("policy")
     if isinstance(raw_policy, dict) and "requested_mode" in raw_policy:
-        raw_policy = {
-            "mode": raw_policy.get("requested_mode"),
-            **(
-                {"deadline_seconds": raw_policy["deadline_seconds"]}
-                if "deadline_seconds" in raw_policy
-                else {}
-            ),
-        }
+        if "deadline_seconds" in raw_policy:
+            raise ExecutionSpecError("unsupported routing fields: deadline_seconds")
+        raw_policy = {"mode": raw_policy.get("requested_mode")}
     try:
         requested_policy = normalize_routing_request(raw_policy)
     except ValueError as exc:
         raise ExecutionSpecError(str(exc)) from exc
-    paired_type = next((value for value in used_types if value in PAIRED_READ_TYPES), None)
+    paired_type = next(
+        (value for value in used_types if value in PAIRED_READ_TYPES), None
+    )
     requested_mode = requested_policy["mode"]
     adaptive = requested_mode in {"auto", "emergency"} and paired_type is not None
-    effective_mode = requested_mode if adaptive or requested_mode == "deep" else "standard"
+    effective_mode = requested_mode if adaptive else "standard"
     policy = {
         "requested_mode": requested_mode,
         "effective_mode": effective_mode,
@@ -295,11 +298,6 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
         **(
             {"adaptive_input_type": paired_type, "sample_fraction": 0.05}
             if adaptive
-            else {}
-        ),
-        **(
-            {"deadline_seconds": requested_policy["deadline_seconds"]}
-            if "deadline_seconds" in requested_policy
             else {}
         ),
     }
@@ -388,7 +386,9 @@ def validate_plan_rules(
 ) -> tuple[str, ...]:
     expected_steps = canonical_steps(spec)
     if [step.get("id") for step in steps] != [step["id"] for step in expected_steps]:
-        raise ExecutionSpecError("plan steps do not match the compiled analysis pipeline")
+        raise ExecutionSpecError(
+            "plan steps do not match the compiled analysis pipeline"
+        )
     return selected_rules(spec)
 
 

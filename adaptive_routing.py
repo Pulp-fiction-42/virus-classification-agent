@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROUTING_MODES = {"auto", "emergency", "standard", "deep"}
-DEFAULT_EMERGENCY_DEADLINE_SECONDS = 15 * 60
+ROUTING_MODES = {"auto", "emergency", "standard"}
 MIN_KNOWN_VIRUS_READS = 1_000
 MIN_SAMPLE_FRACTION = 0.01
 MIN_VIRAL_DOMINANCE = 0.80
@@ -28,20 +27,13 @@ def normalize_routing_request(raw: Any) -> dict[str, Any]:
     value = raw if isinstance(raw, dict) else {}
     mode = value.get("mode", "auto")
     if mode not in ROUTING_MODES:
-        raise ValueError("routing.mode must be auto, emergency, standard, or deep")
-    deadline = value.get("deadline_seconds")
-    if deadline is not None:
-        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
-            raise ValueError("routing.deadline_seconds must be a positive number")
-        deadline = int(deadline)
-        if deadline <= 0 or deadline > 30 * 24 * 60 * 60:
-            raise ValueError("routing.deadline_seconds is outside the supported range")
-    elif mode == "emergency":
-        deadline = DEFAULT_EMERGENCY_DEADLINE_SECONDS
-    return {
-        "mode": mode,
-        **({"deadline_seconds": deadline} if deadline is not None else {}),
-    }
+        raise ValueError("routing.mode must be auto, emergency, or standard")
+    unsupported = set(value) - {"mode"}
+    if unsupported:
+        raise ValueError(
+            "unsupported routing fields: " + ", ".join(sorted(unsupported))
+        )
+    return {"mode": mode}
 
 
 def parse_kraken_report(path: Path) -> dict[str, Any]:
@@ -264,14 +256,6 @@ def decide_route(
     if blocked:
         reasons.extend(full_resources.get("reason_codes") or [])
 
-    deadline = routing.get("deadline_seconds")
-    p90 = (history or {}).get("p90_duration_seconds")
-    deadline_at_risk = bool(
-        deadline and p90 and selected_route == "B" and p90 > deadline
-    )
-    if deadline_at_risk:
-        reasons.append("SLO_P90_EXCEEDS_DEADLINE")
-
     return {
         "phase": "blocked" if blocked else "selected",
         "selected_route": selected_route,
@@ -282,5 +266,4 @@ def decide_route(
             if blocked or (selected_route == "A" and not high_confidence)
             else ("preliminary_alert" if selected_route == "A" else "full_analysis")
         ),
-        "deadline_at_risk": deadline_at_risk,
     }

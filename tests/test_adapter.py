@@ -128,6 +128,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.analysis_health()
         self.assertEqual(result["deterministic"]["status"], "ready")
         self.assertEqual(result["conversation_model"]["status"], "unavailable")
+        self.assertEqual(result["conversation_model"]["id"], "BioAgent")
         self.assertEqual(result["knowledge"]["status"], "unavailable")
 
     async def test_start_api_forwards_backend_owned_run_reference(self):
@@ -199,7 +200,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeSessions()
         adapter.sessions = fake
         chat_id = "11111111-1111-1111-1111-111111111111"
-        routing = {"mode": "emergency", "deadline_seconds": 900}
+        routing = {"mode": "emergency"}
 
         response = await adapter.chat(
             ChatRequest(

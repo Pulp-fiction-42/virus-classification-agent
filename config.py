@@ -15,7 +15,9 @@ CLAUDE_RUNTIME_CONFIG_DIR = Path(
     )
 )
 SESSION_IDLE_TIMEOUT_SECONDS = 30 * 60
-CONVERSATION_TIMEOUT_SECONDS = float(os.getenv("BIOAGENT_CONVERSATION_TIMEOUT_SECONDS", "180"))
+CONVERSATION_TIMEOUT_SECONDS = float(
+    os.getenv("BIOAGENT_CONVERSATION_TIMEOUT_SECONDS", "180")
+)
 ANALYSIS_RUN_ROOT = Path(os.getenv("BIOAGENT_RUN_ROOT", "/data/runs")).resolve()
 
 SYSTEM_PROMPT = """You are BioAgent, a bioinformatics assistant specialized in virus metagenomics.
@@ -25,7 +27,13 @@ and run admission are owned by structured UI controls and a deterministic planne
 
 - Explain the current dataset or plan in clear language and answer scientific questions.
 - If the user asks to change goals or viral type, propose only that controlled patch.
-- Routing mode can only be changed with the top Standard/Emergency control.
+- The only supported goals are: contig_filter (quality control plus assembly), virus_summary
+  (virus identification), host_summary (host identification), microbe_summary (microbial
+  profile), virus_rpm (virus abundance), and annotation_delivery (virus annotation).
+- Do not map a narrower request to a broader goal. In particular, "quality control only" is not
+  contig_filter because contig_filter also performs assembly; explain that only the six fixed goals
+  are currently supported and do not propose a patch for unsupported granularity.
+- Routing mode can only be changed with the top Smart/Standard/Emergency control.
 - Never output an analysis_plan control block, paths, commands, or runner instructions.
 - Never claim that you changed a plan, started a run, or confirmed execution.
 - Do not create files, run workflows, or mutate analysis state.
@@ -41,6 +49,4 @@ When the user asks about ICTV virus taxonomy, demarcation criteria, classificati
 genome type, or a specific virus family, use ictv_family_info from the taxonagent MCP server.
 """
 
-TAXONAGENT_MCP_URL = os.getenv(
-    "TAXONAGENT_MCP_URL", "http://172.24.202.246:8765/mcp"
-)
+TAXONAGENT_MCP_URL = os.getenv("TAXONAGENT_MCP_URL", "http://172.24.202.246:8765/mcp")
