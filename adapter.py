@@ -12,22 +12,33 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from deterministic_planner import DeterministicPlanner, PlannerError
-
-from runtime import (
+import config
+from conversation_events import (
     InvalidSessionError,
     OutputItemAdded,
     SessionError,
-    SessionManager,
-    SessionStateError,
     TextDelta,
 )
+from deterministic_planner import DeterministicPlanner, PlannerError
+from deterministic_runtime import DeterministicRuntime
+from runtime_errors import ConversationPublicError, SessionStateError
 
 
 app = FastAPI()
-sessions = SessionManager()
-planner = DeterministicPlanner(sessions)
+deterministic_runtime = DeterministicRuntime()
+planner = DeterministicPlanner(deterministic_runtime)
+sessions: Any | None = None
 log = logging.getLogger(__name__)
+CONVERSATION_ERROR = "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
+
+
+def conversation_sessions() -> Any:
+    global sessions
+    if sessions is None:
+        from runtime import SessionManager
+
+        sessions = SessionManager()
+    return sessions
 
 
 class ChatRequest(BaseModel):
@@ -118,6 +129,11 @@ def error_sse(exc: Exception, response_id: str) -> str:
         "error": {
             "message": str(exc) or exc.__class__.__name__,
             "type": exc.__class__.__name__,
+            **(
+                {"code": exc.code}
+                if isinstance(exc, ConversationPublicError)
+                else {}
+            ),
         },
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -155,6 +171,22 @@ async def list_models():
     return {
         "object": "list",
         "data": [{"id": "BioAgent", "object": "model", "owned_by": "local"}],
+    }
+
+
+@app.get("/v1/analysis/health")
+@app.get("/analysis/health")
+async def analysis_health():
+    return {
+        "deterministic": {"status": "ready"},
+        "conversation_model": {
+            "status": "ready" if config.MINIMAX_API_KEY else "unavailable",
+            "provider": config.MODEL,
+        },
+        "knowledge": {
+            "status": "configured" if config.TAXONAGENT_MCP_URL else "unavailable",
+            "provider": "taxonagent",
+        },
     }
 
 
@@ -197,6 +229,7 @@ async def chat(req: ChatRequest, request: Request):
     dataset = analysis_dataset(req)
     plan_summary = analysis_plan_summary(req)
     response_id = completion_id()
+    sessions = conversation_sessions()
 
     if not req.stream:
         try:
@@ -223,10 +256,18 @@ async def chat(req: ChatRequest, request: Request):
             content = "".join(parts)
         except InvalidSessionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (SessionError, OSError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ConversationPublicError as exc:
+            log.info("BioAgent conversation rejected safely: %s", exc.code)
+            raise HTTPException(
+                status_code=502,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        except (SessionError, SessionStateError, OSError) as exc:
+            log.exception("BioAgent conversation failed")
+            raise HTTPException(status_code=502, detail=CONVERSATION_ERROR) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            log.exception("BioAgent conversation failed")
+            raise HTTPException(status_code=502, detail=CONVERSATION_ERROR) from exc
         return completion_response(content, response_id)
 
     if not task:
@@ -234,8 +275,15 @@ async def chat(req: ChatRequest, request: Request):
             await sessions.ensure_session(chat_id)
         except InvalidSessionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ConversationPublicError as exc:
+            log.info("BioAgent conversation session unavailable: %s", exc.code)
+            raise HTTPException(
+                status_code=503,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except SessionStateError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            log.exception("BioAgent conversation session failed")
+            raise HTTPException(status_code=503, detail=CONVERSATION_ERROR) from exc
 
     async def stream():
         try:
@@ -260,9 +308,12 @@ async def chat(req: ChatRequest, request: Request):
                     yield sse(event.text, response_id)
                 elif isinstance(event, OutputItemAdded):
                     yield output_item_sse(event.item, response_id)
-        except Exception as exc:
-            log.exception("BioAgent stream failed")
+        except ConversationPublicError as exc:
+            log.info("BioAgent stream rejected safely: %s", exc.code)
             yield error_sse(exc, response_id)
+        except Exception:
+            log.exception("BioAgent stream failed")
+            yield error_sse(SessionStateError(CONVERSATION_ERROR), response_id)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
@@ -270,4 +321,5 @@ async def chat(req: ChatRequest, request: Request):
 
 @app.on_event("shutdown")
 async def shutdown_sessions():
-    await sessions.close_all()
+    if sessions is not None:
+        await sessions.close_all()

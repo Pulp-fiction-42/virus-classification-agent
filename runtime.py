@@ -6,14 +6,10 @@ import asyncio
 import json
 import os
 import re
-import subprocess
-import sys
-import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +20,9 @@ try:
         ClaudeSDKClient,
         ResultMessage,
         StreamEvent,
-        ThinkingBlock,
+        ToolResultBlock,
         ToolUseBlock,
+        UserMessage,
     )
 except (
     ModuleNotFoundError
@@ -67,11 +64,21 @@ except (
         result: str | None = None
         errors: list[str] | None = None
         subtype: str = "success"
+        structured_output: Any | None = None
 
     @dataclass
-    class ThinkingBlock:  # type: ignore[no-redef]
-        thinking: str
-        signature: str = ""
+    class StreamEvent:  # type: ignore[no-redef]
+        event: dict[str, Any]
+
+    @dataclass
+    class ToolResultBlock:  # type: ignore[no-redef]
+        tool_use_id: str
+        content: str | list[dict[str, Any]] | None = None
+        is_error: bool | None = None
+
+    @dataclass
+    class UserMessage:  # type: ignore[no-redef]
+        content: str | list[Any]
 
     @dataclass
     class ToolUseBlock:  # type: ignore[no-redef]
@@ -83,100 +90,51 @@ except (
     class AssistantMessage:  # type: ignore[no-redef]
         content: list[Any]
         model: str = ""
-        uuid: str | None = None
-        message_id: str | None = None
-        parent_tool_use_id: str | None = None
-
-    @dataclass
-    class StreamEvent:  # type: ignore[no-redef]
-        event: dict[str, Any]
 
 
 import config
-from resource_calibration import ResourceCalibrator
-from pipeline_spec import (
-    canonical_steps,
-    ExecutionSpecError,
-    normalize_execution_spec,
-    normalize_plan_execution_spec,
-    validate_plan_rules,
+from conversation_events import (
+    InvalidSessionError,
+    OutputItemAdded,
+    RuntimeEvent,
+    TextDelta,
 )
+from conversation_contract import (
+    ConversationContractError,
+    action_trace_output,
+    conversation_action_output_format,
+    parse_conversation_action,
+    proposal_output,
+    validate_conversation_action,
+)
+from conversation_context import build_conversation_context
+from runtime_errors import ConversationPublicError, SessionStateError
 
 
-PLAN_MODE = "plan"
-EXECUTE_MODE = "execute"
 SDK_PLAN_PERMISSION_MODE = "dontAsk"
-SDK_EXECUTE_PERMISSION_MODE = "bypassPermissions"
 
 PLAN_PROMPT_PREFIX = """当前是 BioAgent 咨询对话。
 分析目标、病毒类型、路由模式与执行方案由界面控制器和确定性 planner 管理。
-你只能解释当前数据集与方案，或引导用户操作目标卡片；不得输出 analysis_plan、修改方案、切换模式或启动分析。
-不要调用 EnterPlanMode 或 ExitPlanMode，不要创建或修改任何 plan 文件。"""
-ANALYSIS_PLAN_BLOCK_RE = re.compile(r"```analysis_plan\s*([\s\S]*?)```", re.IGNORECASE)
+你只能解释当前数据集与方案、提出一个明确追问，或提出受控 goals/viral_type patch。
+你不能修改数据集、模式、步骤、资源或执行状态，也不能启动分析。
+必须按运行时提供的 JSON Schema 返回一个 action。
+仅当运行时不支持 structured output 时，才输出一个 conversation_action fenced JSON，且不得在控制块外输出文字。"""
 
 
-class SessionError(RuntimeError):
-    """Base error for an SDK-backed chat session."""
+MODEL_TIMEOUT_MESSAGE = "对话模型请求超时，请重试；数据集、方案与执行功能不受影响。"
+MODEL_UNAVAILABLE_MESSAGE = "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
+ACTION_INVALID_MESSAGE = "对话模型返回了无效的结构化结果，请重试；方案未发生变更。"
+KNOWLEDGE_PATCH_MESSAGE = "知识查询不能形成方案修改建议，请分开提出修改要求；方案未发生变更。"
+KNOWLEDGE_UNAVAILABLE_MESSAGE = "当前无法完成经验证的 ICTV 查询，请稍后重试。"
 
-
-class InvalidSessionError(SessionError):
-    """Raised when Open WebUI does not provide a usable persistent chat ID."""
-
-
-class SessionStateError(SessionError):
-    """Raised when an SDK session cannot be safely used."""
-
-
-@dataclass(frozen=True)
-class TextDelta:
-    text: str
-
-
-@dataclass(frozen=True)
-class OutputItemAdded:
-    item: dict[str, Any]
-
-
-RuntimeEvent = TextDelta | OutputItemAdded
-
-
-class TrailingControlBlockFilter:
-    """Streams visible text while collecting one trailing control block."""
-
-    def __init__(self, marker: str) -> None:
-        self.marker = marker
-        self.buffer = ""
-        self.hidden = ""
-        self.collecting = False
-
-    def push(self, text: str) -> list[str]:
-        if self.collecting:
-            self.hidden += text
-            return []
-
-        self.buffer += text
-        marker_index = self.buffer.find(self.marker)
-        if marker_index >= 0:
-            visible = self.buffer[:marker_index]
-            self.hidden = self.buffer[marker_index:]
-            self.buffer = ""
-            self.collecting = True
-            return [visible] if visible else []
-
-        keep = len(self.marker) - 1
-        if len(self.buffer) <= keep:
-            return []
-
-        visible = self.buffer[:-keep]
-        self.buffer = self.buffer[-keep:]
-        return [visible] if visible else []
-
-    def finish(self) -> tuple[list[str], str]:
-        if self.collecting:
-            return [], self.hidden
-        visible = [self.buffer] if self.buffer else []
-        self.buffer = ""
-        return visible, ""
+ICTV_INTENT_PATTERN = re.compile(
+    r"(?:\bictv\b|病毒分类学|病毒分類學|"
+    r"(?:病毒)?(?:科|属|屬).{0,8}(?:界定|划分|劃分|分类|分類|判定|标准|標準)|"
+    r"(?:marker[ _-]?gene|标记基因|標記基因)|"
+    r"(?:genome[ _-]?type|基因组类型|基因組類型)|"
+    r"\b[a-z][a-z0-9-]*viridae\b)",
+    re.IGNORECASE,
+)
 
 
 class MarkdownTextStream:
@@ -219,7 +177,6 @@ class MarkdownTextStream:
 @dataclass
 class ManagedSession:
     client: Any
-    mode: str
     lock: asyncio.Lock
     last_used_at: float
     bootstrapped: bool
@@ -238,8 +195,6 @@ class SessionManager:
         client_factory: Callable[[ClaudeAgentOptions], Any] = ClaudeSDKClient,
         idle_timeout_seconds: float = config.SESSION_IDLE_TIMEOUT_SECONDS,
         analysis_run_root: Path = config.ANALYSIS_RUN_ROOT,
-        resource_calibrator: ResourceCalibrator | None = None,
-        runner_launcher: Callable[[Path, Path], int] | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_dir = config_dir.resolve()
@@ -249,31 +204,12 @@ class SessionManager:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.chat_map_dir = self.config_dir / "bioagent" / "chat-map"
         self.chat_map_dir.mkdir(parents=True, exist_ok=True)
-        self.agent_trace_dir = self.config_dir / "bioagent" / "agent-traces"
-        self.agent_trace_dir.mkdir(parents=True, exist_ok=True)
         self.sdk_config_dir = sdk_config_dir.resolve()
         self._prepare_sdk_config_dir()
-        self.analysis_plan_dir = self.config_dir / "bioagent" / "analysis-plans"
-        self.analysis_plan_dir.mkdir(parents=True, exist_ok=True)
-        self.resource_history_path = (
-            self.config_dir / "bioagent" / "resource-history.sqlite3"
-        )
-        self.resource_calibrator = resource_calibrator or ResourceCalibrator(
-            self.resource_history_path,
-            self.analysis_run_root,
-        )
-        self._resource_backfill = threading.Thread(
-            target=self.resource_calibrator.backfill,
-            name="bioagent-resource-backfill",
-            daemon=True,
-        )
-        self._resource_backfill.start()
         self.client_factory = client_factory
-        self.runner_launcher = runner_launcher or self._launch_runner_process
         self.idle_timeout_seconds = idle_timeout_seconds
         self._sessions: dict[str, ManagedSession] = {}
         self._sessions_lock = asyncio.Lock()
-        self._execution_lock = asyncio.Lock()
 
         # SDK inspection helpers read this process variable, while the CLI
         # subprocess receives the same value through ClaudeAgentOptions.env.
@@ -293,19 +229,6 @@ class SessionManager:
             )
         projects_link.symlink_to(self.projects_dir, target_is_directory=True)
 
-    async def set_mode(self, chat_id: str | None, mode: str) -> None:
-        if mode not in {PLAN_MODE, EXECUTE_MODE}:
-            raise InvalidSessionError("Mode must be either plan or execute")
-
-        normalized_chat_id = self._validate_chat_id(chat_id)
-        session = await self._get_or_create_session(normalized_chat_id)
-        permission_mode = self._sdk_permission_mode(mode)
-
-        async with session.lock:
-            await session.client.set_permission_mode(permission_mode)
-            session.mode = mode
-            session.last_used_at = time.time()
-
     async def stream_turn(
         self,
         messages: list[dict],
@@ -315,170 +238,170 @@ class SessionManager:
         plan_context: dict[str, Any] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         normalized_chat_id = self._validate_chat_id(chat_id)
-        session = await self._get_or_create_session(normalized_chat_id)
+        session = await self._get_conversation_session(normalized_chat_id)
 
         async with session.lock:
             user_prompt = self._prompt_for_session(messages, session)
+            ictv_intent = self._has_ictv_intent(self._latest_user_message(messages))
             prompt = self._prefixed_prompt(
-                session.mode,
                 user_prompt,
                 routing_request=routing_request,
                 dataset_context=dataset_context,
                 plan_context=plan_context,
             )
             session.last_used_at = time.time()
-            await session.client.query(prompt)
-
-            result_seen = False
-            text_stream = MarkdownTextStream()
-            async for message in session.client.receive_response():
-                if isinstance(message, StreamEvent):
-                    text = text_stream.push(message.event)
-                    if text:
-                        yield TextDelta(text)
-                elif isinstance(message, AssistantMessage):
-                    self._record_assistant_trace(normalized_chat_id, message)
-                elif isinstance(message, ResultMessage):
-                    result_seen = True
-                    self._record_result(normalized_chat_id, session, message)
-
-            if not result_seen:
-                raise SessionStateError(
-                    "Claude Agent SDK ended without a ResultMessage"
+            model_started_at = time.monotonic()
+            try:
+                async with asyncio.timeout(config.CONVERSATION_TIMEOUT_SECONDS):
+                    (
+                        response_parts,
+                        knowledge_attempted,
+                        knowledge_succeeded,
+                        structured_output,
+                    ) = await self._collect_response(normalized_chat_id, session, prompt)
+            except TimeoutError as exc:
+                error_code = "KNOWLEDGE_UNAVAILABLE" if ictv_intent else "MODEL_TIMEOUT"
+                error_message = (
+                    KNOWLEDGE_UNAVAILABLE_MESSAGE if ictv_intent else MODEL_TIMEOUT_MESSAGE
                 )
+                yield OutputItemAdded(
+                    action_trace_output(
+                        action=None,
+                        model=config.MODEL,
+                        latency_ms=round((time.monotonic() - model_started_at) * 1000),
+                        error_code=error_code,
+                    )
+                )
+                raise ConversationPublicError(error_code, error_message) from exc
+            except Exception as exc:
+                error_code = "KNOWLEDGE_UNAVAILABLE" if ictv_intent else "MODEL_UNAVAILABLE"
+                error_message = (
+                    KNOWLEDGE_UNAVAILABLE_MESSAGE
+                    if ictv_intent
+                    else MODEL_UNAVAILABLE_MESSAGE
+                )
+                yield OutputItemAdded(
+                    action_trace_output(
+                        action=None,
+                        model=config.MODEL,
+                        latency_ms=round((time.monotonic() - model_started_at) * 1000),
+                        error_code=error_code,
+                    )
+                )
+                raise ConversationPublicError(error_code, error_message) from exc
+
+            try:
+                action = (
+                    validate_conversation_action(structured_output)
+                    if structured_output is not None
+                    else parse_conversation_action("".join(response_parts))
+                )
+            except ConversationContractError as exc:
+                yield OutputItemAdded(
+                    action_trace_output(
+                        action=None,
+                        model=config.MODEL,
+                        latency_ms=round((time.monotonic() - model_started_at) * 1000),
+                        error_code=exc.code,
+                    )
+                )
+                raise ConversationPublicError(
+                    exc.code, ACTION_INVALID_MESSAGE
+                ) from exc
+            if ictv_intent and not knowledge_succeeded:
+                yield OutputItemAdded(
+                    action_trace_output(
+                        action=None,
+                        model=config.MODEL,
+                        latency_ms=round((time.monotonic() - model_started_at) * 1000),
+                        error_code="KNOWLEDGE_UNAVAILABLE",
+                    )
+                )
+                raise ConversationPublicError(
+                    "KNOWLEDGE_UNAVAILABLE", KNOWLEDGE_UNAVAILABLE_MESSAGE
+                )
+
+            item = proposal_output(action)
+            if item and knowledge_attempted:
+                yield OutputItemAdded(
+                    action_trace_output(
+                        action=action,
+                        model=config.MODEL,
+                        latency_ms=round((time.monotonic() - model_started_at) * 1000),
+                        error_code="KNOWLEDGE_PATCH_FORBIDDEN",
+                    )
+                )
+                raise ConversationPublicError(
+                    "KNOWLEDGE_PATCH_FORBIDDEN", KNOWLEDGE_PATCH_MESSAGE
+                )
+            yield TextDelta(action.message)
+            yield OutputItemAdded(
+                action_trace_output(
+                    action=action,
+                    model=config.MODEL,
+                    latency_ms=round((time.monotonic() - model_started_at) * 1000),
+                )
+            )
+            if item:
+                yield OutputItemAdded(item)
 
             session.bootstrapped = True
             session.last_used_at = time.time()
 
-    async def start_execution(
+    async def _collect_response(
         self,
-        chat_id: str | None,
-        assistant_message_id: str | None,
-        dataset_context: dict[str, Any] | None = None,
-    ) -> AsyncIterator[RuntimeEvent]:
-        normalized_chat_id = self._validate_chat_id(chat_id)
-        async with self._execution_lock:
-            plan = self._load_analysis_plan(normalized_chat_id)
-            if not plan or plan.get("ready_to_execute") is not True:
-                yield TextDelta("请先生成可执行分析方案，再确认启动分析。")
-                return
-
-            try:
-                self._validate_execution_dataset(plan, dataset_context)
-            except SessionStateError as exc:
-                yield TextDelta(str(exc))
-                return
-
-            try:
-                execution_spec = normalize_execution_spec(plan.get("execution_spec"))
-                validate_plan_rules(execution_spec, plan.get("steps") or [])
-            except ExecutionSpecError:
-                yield TextDelta("当前方案缺少有效执行区段，请在方案模式重新生成方案。")
-                return
-            plan["execution_spec"] = execution_spec
-
-            run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
-            state_path = Path(str(run.get("state_path", ""))).resolve()
-            if state_path.exists():
-                _, state = self._read_run_state(plan)
-                if (
-                    state.get("run_id") != run.get("run_id")
-                    or state.get("openwebui_chat_id") != normalized_chat_id
-                ):
-                    raise SessionStateError("现有分析状态与当前方案不匹配。")
-                yield TextDelta("该分析任务已经启动，不能重复创建运行。")
-                return
-
-            state = self._write_initial_run_state(
-                plan, normalized_chat_id, assistant_message_id
-            )
-            try:
-                runner_log = state_path.parent / "runner-process.log"
-                self.runner_launcher(state_path, runner_log)
-            except Exception as exc:
-                state["execution"].update(
-                    {
-                        "status": "failed",
-                        "ok": False,
-                        "returncode": -1,
-                        "error": f"无法启动分析进程：{exc}",
-                        "finished_at": datetime.now()
-                        .astimezone()
-                        .isoformat(timespec="seconds"),
-                    }
-                )
-                state["technical_report"].update(
-                    {"status": "unavailable", "available": False}
-                )
-                state["report"].update({"status": "unavailable", "available": False})
-                self._write_json_atomic(state_path, state)
-                yield TextDelta(f"分析任务启动失败：{exc}")
-                yield OutputItemAdded(self._analysis_run_item(plan, "failed"))
-                return
-
-            yield TextDelta("分析任务已启动，进度与结果将在状态区自动更新。")
-            yield OutputItemAdded(self._analysis_run_item(plan, "running"))
-
-    async def launch_deterministic_plan(
-        self, plan: dict[str, Any], chat_id: str
-    ) -> dict[str, Any]:
-        """Validate and launch a backend-owned immutable plan revision."""
-
-        normalized_chat_id = self._validate_chat_id(chat_id)
-        async with self._execution_lock:
-            dataset = plan.get("dataset")
-            self._validate_execution_dataset(plan, dataset)
-            try:
-                execution_spec = normalize_execution_spec(plan.get("execution_spec"))
-                validate_plan_rules(execution_spec, plan.get("steps") or [])
-            except ExecutionSpecError as exc:
-                raise SessionStateError(f"分析方案执行区段无效：{exc}") from exc
-            plan["execution_spec"] = execution_spec
-
-            run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
-            state_path = Path(str(run.get("state_path", ""))).resolve()
-            if state_path.exists():
-                _, state = self._read_run_state(plan)
-                if (
-                    state.get("run_id") != run.get("run_id")
-                    or state.get("openwebui_chat_id") != normalized_chat_id
-                    or state.get("plan_ref") != plan.get("plan_ref")
-                ):
-                    raise SessionStateError("现有分析状态与当前方案不匹配。")
-                return self._analysis_run_item(
-                    plan, str((state.get("execution") or {}).get("status") or "running")
-                )
-
-            state = self._write_initial_run_state(plan, normalized_chat_id, None)
-            try:
-                self.runner_launcher(
-                    state_path, state_path.parent / "runner-process.log"
-                )
-            except Exception as exc:
-                state["execution"].update(
-                    {
-                        "status": "failed",
-                        "ok": False,
-                        "returncode": -1,
-                        "error": f"无法启动分析进程：{exc}",
-                        "finished_at": datetime.now()
-                        .astimezone()
-                        .isoformat(timespec="seconds"),
-                    }
-                )
-                state["technical_report"].update(
-                    {"status": "unavailable", "available": False}
-                )
-                state["report"].update({"status": "unavailable", "available": False})
-                self._write_json_atomic(state_path, state)
-                raise SessionStateError(f"分析任务启动失败：{exc}") from exc
-            return self._analysis_run_item(plan, "running")
+        chat_id: str,
+        session: ManagedSession,
+        prompt: str,
+    ) -> tuple[list[str], bool, bool, Any | None]:
+        await session.client.query(prompt)
+        result_seen = False
+        text_stream = MarkdownTextStream()
+        response_parts: list[str] = []
+        knowledge_tool_ids: set[str] = set()
+        knowledge_attempted = False
+        knowledge_succeeded = False
+        structured_output: Any | None = None
+        async for message in session.client.receive_response():
+            if isinstance(message, StreamEvent):
+                tool_id = self._knowledge_tool_id(message.event)
+                if tool_id is not None:
+                    knowledge_attempted = True
+                    knowledge_tool_ids.add(tool_id)
+                text = text_stream.push(message.event)
+                if text:
+                    response_parts.append(text)
+            elif isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock) and self._is_knowledge_tool_name(
+                        block.name
+                    ):
+                        knowledge_attempted = True
+                        knowledge_tool_ids.add(block.id)
+            elif isinstance(message, UserMessage) and isinstance(message.content, list):
+                for block in message.content:
+                    if (
+                        isinstance(block, ToolResultBlock)
+                        and block.tool_use_id in knowledge_tool_ids
+                        and block.is_error is not True
+                    ):
+                        knowledge_succeeded = True
+            elif isinstance(message, ResultMessage):
+                result_seen = True
+                structured_output = getattr(message, "structured_output", None)
+                self._record_result(chat_id, session, message)
+        if not result_seen:
+            raise SessionStateError("Claude Agent SDK ended without a ResultMessage")
+        return response_parts, knowledge_attempted, knowledge_succeeded, structured_output
 
     async def stream_ephemeral_turn(
         self, messages: list[dict]
     ) -> AsyncIterator[RuntimeEvent]:
         """Run an Open WebUI background task without persistent chat state."""
-        options = self._build_options(permission_mode=SDK_PLAN_PERMISSION_MODE)
+        options = self._build_options(
+            permission_mode=SDK_PLAN_PERMISSION_MODE,
+            structured_output=False,
+        )
         client = self.client_factory(options)
         result_seen = False
 
@@ -513,7 +436,22 @@ class SessionManager:
 
     async def ensure_session(self, chat_id: str | None) -> None:
         normalized_chat_id = self._validate_chat_id(chat_id)
-        await self._get_or_create_session(normalized_chat_id)
+        await self._get_conversation_session(normalized_chat_id)
+
+    async def _get_conversation_session(self, chat_id: str) -> ManagedSession:
+        try:
+            async with asyncio.timeout(config.CONVERSATION_TIMEOUT_SECONDS):
+                return await self._get_or_create_session(chat_id)
+        except TimeoutError as exc:
+            raise ConversationPublicError(
+                "MODEL_TIMEOUT", MODEL_TIMEOUT_MESSAGE
+            ) from exc
+        except ConversationPublicError:
+            raise
+        except Exception as exc:
+            raise ConversationPublicError(
+                "MODEL_UNAVAILABLE", MODEL_UNAVAILABLE_MESSAGE
+            ) from exc
 
     async def close_idle_sessions(self) -> None:
         now = time.time()
@@ -534,11 +472,6 @@ class SessionManager:
 
         for session in sessions:
             await self._disconnect_session(session)
-
-    def current_mode(self, chat_id: str | None) -> str:
-        normalized_chat_id = self._validate_chat_id(chat_id)
-        session = self._sessions.get(normalized_chat_id)
-        return session.mode if session else PLAN_MODE
 
     def transcript_path(self, session_id: str) -> Path:
         project_name = re.sub(r"[^A-Za-z0-9]", "-", str(self.project_root))
@@ -566,20 +499,14 @@ class SessionManager:
                 )
             self._validate_transcript(transcript)
 
-        # The SDK can only switch back to bypassPermissions if the subprocess
-        # was launched with that capability. We immediately set the active mode
-        # to plan before accepting any user turn, so new chats still default to
-        # read-only plan behavior.
         options = self._build_options(
-            permission_mode=SDK_EXECUTE_PERMISSION_MODE,
+            permission_mode=SDK_PLAN_PERMISSION_MODE,
             resume=claude_session_id,
         )
         client = self.client_factory(options)
         await client.connect()
-        await client.set_permission_mode(SDK_PLAN_PERMISSION_MODE)
         return ManagedSession(
             client=client,
-            mode=PLAN_MODE,
             lock=asyncio.Lock(),
             last_used_at=time.time(),
             bootstrapped=bool(claude_session_id),
@@ -591,32 +518,35 @@ class SessionManager:
         *,
         permission_mode: str,
         resume: str | None = None,
+        structured_output: bool = True,
     ) -> ClaudeAgentOptions:
+        knowledge_enabled = bool(config.TAXONAGENT_MCP_URL)
         return ClaudeAgentOptions(
             system_prompt=config.SYSTEM_PROMPT,
-            tools={"type": "preset", "preset": "claude_code"},
-            allowed_tools=["Read", "Glob", "Grep", "mcp__taxonagent__*"],
-            mcp_servers={
-                "taxonagent": {
-                    "type": "http",
-                    "url": config.TAXONAGENT_MCP_URL,
-                },
-            },
+            tools=[],
+            allowed_tools=["mcp__taxonagent__*"] if knowledge_enabled else [],
+            mcp_servers=(
+                {
+                    "taxonagent": {
+                        "type": "http",
+                        "url": config.TAXONAGENT_MCP_URL,
+                    },
+                }
+                if knowledge_enabled
+                else {}
+            ),
             permission_mode=permission_mode,
             resume=resume,
             model=config.MODEL,
-            thinking={
-                "type": "enabled",
-                "budget_tokens": 20_000,
-                "display": "summarized",
-            },
             include_partial_messages=True,
+            output_format=(
+                conversation_action_output_format() if structured_output else None
+            ),
             cwd=self.project_root,
-            add_dirs=config.EXTRA_DIRS,
-            setting_sources=["project"],
-            skills="all",
+            setting_sources=[],
             env={
                 "ANTHROPIC_BASE_URL": config.ANTHROPIC_BASE_URL,
+                "ANTHROPIC_API_KEY": config.MINIMAX_API_KEY,
                 "ANTHROPIC_AUTH_TOKEN": config.MINIMAX_API_KEY,
                 "MINIMAX_API_KEY": config.MINIMAX_API_KEY,
                 "CLAUDE_CONFIG_DIR": str(self.sdk_config_dir),
@@ -631,39 +561,19 @@ class SessionManager:
 
     @staticmethod
     def _prefixed_prompt(
-        mode: str,
         prompt: str,
         routing_request: dict[str, Any] | None = None,
         dataset_context: dict[str, Any] | None = None,
         plan_context: dict[str, Any] | None = None,
     ) -> str:
-        routing_text = (
-            "\n\nCURRENT ANALYSIS ROUTING (read-only):\n"
-            + json.dumps(routing_request, ensure_ascii=False)
-            if routing_request
-            else ""
+        context = build_conversation_context(
+            routing=routing_request,
+            dataset=dataset_context,
+            plan=plan_context,
         )
-        dataset_text = (
-            "\n\nCURRENT ANALYSIS DATASET SUMMARY (read-only):\n"
-            + json.dumps(dataset_context.get("summary"), ensure_ascii=False)
-            if isinstance(dataset_context, dict)
-            and isinstance(dataset_context.get("summary"), dict)
-            else "\n\nAUTHORITATIVE ANALYSIS DATASET: none"
-        )
-        plan_text = (
-            "\n\nCURRENT DETERMINISTIC PLAN (read-only):\n"
-            + json.dumps(plan_context, ensure_ascii=False)
-            if plan_context
-            else ""
-        )
-        return f"{PLAN_PROMPT_PREFIX}{routing_text}{dataset_text}{plan_text}\n\nUSER REQUEST:\n{prompt}"
-
-    @staticmethod
-    def _sdk_permission_mode(mode: str) -> str:
         return (
-            SDK_PLAN_PERMISSION_MODE
-            if mode == PLAN_MODE
-            else SDK_EXECUTE_PERMISSION_MODE
+            f"{PLAN_PROMPT_PREFIX}\n\nSAFE ANALYSIS CONTEXT (read-only):\n"
+            f"{json.dumps(context, ensure_ascii=False)}\n\nUSER REQUEST:\n{prompt}"
         )
 
     @staticmethod
@@ -714,14 +624,28 @@ class SessionManager:
 
     @staticmethod
     def _is_runtime_control_message(role: str, content: str) -> bool:
-        normalized = content.strip()
-        if role == "user" and normalized in {"/plan", "/execute"}:
-            return True
-        if role == "assistant" and re.fullmatch(
-            r"已切换到 (plan|execute) mode", normalized
-        ):
-            return True
         return False
+
+    @staticmethod
+    def _knowledge_tool_id(event: dict[str, Any]) -> str | None:
+        if event.get("type") != "content_block_start":
+            return None
+        block = event.get("content_block")
+        if not isinstance(block, dict) or block.get("type") not in {"tool_use", "server_tool_use"}:
+            return None
+        name = str(block.get("name") or "")
+        if not SessionManager._is_knowledge_tool_name(name):
+            return None
+        tool_id = block.get("id")
+        return str(tool_id) if tool_id else "__taxonagent_without_id__"
+
+    @staticmethod
+    def _is_knowledge_tool_name(name: str) -> bool:
+        return name.startswith("mcp__taxonagent__") or name == "ictv_family_info"
+
+    @staticmethod
+    def _has_ictv_intent(message: str) -> bool:
+        return bool(ICTV_INTENT_PATTERN.search(message))
 
     @staticmethod
     def _content_as_text(content: object) -> str:
@@ -772,538 +696,6 @@ class SessionManager:
                 "Claude Agent SDK returned a session ID that does not match "
                 "the stored Claude session ID"
             )
-
-    def _extract_analysis_plan(
-        self,
-        text: str,
-        *,
-        routing_request: dict[str, Any] | None = None,
-        dataset_context: dict[str, Any] | None = None,
-    ) -> tuple[str, dict[str, Any] | None]:
-        matches = list(ANALYSIS_PLAN_BLOCK_RE.finditer(text))
-        visible = ANALYSIS_PLAN_BLOCK_RE.sub("", text).strip()
-        if not matches:
-            return visible, None
-
-        for match in reversed(matches):
-            try:
-                raw_plan = json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
-            plan = self._build_analysis_plan(
-                raw_plan,
-                routing_request=routing_request,
-                dataset_context=dataset_context,
-            )
-            if plan:
-                return visible, plan
-        return visible, None
-
-    def _build_analysis_plan(
-        self,
-        raw_plan: Any,
-        *,
-        routing_request: dict[str, Any] | None = None,
-        dataset_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        if not isinstance(raw_plan, dict):
-            return None
-
-        execution_spec = None
-        execution_error = None
-        raw_execution_spec = self._apply_analysis_routing(
-            raw_plan.get("execution_spec"), routing_request
-        )
-        try:
-            raw_execution_spec = self._bind_dataset_inputs(
-                raw_execution_spec, dataset_context
-            )
-            execution_spec = normalize_plan_execution_spec(raw_execution_spec, [])
-        except ExecutionSpecError as exc:
-            execution_error = exc
-        steps = canonical_steps(execution_spec) if execution_spec else []
-
-        run_id = self._new_run_id()
-        run_dir = self.analysis_run_root / run_id
-        is_deep = bool(
-            execution_spec and execution_spec["policy"].get("requested_mode") == "deep"
-        )
-        plan: dict[str, Any] = {
-            "type": "analysis_plan",
-            "id": f"analysis_plan_{run_id}",
-            "status": "completed",
-            "title": raw_plan.get("title")
-            if isinstance(raw_plan.get("title"), str)
-            else "分析方案",
-            "ready_to_execute": (
-                raw_plan.get("ready_to_execute") is not False
-                and execution_spec is not None
-                and not is_deep
-                and isinstance(dataset_context, dict)
-                and dataset_context.get("status") == "ready"
-            ),
-            "run": {
-                "run_id": run_id,
-                "run_dir": str(run_dir),
-                "state_path": str(run_dir / ".bioagent" / "state.json"),
-                "log_path": str(run_dir / ".bioagent" / "execution.log"),
-            },
-            "steps": steps,
-            **(
-                {"dataset": dataset_context}
-                if isinstance(dataset_context, dict)
-                else {}
-            ),
-        }
-        if execution_spec is not None:
-            plan["execution_spec"] = execution_spec
-            plan["routing"] = {
-                **execution_spec["policy"],
-                "available_routes": ["A", "B"]
-                if execution_spec["policy"].get("adaptive")
-                else [],
-            }
-            try:
-                plan["resource_estimate"] = self.resource_calibrator.estimate(
-                    execution_spec
-                )
-            except Exception:
-                pass
-            if is_deep:
-                plan["blocking_reason"] = (
-                    "深度探索路径暂未开放，请选择智能、紧急或标准模式。"
-                )
-            elif dataset_context.get("status") != "ready":
-                plan["blocking_reason"] = self._dataset_blocking_reason(
-                    str(dataset_context.get("status") or "missing")
-                )
-        elif execution_error is not None:
-            plan["blocking_reason"] = self._execution_blocking_reason(execution_error)
-        return plan
-
-    @staticmethod
-    def _bind_dataset_inputs(
-        raw_execution_spec: Any,
-        dataset_context: dict[str, Any] | None,
-    ) -> Any:
-        if not isinstance(dataset_context, dict):
-            raise ExecutionSpecError("missing authoritative analysis dataset")
-        artifacts = dataset_context.get("artifacts")
-        if not isinstance(artifacts, list) or not artifacts:
-            raise ExecutionSpecError("analysis dataset has no assigned artifacts")
-        if not isinstance(raw_execution_spec, dict):
-            return raw_execution_spec
-
-        by_id = {
-            artifact.get("id"): artifact
-            for artifact in artifacts
-            if isinstance(artifact, dict) and isinstance(artifact.get("id"), str)
-        }
-        requested = raw_execution_spec.get("inputs")
-        references = (
-            requested if isinstance(requested, list) and requested else artifacts
-        )
-        bound_inputs = []
-        for reference in references:
-            if not isinstance(reference, dict):
-                raise ExecutionSpecError("dataset input references must be objects")
-            artifact = by_id.get(reference.get("id"))
-            if artifact is None or reference.get("type") != artifact.get("type"):
-                raise ExecutionSpecError("unknown analysis dataset artifact reference")
-            records = []
-            for record in artifact.get("records", []):
-                if not isinstance(record, dict):
-                    raise ExecutionSpecError("analysis dataset records must be objects")
-                files = record.get("files")
-                if not isinstance(files, dict):
-                    raise ExecutionSpecError(
-                        "analysis dataset record files are missing"
-                    )
-                records.append(
-                    {
-                        key: value
-                        for key, value in record.items()
-                        if key not in {"record_id", "files"}
-                    }
-                    | {
-                        "files": {
-                            role: value.get("path")
-                            for role, value in files.items()
-                            if isinstance(value, dict)
-                        }
-                    }
-                )
-            bound_inputs.append(
-                {"id": artifact["id"], "type": artifact["type"], "records": records}
-            )
-        return {**raw_execution_spec, "inputs": bound_inputs}
-
-    @staticmethod
-    def _dataset_blocking_reason(status: str) -> str:
-        return {
-            "checking": "数据集正在执行全量预检，完成前不能启动分析。",
-            "needs_review": "数据集的配对或样本关系需要人工确认。",
-            "invalid": "数据集未通过格式或配对预检。",
-            "stale": "数据集文件在预检后发生变化，请建立新 revision。",
-            "missing": "请先建立并选择数据集。",
-        }.get(status, "数据集尚未满足执行条件。")
-
-    def _validate_execution_dataset(
-        self,
-        plan: dict[str, Any],
-        current: dict[str, Any] | None,
-    ) -> None:
-        planned = plan.get("dataset")
-        if not isinstance(planned, dict) or not isinstance(current, dict):
-            raise SessionStateError("当前方案没有可验证的数据集，请重新建立方案。")
-        if planned.get("id") != current.get("id") or planned.get(
-            "revision"
-        ) != current.get("revision"):
-            raise SessionStateError(
-                "当前数据集 revision 与方案不一致，请重新生成方案。"
-            )
-        if current.get("status") != "ready":
-            raise SessionStateError(
-                self._dataset_blocking_reason(str(current.get("status")))
-            )
-        if planned.get("artifacts") != current.get("artifacts"):
-            raise SessionStateError("数据集内容与方案快照不一致，请重新生成方案。")
-        for artifact in current.get("artifacts", []):
-            for record in artifact.get("records", []):
-                for value in (record.get("files") or {}).values():
-                    if not isinstance(value, dict) or not isinstance(
-                        value.get("path"), str
-                    ):
-                        raise SessionStateError("数据集缺少有效文件指纹。")
-                    path = Path(value["path"]).resolve()
-                    if not self._is_under_analysis_root(path):
-                        raise SessionStateError("数据集文件不在 BIOAGENT_RUN_ROOT 内。")
-                    try:
-                        stat = path.stat()
-                    except OSError as exc:
-                        raise SessionStateError(
-                            "数据集文件已不可用，请重新预检。"
-                        ) from exc
-                    actual = {
-                        "device": stat.st_dev,
-                        "inode": stat.st_ino,
-                        "size": stat.st_size,
-                        "mtime_ns": stat.st_mtime_ns,
-                    }
-                    if actual != value.get("fingerprint"):
-                        raise SessionStateError(
-                            "数据集文件在预检后发生变化，请建立新 revision。"
-                        )
-
-    @staticmethod
-    def _apply_analysis_routing(
-        raw_execution_spec: Any,
-        routing_request: dict[str, Any] | None,
-    ) -> Any:
-        if not routing_request or not isinstance(raw_execution_spec, dict):
-            return raw_execution_spec
-        return {**raw_execution_spec, "policy": routing_request}
-
-    @staticmethod
-    def _execution_blocking_reason(error: ExecutionSpecError) -> str:
-        message = str(error)
-        if "missing execution_spec" in message:
-            return "方案缺少可执行流程信息，请补充输入后重新生成方案。"
-        if "input" in message or "path" in message:
-            return "输入文件信息与流程起点不匹配，请检查输入后重新生成方案。"
-        return "流程区段与方案步骤不一致，请重新生成方案。"
-
-    @staticmethod
-    def _new_run_id() -> str:
-        return f"analysis-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-
-    def _analysis_plan_path(self, chat_id: str) -> Path:
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", chat_id)
-        return self.analysis_plan_dir / f"{safe_name}.json"
-
-    def _load_analysis_plan(self, chat_id: str) -> dict[str, Any] | None:
-        path = self._analysis_plan_path(chat_id)
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise SessionStateError(
-                f"Cannot read analysis plan reservation: {path}"
-            ) from exc
-        return data if isinstance(data, dict) else None
-
-    def _save_analysis_plan(self, chat_id: str, plan: dict[str, Any]) -> None:
-        payload = {
-            **plan,
-            "openwebui_chat_id": chat_id,
-            "updated_at": time.time(),
-        }
-        self._write_json_atomic(self._analysis_plan_path(chat_id), payload)
-
-    def _write_initial_run_state(
-        self,
-        plan: dict[str, Any],
-        chat_id: str,
-        assistant_message_id: str | None,
-    ) -> dict[str, Any]:
-        run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
-        run_dir = Path(str(run.get("run_dir", ""))).resolve()
-        if not self._is_under_analysis_root(run_dir):
-            raise SessionStateError(
-                f"分析运行目录不在 BIOAGENT_RUN_ROOT 内：{run_dir}；root={self.analysis_run_root}"
-            )
-
-        state_path = run_dir / ".bioagent" / "state.json"
-        requested_state_path = Path(str(run.get("state_path", ""))).resolve()
-        if requested_state_path != state_path:
-            raise SessionStateError("分析状态路径与运行目录不匹配。")
-        if state_path.exists():
-            raise SessionStateError("当前分析方案已经启动，请重新生成方案后再执行。")
-
-        log_path = Path(
-            str(run.get("log_path", run_dir / ".bioagent" / "execution.log"))
-        ).resolve()
-        if not self._is_under_analysis_root(log_path):
-            raise SessionStateError(
-                f"分析日志不在 BIOAGENT_RUN_ROOT 内：{log_path}；root={self.analysis_run_root}"
-            )
-
-        try:
-            execution_spec = normalize_execution_spec(plan.get("execution_spec"))
-            validate_plan_rules(execution_spec, plan.get("steps") or [])
-        except ExecutionSpecError as exc:
-            raise SessionStateError(f"分析方案执行区段无效：{exc}") from exc
-
-        state = {
-            "version": 3,
-            "run_id": run.get("run_id"),
-            "run_dir": str(run_dir),
-            "openwebui_chat_id": chat_id,
-            "assistant_message_id": assistant_message_id,
-            "plan_ref": plan.get("plan_ref"),
-            "goals": plan.get("goals"),
-            "options": plan.get("options"),
-            "planner_version": plan.get("planner_version"),
-            "decision_trace": [
-                *(plan.get("decision_trace") or []),
-                {"kind": "confirmation", "plan_ref": plan.get("plan_ref")},
-            ],
-            "title": plan.get("title"),
-            "dataset": plan.get("dataset"),
-            "plan": plan,
-            "execution_spec": execution_spec,
-            "steps": [
-                {
-                    "id": step["id"],
-                    "label": step["label"],
-                    **({"tool": step["tool"]} if step.get("tool") else {}),
-                    **({"rules": step["rules"]} if step.get("rules") else {}),
-                    **(
-                        {"depends_on": step["depends_on"]}
-                        if isinstance(step.get("depends_on"), list)
-                        else {}
-                    ),
-                    **({"produces": step["produces"]} if step.get("produces") else {}),
-                    "is_deliverable": step.get("is_deliverable") is True,
-                    "status": "pending",
-                }
-                for step in plan.get("steps", [])
-                if isinstance(step, dict) and step.get("id") and step.get("label")
-            ],
-            "resource_estimate": plan.get("resource_estimate"),
-            **(
-                {"routing": plan["routing"]}
-                if isinstance(plan.get("routing"), dict)
-                else {}
-            ),
-            "resource_history_db": str(self.resource_history_path),
-            "execution": {
-                "started": True,
-                "status": "running",
-                "ok": None,
-                "returncode": None,
-                "current_step_id": None,
-                "log": str(log_path),
-            },
-            "technical_report": {
-                "status": "collecting",
-                "available": False,
-                "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
-                "telemetry_version": 3,
-                "agent_trace": str(run_dir / ".bioagent" / "agent-trace.jsonl"),
-            },
-            "report": {
-                "status": "collecting",
-                "available": False,
-                "schema_version": 4,
-                "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
-            },
-        }
-        try:
-            self.analysis_run_root.mkdir(parents=True, exist_ok=True)
-            bioagent_dir = run_dir / ".bioagent"
-            bioagent_dir.mkdir(parents=True, exist_ok=True)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.touch(exist_ok=True)
-            self._snapshot_agent_trace(chat_id, bioagent_dir / "agent-trace.jsonl")
-            self._write_json_atomic(state_path, state)
-        except OSError as exc:
-            raise SessionStateError(
-                f"无法创建分析运行目录：{run_dir}，请检查 BIOAGENT_RUN_ROOT 写权限"
-            ) from exc
-        return state
-
-    def _launch_runner_process(self, state_path: Path, log_path: Path) -> int:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("ab") as runner_log:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(self.project_root / "analysis_runner.py"),
-                    "--state",
-                    str(state_path),
-                ],
-                cwd=self.project_root,
-                stdin=subprocess.DEVNULL,
-                stdout=runner_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
-            )
-        threading.Thread(
-            target=process.wait,
-            name=f"bioagent-runner-{process.pid}",
-            daemon=True,
-        ).start()
-        return process.pid
-
-    @staticmethod
-    def _analysis_run_item(plan: dict[str, Any], status: str) -> dict[str, Any]:
-        run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
-        return {
-            "type": "analysis_run",
-            "id": f"analysis_run_{run.get('run_id')}",
-            "status": status,
-            "run": {
-                key: run.get(key)
-                for key in ("run_id", "run_dir", "state_path", "log_path")
-            },
-        }
-
-    def _read_run_state(self, plan: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
-        run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
-        state_path = Path(str(run.get("state_path", ""))).resolve()
-        if not self._is_under_analysis_root(state_path):
-            raise ValueError("Analysis state is outside BIOAGENT_RUN_ROOT")
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if not isinstance(state, dict):
-            raise ValueError("Analysis state must be a JSON object")
-        return state_path, state
-
-    def _is_under_analysis_root(self, path: Path) -> bool:
-        try:
-            path.resolve().relative_to(self.analysis_run_root)
-            return True
-        except ValueError:
-            return False
-
-    @staticmethod
-    def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-        tmp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        tmp_path.replace(path)
-
-    def _agent_trace_path(self, chat_id: str) -> Path:
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", chat_id)
-        return self.agent_trace_dir / f"{safe_name}.jsonl"
-
-    @classmethod
-    def _redact_trace_value(cls, value: Any, key: str = "") -> Any:
-        if re.search(r"token|secret|password|api[_-]?key|authorization", key, re.I):
-            return "[REDACTED]"
-        if isinstance(value, dict):
-            return {
-                str(item_key): cls._redact_trace_value(item, str(item_key))
-                for item_key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [cls._redact_trace_value(item) for item in value]
-        if isinstance(value, str):
-            return re.sub(
-                r"(?i)(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+",
-                r"\1[REDACTED]",
-                value,
-            )
-        return value
-
-    def _record_assistant_trace(self, chat_id: str, message: AssistantMessage) -> None:
-        message_id = (
-            getattr(message, "uuid", None)
-            or getattr(message, "message_id", None)
-            or str(uuid.uuid4())
-        )
-        records = []
-        for index, block in enumerate(message.content):
-            event_id = f"{message_id}:{index}"
-            if isinstance(block, ThinkingBlock) and block.thinking.strip():
-                records.append(
-                    {
-                        "version": 1,
-                        "id": event_id,
-                        "type": "thinking_summary",
-                        "timestamp": datetime.now()
-                        .astimezone()
-                        .isoformat(timespec="seconds"),
-                        "message_id": message_id,
-                        "thinking": block.thinking.strip(),
-                    }
-                )
-            elif isinstance(block, ToolUseBlock):
-                records.append(
-                    {
-                        "version": 1,
-                        "id": event_id,
-                        "type": "tool_use",
-                        "timestamp": datetime.now()
-                        .astimezone()
-                        .isoformat(timespec="seconds"),
-                        "message_id": message_id,
-                        "tool": block.name,
-                        "input": self._redact_trace_value(block.input),
-                    }
-                )
-        if not records:
-            return
-
-        path = self._agent_trace_path(chat_id)
-        existing_ids: set[str] = set()
-        if path.is_file():
-            try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        value = json.loads(line)
-                        if isinstance(value, dict) and isinstance(value.get("id"), str):
-                            existing_ids.add(value["id"])
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise SessionStateError(f"Cannot read agent trace: {path}") from exc
-        new_records = [record for record in records if record["id"] not in existing_ids]
-        if not new_records:
-            return
-        try:
-            with path.open("a", encoding="utf-8") as stream:
-                for record in new_records:
-                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError as exc:
-            raise SessionStateError(f"Cannot write agent trace: {path}") from exc
-
-    def _snapshot_agent_trace(self, chat_id: str, destination: Path) -> None:
-        source = self._agent_trace_path(chat_id)
-        content = source.read_text(encoding="utf-8") if source.is_file() else ""
-        destination.write_text(content, encoding="utf-8")
 
     def _chat_map_path(self, chat_id: str) -> Path:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", chat_id)

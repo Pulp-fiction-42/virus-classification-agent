@@ -13,7 +13,7 @@ SessionManager (runtime.py)
   | ClaudeAgentOptions(resume=<claude_session_id>)
   v
 Claude Agent SDK client.query(prompt)
-  | project Skills + all Claude Code tools
+  | only TaxonAgent MCP; structured conversation_action output
   v
 MiniMax Anthropic-compatible API
 ```
@@ -33,20 +33,20 @@ MiniMax Anthropic-compatible API
 - `SessionManager` 通过 chat-map 保存 Open WebUI chat ID 对应的 Claude session ID。
 - 为每个 chat ID 创建并复用一个常驻 `ClaudeSDKClient`。
 - 用每个 session 自己的 `asyncio.Lock` 串行同一聊天的请求。
-- 新 session 以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段只预先允许只读的 `Read`、`Glob`、`Grep`。
-- 对话使用 `dontAsk`，提示词明确禁止模型修改方案或启动分析。`DeterministicPlanner` 复用 catalog/compiler，执行前重编并把 backend plan reference 写入 state。
+- 新 session 固定使用 `dontAsk`，不加载 Claude Code preset、project Skills、文件工具或额外目录，只保留 TaxonAgent MCP。
+- 对话输出经过 `ConversationAction` schema 验证；模型只能回答、追问或提出 goals/viral_type patch，不能直接修改方案或启动分析。
+- `DeterministicRuntime` 独立拥有资源估算与 runner admission；`DeterministicPlanner` 复用 catalog/compiler，执行前重编并把 backend plan reference 写入 state。
 - 成功 run 由固定 runner 写入版本化交付指标与报告可用状态；runtime 不发送报告 output item，Open WebUI 从 run 状态提供下载入口，后端按需确定性渲染分析报告，不接收模型生成的 HTML。
 - 方案中的资源数字不由模型生成。runtime 根据已验证的 execution spec、输入序列规模与 SQLite 历史索引生成 P50/P90、峰值内存、安全余量和置信度。
 - 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
-- 构建统一的 `ClaudeAgentOptions`，加载项目 Skills 和 Claude Code preset tools。
-- SDK 使用 20k token thinking budget 并请求 `display=summarized`；runtime 只把 `AssistantMessage` 中的非空思考摘要和脱敏工具调用写入 chat 审计 JSONL，启动 run 时快照到 `.bioagent/agent-trace.jsonl`。思考摘要只解释方案形成过程，不作为结果证据。
+- SDK 不设置 thinking budget；执行稽核以 Open WebUI 保存的 deterministic decision events 为准。
 - 校验 transcript、SDK 执行结果和返回的 session ID。
 
 `SessionManager` 持有内存 client registry 和文件式 chat-map，但不访问 `webui.db`。
 
 ### `config.py`
 
-模型、API 地址、API 密钥、项目路径、额外目录和系统提示词集中定义在该文件中。运行目录和 SDK 临时目录允许通过环境变量覆盖。
+模型、API 地址、API 密钥、项目路径和系统提示词集中定义在该文件中。运行目录和 SDK 临时目录允许通过环境变量覆盖。
 
 ### `workflow_adapters.py`
 
@@ -62,10 +62,6 @@ MiniMax Anthropic-compatible API
 - 每条结果结论至少引用一个数值证据。证据记录报告字段、精确值、单位和 run-local 来源定位；后端下载报告时重新读取来源并计算允许的聚合公式，任何缺失、越界或不一致都拒绝出具报告。
 - runner 每秒采样 Snakemake process tree RSS、整机内存和并行 analysis runner 数，并在终态更新资源历史索引；失败或取消记录只供稽核，不进入分位数。
 - workflow 1–6 的 run-local 副本增加 benchmark；workflow2 另增加机器可读分类 CSV。源 workflow 不被修改。
-
-### `.claude/skills/`
-
-Skill 是 SDK 从项目文件系统发现的运行规则。Snakemake gatekeeper Skill 只说明固定流程能力和模型边界，不生成方案或执行控制块；分析报告不由模型撰写。
 
 ## 持久化
 

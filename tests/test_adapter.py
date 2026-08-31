@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
+from fastapi import HTTPException
 from starlette.requests import Request
 
 import adapter
 from adapter import ChatRequest, CompilePlanRequest, StartRunRequest, error_sse
 from deterministic_planner import PlannerError
 from runtime import SessionStateError, TextDelta
+from runtime_errors import ConversationPublicError
 
 
 def request_with_headers(**headers: str) -> Request:
@@ -32,15 +35,21 @@ class FakeSessions:
         *,
         fail: bool = False,
         text_parts: list[str] | None = None,
+        error: Exception | None = None,
+        ensure_error: Exception | None = None,
     ) -> None:
         self.fail = fail
         self.text_parts = text_parts or ["persistent"]
+        self.error = error
+        self.ensure_error = ensure_error
         self.persistent_calls = []
         self.ephemeral_calls = []
         self.ensure_calls = []
 
     async def ensure_session(self, chat_id):
         self.ensure_calls.append(chat_id)
+        if self.ensure_error:
+            raise self.ensure_error
 
     async def stream_turn(
         self, messages, chat_id, routing=None, dataset_context=None, plan_context=None
@@ -52,6 +61,8 @@ class FakeSessions:
             raise SessionStateError(
                 "无法创建分析运行目录：/tmp/run，请检查 BIOAGENT_RUN_ROOT 写权限"
             )
+        if self.error:
+            raise self.error
         for text in self.text_parts:
             yield TextDelta(text)
 
@@ -59,6 +70,8 @@ class FakeSessions:
         self.ephemeral_calls.append(messages)
         if self.fail:
             raise SessionStateError("task failed")
+        if self.error:
+            raise self.error
         yield TextDelta("ephemeral")
 
     async def close_all(self):
@@ -106,6 +119,16 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["planner_version"], 1)
         self.assertEqual(fake.compile_calls[0]["goals"], ["virus_summary"])
+
+    async def test_health_separates_deterministic_model_and_knowledge(self):
+        with (
+            patch.object(adapter.config, "MINIMAX_API_KEY", ""),
+            patch.object(adapter.config, "TAXONAGENT_MCP_URL", ""),
+        ):
+            result = await adapter.analysis_health()
+        self.assertEqual(result["deterministic"]["status"], "ready")
+        self.assertEqual(result["conversation_model"]["status"], "unavailable")
+        self.assertEqual(result["knowledge"]["status"], "unavailable")
 
     async def test_start_api_forwards_backend_owned_run_reference(self):
         fake = FakePlanner()
@@ -284,8 +307,54 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["object"], "error")
         self.assertEqual(payload["error"]["type"], "SessionStateError")
-        self.assertEqual(payload["error"]["message"], "task failed")
+        self.assertEqual(payload["error"]["message"], adapter.CONVERSATION_ERROR)
         self.assertTrue(body.rstrip().endswith("data: [DONE]"))
+
+    async def test_public_conversation_errors_keep_distinct_safe_messages(self):
+        cases = {
+            "ACTION_SCHEMA_INVALID": "对话模型返回了无效的结构化结果，请重试；方案未发生变更。",
+            "MODEL_TIMEOUT": "对话模型请求超时，请重试；数据集、方案与执行功能不受影响。",
+            "MODEL_UNAVAILABLE": adapter.CONVERSATION_ERROR,
+            "KNOWLEDGE_PATCH_FORBIDDEN": "知识查询不能形成方案修改建议，请分开提出修改要求；方案未发生变更。",
+            "KNOWLEDGE_UNAVAILABLE": "当前无法完成经验证的 ICTV 查询，请稍后重试。",
+        }
+        for code, message in cases.items():
+            with self.subTest(code=code):
+                adapter.sessions = FakeSessions(
+                    error=ConversationPublicError(code, message)
+                )
+                response = await adapter.chat(
+                    ChatRequest(messages=[{"role": "user", "content": "test"}]),
+                    request_with_headers(
+                        x_openwebui_chat_id="11111111-1111-1111-1111-111111111111"
+                    ),
+                )
+                body = await response_text(response)
+                payload = json.loads(
+                    next(
+                        line.removeprefix("data: ")
+                        for line in body.splitlines()
+                        if line.startswith("data: {")
+                    )
+                )
+                self.assertEqual(payload["error"]["code"], code)
+                self.assertEqual(payload["error"]["message"], message)
+
+    async def test_session_initialize_error_is_safe_and_typed(self):
+        adapter.sessions = FakeSessions(
+            ensure_error=ConversationPublicError(
+                "MODEL_UNAVAILABLE", adapter.CONVERSATION_ERROR
+            )
+        )
+        with self.assertRaises(HTTPException) as raised:
+            await adapter.chat(
+                ChatRequest(messages=[{"role": "user", "content": "test"}]),
+                request_with_headers(
+                    x_openwebui_chat_id="11111111-1111-1111-1111-111111111111"
+                ),
+            )
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail["code"], "MODEL_UNAVAILABLE")
 
     def test_error_sse_is_openai_compatible(self):
         payload = error_sse(SessionStateError("failed"), "chatcmpl-test")

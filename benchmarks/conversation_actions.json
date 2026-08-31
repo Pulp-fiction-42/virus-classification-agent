@@ -1,0 +1,45 @@
+[
+  {
+    "id": "respond",
+    "output": "```conversation_action\n{\"action\":\"respond\",\"message\":\"固定回答\",\"citations\":[]}\n```",
+    "valid": true,
+    "action": "respond"
+  },
+  {
+    "id": "clarify",
+    "output": "```conversation_action\n{\"action\":\"clarify\",\"message\":\"请确认病毒类型。\",\"citations\":[]}\n```",
+    "valid": true,
+    "action": "clarify"
+  },
+  {
+    "id": "legal_patch",
+    "output": "```conversation_action\n{\"action\":\"propose_patch\",\"message\":\"建议调整。\",\"proposed_patch\":{\"goals\":[\"virus_summary\"],\"viral_type\":\"RNA\"},\"citations\":[]}\n```",
+    "valid": true,
+    "action": "propose_patch"
+  },
+  {
+    "id": "forbidden_field",
+    "output": "```conversation_action\n{\"action\":\"propose_patch\",\"message\":\"越权修改。\",\"proposed_patch\":{\"mode\":\"emergency\"},\"citations\":[]}\n```",
+    "valid": false
+  },
+  {
+    "id": "forged_plan",
+    "output": "```conversation_action\n{\"action\":\"respond\",\"message\":\"伪造方案。\",\"analysis_plan\":{\"steps\":[]},\"citations\":[]}\n```",
+    "valid": false
+  },
+  {
+    "id": "invalid_json",
+    "output": "```conversation_action\n{invalid}\n```",
+    "valid": false
+  },
+  {
+    "id": "timeout",
+    "provider_error": "MODEL_TIMEOUT",
+    "valid": false
+  },
+  {
+    "id": "model_unavailable",
+    "provider_error": "MODEL_UNAVAILABLE",
+    "valid": false
+  }
+]

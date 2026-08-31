@@ -153,35 +153,28 @@ TAXONAGENT_MCP_URL = "http://172.24.202.246:8765/mcp"
 
 **路径**：`/data/bioagent/agent/runtime.py`
 
-**改动**：`SessionManager._build_options()` 方法，加入 `mcp_servers` 并扩展 `allowed_tools`：
+**当前改动**：`SessionManager._build_options()` 仅注册只读 TaxonAgent 边界，不再加载 Claude Code preset 或文件工具：
 
 ```python
-# 改动前
 def _build_options(self, *, permission_mode: str, resume: str | None = None) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         system_prompt=config.SYSTEM_PROMPT,
-        tools={"type": "preset", "preset": "claude_code"},
-        allowed_tools=["Read", "Glob", "Grep"],
-        permission_mode=permission_mode,
-        ...
-    )
-
-# 改动后
-def _build_options(self, *, permission_mode: str, resume: str | None = None) -> ClaudeAgentOptions:
-    return ClaudeAgentOptions(
-        system_prompt=config.SYSTEM_PROMPT,
-        tools={"type": "preset", "preset": "claude_code"},
-        allowed_tools=["Read", "Glob", "Grep", "mcp__taxonagent__*"],  # ← 新增
-        mcp_servers={                                                    # ← 新增
+        tools=[],
+        allowed_tools=["mcp__taxonagent__*"],
+        mcp_servers={
             "taxonagent": {
                 "type": "http",
                 "url": config.TAXONAGENT_MCP_URL,
             },
         },
         permission_mode=permission_mode,
+        setting_sources=[],
         ...
     )
 ```
+
+TaxonAgent 返回值会先转换成 typed citation；缺少 `source_version` 或 `locator` 时只标记为
+`incomplete`，统一知识库上线前不启用正式 citation enforcement。知识查询轮次不能同时形成 plan patch。
 
 **设计说明**：
 - `mcp_servers` 在 `ClaudeAgentOptions` 的构造函数中传入，而不是读取文件系统配置（`.mcp.json`），确保每个 session 都能正确加载

@@ -6,7 +6,8 @@ BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime
 
 - 新增无模型 `/v1/analysis/plans/compile`，由六类目标、病毒类型和 Standard/Emergency 控制直接编译 `analysis_pipeline` v2。
 - 新增 `/v1/analysis/runs/start`，执行前重编 persisted plan、检查 canonical dataset fingerprint，并以固定 run ID 幂等启动 runner。
-- 普通 MiniMax 对话只解释数据集和方案，不再输出 `analysis_plan`、切换执行模式或启动 runner。
+- deterministic runtime 独立初始化；MiniMax、Claude transcript 或 TaxonAgent 不可用时仍可规划和启动 runner。
+- MiniMax 对话必须返回 `respond | clarify | propose_patch` action；patch 仅允许 goals 与 viral type，且必须由用户确认。
 - 多目标共享上游，中间 artifact 选择最短依赖闭包，额外 dataset artifact 不进入 execution spec。
 - `standard` 直接执行；`emergency` 在适用的双端 reads 上执行 5% Kraken2 初筛并停止，纯中间产物输入自动降级为标准模式。
 - 集成 TaxonAgent MCP Server；遇到 ICTV 病毒分类、划界标准、marker gene 或 genome type 查询时，runtime 可自动调用 `ictv_family_info`。
@@ -17,13 +18,17 @@ BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime
 agent/
 ├── adapter.py       # HTTP/OpenAI SSE 协议适配
 ├── runtime.py       # SDK 配置、会话恢复、结果流与 MCP 注册
+├── deterministic_runtime.py # 不导入模型 client 的 runner admission
+├── conversation_contract.py # action、patch、citation 与 retrieval 型别
+├── conversation_context.py # 模型可见上下文的唯一安全白名单
+├── conversation_events.py # adapter 与 provider 共用的事件／错误
+├── taxonagent_adapter.py # legacy TaxonAgent 至 typed citation 的边界
 ├── config.py        # 模型、密钥、路径与 MCP endpoint 等静态配置
 ├── workflow_adapters.py # typed input、phase 准备与 targets
 ├── workflow_catalog.py  # artifact 契约与公开 stage DAG
 ├── pipeline_spec.py     # analysis_pipeline v2 验证与最小依赖闭包编译
 ├── analysis_runner.py   # 多 phase Snakemake 执行与 telemetry
 ├── .claude/
-│   ├── skills/      # 项目级 Agent Skills
 │   └── sessions/    # chat-map 与 SDK JSONL transcript，不提交 Git
 ├── tests/
 ├── tools/watch.py   # 可选的消息监控脚本
@@ -37,9 +42,11 @@ TaxonAgent MCP Server 的实现位于 5090 上独立的 `taxonagent` 项目，�
 
 Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map 保存对应的 Claude session ID，不修改 Open WebUI 数据库：
 
+本机启动前先复制 `.env.example` 为 `.env` 并填写 `MINIMAX_API_KEY`；`start.sh` 与本机 8002 包装脚本都会在 uvicorn 启动前载入该文件，`.env` 不提交 Git。
+
 1. adapter 为每个 `chat_id` 保留一个常驻 `ClaudeSDKClient`。
 2. 同一 `chat_id` 的请求复用同一个 client，并通过会话锁串行写入 SDK stream。
-3. 新建 client 时以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段预先允许 `Read`、`Glob`、`Grep` 与 TaxonAgent MCP 工具。
+3. 新建 client 固定使用 `dontAsk`，不加载 Claude Code preset、Skills 或文件工具；仅允许 TaxonAgent MCP。
 4. 恢复时在 `ClaudeAgentOptions(resume=claude_session_id)` 中加载 transcript，每轮只调用 `client.query(prompt)`。
 5. 新会话第一轮完成后保存 SDK 返回的真实 session ID；后续只发送最新用户消息。
 6. SDK transcript 保存在 `.claude/sessions/projects/<project>/<claude_session_id>.jsonl`。
@@ -49,10 +56,8 @@ Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map
 
 ## Agent 能力
 
-- 会话开始时通过 `setting_sources=["project"]`、`skills="all"` 加载 `.claude/skills/`。
-- 对话 session 使用 `dontAsk` permission mode，只提供解释和科研问答；planner 与 runner 不经过 Claude session。
+- 对话 session 使用 `dontAsk` permission mode，只提供解释、追问、受控 patch 和科研问答；planner 与 runner 不经过 Claude session。
 - 成功执行由 runner 写入 state v3、telemetry v3 与 `analysis_pipeline` schema v3 报告数据；Open WebUI 根据 run 状态提供任务区下载入口，并由后端按需确定性生成自包含 HTML。模型不撰写报告。
-- 固定 Snakemake 工作流说明边界位于 `bioinformatics-workflow-gatekeeper` Skill；Skill 不生成执行控制块。
 - ICTV 相关问题通过 MCP Streamable HTTP 调用 TaxonAgent，工具权限为 `mcp__taxonagent__*`。
 
 ## TaxonAgent MCP 集成
