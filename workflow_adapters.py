@@ -15,7 +15,6 @@ from pipeline_spec import (
     validate_plan_rules,
 )
 
-
 WORKFLOW1_RULES = (
     "fastp",
     "bowtie2",
@@ -1443,10 +1442,10 @@ def prepare_execution(
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
     context = {item["type"]: item for item in spec["inputs"]}
     phases: list[PreparedPhase] = []
-    for workflow_id in PHASE_PREPARERS:
+    for workflow_id, prepare_phase in PHASE_PREPARERS.items():
         if not _workflow_stages(spec, workflow_id):
             continue
-        phase, produced = PHASE_PREPARERS[workflow_id](spec, settings, run_dir, context)
+        phase, produced = prepare_phase(spec, settings, run_dir, context)
         phases.append(phase)
         for artifact in produced.values():
             artifact["_generated"] = True

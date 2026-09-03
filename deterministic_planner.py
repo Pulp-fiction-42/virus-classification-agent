@@ -13,7 +13,6 @@ from pipeline_spec import (
     validate_plan_rules,
 )
 
-
 PLANNER_VERSION = 1
 GOAL_LABELS = {
     "contig_filter": "质控与组装",
@@ -118,8 +117,16 @@ def _dataset_label(dataset: dict[str, Any]) -> str:
 
 
 class DeterministicPlanner:
-    def __init__(self, session_manager: Any):
+    def __init__(self, session_manager: Any, enabled_goals: Any = None):
         self.session_manager = session_manager
+        requested = GOAL_ORDER if enabled_goals is None else tuple(enabled_goals)
+        unknown = set(requested) - set(GOAL_ORDER)
+        if unknown:
+            raise PlannerError(
+                "unsupported enabled analysis goal: "
+                + ", ".join(sorted(map(str, unknown)))
+            )
+        self.enabled_goals = tuple(goal for goal in GOAL_ORDER if goal in requested)
 
     def compile(
         self,
@@ -138,6 +145,12 @@ class DeterministicPlanner:
             )
 
         normalized_goals = _normalize_goals(goals)
+        disabled = set(normalized_goals) - set(self.enabled_goals)
+        if disabled:
+            raise PlannerError(
+                "analysis goal is not enabled: "
+                + ", ".join(sorted(disabled))
+            )
         normalized_options = _normalize_options(options)
         normalized_routing = _normalize_routing(routing)
         try:
@@ -199,7 +212,7 @@ class DeterministicPlanner:
             plan["resource_estimate"] = (
                 self.session_manager.resource_calibrator.estimate(execution_spec)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return plan
 

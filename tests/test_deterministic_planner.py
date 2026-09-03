@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from deterministic_planner import DeterministicPlanner, GOAL_ORDER, PlannerError
+from deterministic_planner import GOAL_ORDER, DeterministicPlanner, PlannerError
 
 
 def artifact(
@@ -154,6 +154,16 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
                 dataset(RAW),
                 ["contig_filter"],
                 routing={"mode": "emergency", "deadline_seconds": 900},
+            )
+
+    def test_disabled_goal_is_rejected(self):
+        disabled = DeterministicPlanner(self.manager, enabled_goals=[])
+        with self.assertRaisesRegex(PlannerError, "not enabled"):
+            disabled.compile(
+                dataset=dataset(RAW),
+                goals=["contig_filter"],
+                options={"viral_type": "RNA+DNA"},
+                routing={"mode": "standard"},
             )
 
     async def test_start_recompiles_and_passes_server_owned_run_paths(self):

@@ -3,7 +3,6 @@
 import os
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODEL = "MiniMax-M3"
 ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic"
@@ -19,6 +18,17 @@ CONVERSATION_TIMEOUT_SECONDS = float(
     os.getenv("BIOAGENT_CONVERSATION_TIMEOUT_SECONDS", "180")
 )
 ANALYSIS_RUN_ROOT = Path(os.getenv("BIOAGENT_RUN_ROOT", "/data/runs")).resolve()
+ANALYSIS_DATA_ROOT = Path(
+    os.getenv("BIOAGENT_DATA_ROOT", str(ANALYSIS_RUN_ROOT))
+).resolve()
+ENABLED_ANALYSIS_GOALS = tuple(
+    goal.strip()
+    for goal in os.getenv(
+        "BIOAGENT_ENABLED_GOALS",
+        "contig_filter,virus_summary,host_summary,microbe_summary,virus_rpm,annotation_delivery",
+    ).split(",")
+    if goal.strip()
+)
 
 SYSTEM_PROMPT = """You are BioAgent, a bioinformatics assistant specialized in virus metagenomics.
 

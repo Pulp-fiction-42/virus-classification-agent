@@ -10,7 +10,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-
 GOALS = {
     "contig_filter",
     "virus_summary",
@@ -32,7 +31,7 @@ class ProposedPatch(BaseModel):
     viral_type: str | None = None
 
     @model_validator(mode="after")
-    def validate_values(self) -> "ProposedPatch":
+    def validate_values(self) -> ProposedPatch:
         if self.goals is not None:
             if not self.goals or len(set(self.goals)) != len(self.goals):
                 raise ValueError("goals must be a non-empty unique list")
@@ -52,7 +51,7 @@ class ConversationAction(BaseModel):
     citations: list[str] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
-    def validate_action(self) -> "ConversationAction":
+    def validate_action(self) -> ConversationAction:
         patch_is_empty = self.proposed_patch is None or (
             self.proposed_patch.goals is None
             and self.proposed_patch.viral_type is None

@@ -24,20 +24,19 @@ from adaptive_routing import (
     decide_route,
 )
 from adaptive_screening import run_rapid_screen
+from pipeline_spec import selected_rules
 from resource_calibration import (
     ProcessResourceMonitor,
     ResourceCalibrator,
     build_run_resource_profile,
 )
-from pipeline_spec import selected_rules
 from workflow_adapters import (
+    WORKFLOW1_RULES,
     AdapterSettings,
     PreparedExecution,
     PreparedPhase,
-    WORKFLOW1_RULES,
     prepare_execution,
 )
-
 
 FULL_ANALYSIS_MINIMUM_MEMORY_MB = 24 * 1024
 FULL_ANALYSIS_MINIMUM_THREADS = 8
@@ -93,7 +92,7 @@ def _parse_timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        parsed = datetime.strptime(value, LOG_TIMESTAMP_FORMAT)
+        parsed = datetime.strptime(value, LOG_TIMESTAMP_FORMAT).astimezone()
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
     return parsed
@@ -2379,7 +2378,7 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         _write_json_atomic(routing_path, routing_record)
         _write_json_atomic(state_path, state)
         screening = run_rapid_screen(spec, run_dir, threads=SCREEN_THREADS)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         error = redact_text(str(exc))
         routing_record["error"] = error
         _finish_routing_record(routing_record, phase="failed", success=False)
@@ -2738,7 +2737,7 @@ def run(args: argparse.Namespace) -> int:
                 _write_json_atomic(state_path, state)
                 if returncode != 0:
                     break
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         error = redact_text(str(exc))
         returncode = 128 + cancelled_signal if cancelled_signal else 1
         if process and process.poll() is None:
@@ -2915,9 +2914,7 @@ def run(args: argparse.Namespace) -> int:
         for step in state.get("steps", []):
             rules = set(step.get("rules") or [])
             stage = stages_by_id.get(step.get("id")) or {}
-            if returncode == 0:
-                step["status"] = "completed"
-            elif rules and rules <= completed_rules:
+            if returncode == 0 or rules and rules <= completed_rules:
                 step["status"] = "completed"
             elif returncode != 0 and step.get("status") == "running":
                 step["status"] = "failed"
@@ -3007,7 +3004,7 @@ def main(argv: list[str] | None = None) -> int:
     state_path = Path(args.state).resolve()
     try:
         return run(args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         try:
             state = _read_state(state_path)
             state.setdefault("execution", {}).update(
@@ -3027,7 +3024,7 @@ def main(argv: list[str] | None = None) -> int:
                 {"status": "unavailable", "available": False}
             )
             _write_json_atomic(state_path, state)
-        except Exception as state_error:
+        except Exception as state_error:  # noqa: BLE001
             print(
                 f"BioAgent runner could not terminalize state: {state_error}",
                 file=sys.stderr,

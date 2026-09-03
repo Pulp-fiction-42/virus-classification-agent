@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import config
-from pipeline_spec import ExecutionSpecError, normalize_execution_spec, validate_plan_rules
+from pipeline_spec import (
+    ExecutionSpecError,
+    normalize_execution_spec,
+    validate_plan_rules,
+)
 from resource_calibration import ResourceCalibrator
 from runtime_errors import SessionStateError
 
@@ -27,12 +31,14 @@ class DeterministicRuntime:
         config_dir: Path = config.CLAUDE_STATE_DIR,
         *,
         analysis_run_root: Path = config.ANALYSIS_RUN_ROOT,
+        analysis_data_root: Path = config.ANALYSIS_DATA_ROOT,
         resource_calibrator: ResourceCalibrator | None = None,
         runner_launcher: Callable[[Path, Path], int] | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_dir = config_dir.resolve()
         self.analysis_run_root = analysis_run_root.resolve()
+        self.analysis_data_root = analysis_data_root.resolve()
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.resource_history_path = self.config_dir / "bioagent" / "resource-history.sqlite3"
         self.resource_history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,8 +198,8 @@ class DeterministicRuntime:
                     if not isinstance(value, dict) or not isinstance(value.get("path"), str):
                         raise SessionStateError("数据集缺少有效文件指纹。")
                     path = Path(value["path"]).resolve()
-                    if not self._is_under_analysis_root(path):
-                        raise SessionStateError("数据集文件不在 BIOAGENT_RUN_ROOT 内。")
+                    if not self._is_under_data_root(path):
+                        raise SessionStateError("数据集文件不在 BIOAGENT_DATA_ROOT 内。")
                     try:
                         stat = path.stat()
                     except OSError as exc:
@@ -230,6 +236,13 @@ class DeterministicRuntime:
     def _is_under_analysis_root(self, path: Path) -> bool:
         try:
             path.resolve().relative_to(self.analysis_run_root)
+            return True
+        except ValueError:
+            return False
+
+    def _is_under_data_root(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.analysis_data_root)
             return True
         except ValueError:
             return False

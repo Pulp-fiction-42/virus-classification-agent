@@ -25,7 +25,7 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp_dir.name)
         self.project_root = root / "agent"
         self.run_root = root / "runs"
-        self.input_root = self.run_root / "inputs"
+        self.input_root = root / "inputs"
         self.project_root.mkdir()
         self.input_root.mkdir(parents=True)
         self.read1 = self.input_root / "sample_R1.fastq"
@@ -42,6 +42,7 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.project_root,
             root / "state",
             analysis_run_root=self.run_root,
+            analysis_data_root=self.input_root,
             resource_calibrator=FakeCalibrator(),
             runner_launcher=launch,
         )
@@ -151,6 +152,16 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.launch_deterministic_plan(plan, self.chat_id)
         self.assertFalse(Path(plan["run"]["state_path"]).exists())
         self.assertEqual(self.launches, [])
+
+    async def test_input_outside_data_root_is_rejected(self):
+        plan = self.plan()
+        outside = self.run_root / "outside.fastq"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("@a/1\nAC\n+\nII\n", encoding="utf-8")
+        record = plan["dataset"]["artifacts"][0]["records"][0]
+        record["files"]["read1"] = self._file(outside)
+        with self.assertRaisesRegex(SessionStateError, "BIOAGENT_DATA_ROOT"):
+            await self.runtime.launch_deterministic_plan(plan, self.chat_id)
 
     async def test_mismatched_existing_state_is_not_overwritten(self):
         plan = self.plan()

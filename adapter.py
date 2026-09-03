@@ -23,10 +23,12 @@ from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime
 from runtime_errors import ConversationPublicError, SessionStateError
 
-
 app = FastAPI()
 deterministic_runtime = DeterministicRuntime()
-planner = DeterministicPlanner(deterministic_runtime)
+planner = DeterministicPlanner(
+    deterministic_runtime,
+    enabled_goals=config.ENABLED_ANALYSIS_GOALS,
+)
 sessions: Any | None = None
 log = logging.getLogger(__name__)
 CONVERSATION_ERROR = "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
@@ -174,7 +176,10 @@ async def list_models():
 @app.get("/analysis/health")
 async def analysis_health():
     return {
-        "deterministic": {"status": "ready"},
+        "deterministic": {
+            "status": "ready",
+            "enabled_goals": list(planner.enabled_goals),
+        },
         "conversation_model": {
             "id": "BioAgent",
             "status": "ready" if config.MINIMAX_API_KEY else "unavailable",

@@ -11,13 +11,13 @@ import statistics
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from pipeline_spec import selected_rules
 from workflow_adapters import AdapterSettings
-
 
 SCHEMA_VERSION = 1
 LOW_MARGIN = 0.25
