@@ -2638,7 +2638,10 @@ def run(args: argparse.Namespace) -> int:
             [redact_text(value) for value in phase.command] for phase in prepared.phases
         ]
         phase_environment = os.environ.copy()
-        tool_dir = str(Path(prepared.seqkit).resolve().parent)
+        # Keep the spelling supplied by the environment. On macOS /var is a
+        # symlink to /private/var; realpath would make otherwise identical tool
+        # paths disagree with workflow configs and test wrappers.
+        tool_dir = str(Path(prepared.seqkit).absolute().parent)
         phase_environment["PATH"] = os.pathsep.join(
             [tool_dir, phase_environment.get("PATH", "")]
         )

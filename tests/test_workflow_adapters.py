@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 
 from pipeline_spec import ExecutionSpecError, canonical_steps, normalize_execution_spec
-from workflow_adapters import AdapterSettings, prepare_execution
+from workflow_adapters import (
+    AdapterSettings,
+    _rewrite_workflow1_config,
+    prepare_execution,
+)
 from workflow_catalog import ARTIFACTS, STAGES
 
 
@@ -191,6 +195,30 @@ class PipelineSpecTests(unittest.TestCase):
 
 
 class PipelinePreparationTests(unittest.TestCase):
+    def test_workflow1_run_local_config_uses_configured_seqkit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workflow_dir = root / "workflow"
+            config_dir = workflow_dir / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.yaml").write_text(
+                'sample_list: "data/samples.txt"\n'
+                'output_dir: "example"\n'
+                "software:\n"
+                '  seqkit: "/slow/seqkit"\n'
+                '  fastp: "/tools/fastp"\n',
+                encoding="utf-8",
+            )
+
+            rewritten = _rewrite_workflow1_config(
+                workflow_dir,
+                root / "results",
+                seqkit="/home/user/.pixi/bin/seqkit",
+            ).read_text(encoding="utf-8")
+
+            self.assertIn('  seqkit: "/home/user/.pixi/bin/seqkit"', rewritten)
+            self.assertNotIn("/slow/seqkit", rewritten)
+
     def test_prepares_one_run_local_phase_per_selected_source_workflow(self):
         settings = AdapterSettings.from_env()
         sources = [

@@ -136,11 +136,11 @@ class AdapterSettings:
             ),
             snakemake=os.getenv(
                 "BIOAGENT_SNAKEMAKE",
-                "/data/user/liufangzhou/tools/pixi/bin/snakemake",
+                "/home/liufangzhou/.pixi/bin/snakemake",
             ),
             seqkit=os.getenv(
                 "BIOAGENT_SEQKIT",
-                "/data/user/guojindan/softwares/xvirmin/bin/seqkit",
+                "/home/liufangzhou/.pixi/bin/seqkit",
             ),
             cores=int(os.getenv("BIOAGENT_SNAKEMAKE_CORES", "8")),
         )
@@ -303,7 +303,9 @@ def _prepare_workflow1_inputs(
     return list(dict.fromkeys(run_ids)), list(dict.fromkeys(sample_ids))
 
 
-def _rewrite_workflow1_config(workflow_dir: Path, results_dir: Path) -> Path:
+def _rewrite_workflow1_config(
+    workflow_dir: Path, results_dir: Path, *, seqkit: str
+) -> Path:
     config_path = workflow_dir / "config" / "config.yaml"
     lines = []
     for line in config_path.read_text(encoding="utf-8").splitlines():
@@ -311,6 +313,9 @@ def _rewrite_workflow1_config(workflow_dir: Path, results_dir: Path) -> Path:
             lines.append(f'sample_list: "{workflow_dir / "data" / "samples.txt"}"')
         elif line.startswith("output_dir:"):
             lines.append(f'output_dir: "{results_dir}"')
+        elif line.strip().startswith("seqkit:"):
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(f'{indent}seqkit: "{seqkit}"')
         else:
             lines.append(line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -416,7 +421,9 @@ def _prepare_workflow1_phase(
     results_dir.mkdir(parents=True, exist_ok=True)
     _copy_workflow(settings.workflow1_source, workflow_dir)
     run_ids, sample_ids = _prepare_workflow1_inputs(spec, workflow_dir, results_dir)
-    config_path = _rewrite_workflow1_config(workflow_dir, results_dir)
+    config_path = _rewrite_workflow1_config(
+        workflow_dir, results_dir, seqkit=settings.seqkit
+    )
     targets = _workflow1_targets(
         spec["exit_rule"],
         results_dir,

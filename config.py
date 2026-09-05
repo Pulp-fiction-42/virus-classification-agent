@@ -21,6 +21,27 @@ ANALYSIS_RUN_ROOT = Path(os.getenv("BIOAGENT_RUN_ROOT", "/data/runs")).resolve()
 ANALYSIS_DATA_ROOT = Path(
     os.getenv("BIOAGENT_DATA_ROOT", str(ANALYSIS_RUN_ROOT))
 ).resolve()
+SSH_HOST = os.getenv("BIOAGENT_SSH_HOST", "").strip()
+REMOTE_PYTHON = os.getenv(
+    "BIOAGENT_REMOTE_PYTHON",
+    "/home/liufangzhou/.pixi/envs/snakemake/bin/python",
+)
+REMOTE_CONTROL_PYTHON = os.getenv(
+    "BIOAGENT_REMOTE_CONTROL_PYTHON",
+    "/home/liufangzhou/.pixi/envs/snakemake/bin/python",
+)
+REMOTE_TMUX = os.getenv("BIOAGENT_REMOTE_TMUX", "/data/user/liufangzhou/bin/tmux")
+REMOTE_WORKER_ROOT = os.getenv(
+    "BIOAGENT_REMOTE_WORKER_ROOT", "/data/user/liufangzhou/.bioagent/worker"
+)
+REMOTE_DATA_ALLOWED_ROOTS = tuple(
+    value.strip()
+    for value in os.getenv(
+        "BIOAGENT_DATA_ALLOWED_ROOTS",
+        "/data/user/liufangzhou/datasets:/data/user/guojindan/Projects/flu_tgs_ngs/rawdata/NGS",
+    ).split(":")
+    if value.strip()
+)
 ENABLED_ANALYSIS_GOALS = tuple(
     goal.strip()
     for goal in os.getenv(

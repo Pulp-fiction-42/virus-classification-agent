@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Any
@@ -20,11 +21,21 @@ from conversation_events import (
     TextDelta,
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
-from deterministic_runtime import DeterministicRuntime
+from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
+from remote_client import (
+    RemoteConnectionError,
+    RemoteExecutionError,
+    RemoteWorkerClient,
+)
 from runtime_errors import ConversationPublicError, SessionStateError
 
 app = FastAPI()
-deterministic_runtime = DeterministicRuntime()
+remote_worker = RemoteWorkerClient()
+deterministic_runtime = (
+    RemoteDeterministicRuntime(remote_worker)
+    if remote_worker.enabled
+    else DeterministicRuntime()
+)
 planner = DeterministicPlanner(
     deterministic_runtime,
     enabled_goals=config.ENABLED_ANALYSIS_GOALS,
@@ -32,6 +43,24 @@ planner = DeterministicPlanner(
 sessions: Any | None = None
 log = logging.getLogger(__name__)
 CONVERSATION_ERROR = "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
+remote_snapshot_cache: dict[str, dict[str, Any]] = {}
+
+
+def _warm_remote_worker() -> None:
+    try:
+        remote_worker.invoke_sync("health")
+    except RemoteExecutionError:
+        log.info("Cyclone worker warm-up did not complete; it will retry on demand")
+
+
+@app.on_event("startup")
+async def warm_remote_worker():
+    if remote_worker.enabled:
+        threading.Thread(
+            target=_warm_remote_worker,
+            name="bioagent-cyclone-warmup",
+            daemon=True,
+        ).start()
 
 
 def conversation_sessions() -> Any:
@@ -64,6 +93,25 @@ class StartRunRequest(BaseModel):
     plan_id: str
     plan_revision: int
     run_id: str
+
+
+class RemoteSourcesRequest(BaseModel):
+    paths: list[str]
+
+
+class RemotePreflightRequest(BaseModel):
+    sources: list[dict[str, Any]]
+    artifacts: list[dict[str, Any]]
+    full: bool = False
+
+
+class RemoteFingerprintRequest(BaseModel):
+    sources: list[dict[str, Any]]
+
+
+class RemoteEvidenceRequest(BaseModel):
+    run_dir: str
+    telemetry: dict[str, Any]
 
 
 def completion_id() -> str:
@@ -175,6 +223,12 @@ async def list_models():
 @app.get("/v1/analysis/health")
 @app.get("/analysis/health")
 async def analysis_health():
+    remote = {"status": "local"}
+    if remote_worker.enabled:
+        try:
+            remote = {"status": "ready", **(await remote_worker.invoke("health"))}
+        except RemoteExecutionError:
+            remote = {"status": "unavailable"}
     return {
         "deterministic": {
             "status": "ready",
@@ -189,7 +243,97 @@ async def analysis_health():
             "status": "configured" if config.TAXONAGENT_MCP_URL else "unavailable",
             "provider": "taxonagent",
         },
+        "execution": remote,
     }
+
+
+def _remote_required() -> RemoteWorkerClient:
+    if not remote_worker.enabled:
+        raise HTTPException(
+            status_code=503, detail="Cyclone SSH backend is not configured"
+        )
+    return remote_worker
+
+
+async def _remote_call(operation: str, **payload: Any) -> dict[str, Any]:
+    try:
+        result = await _remote_required().invoke(operation, **payload)
+        if operation == "snapshot" and result.get("found") is True:
+            state = result.get("state") if isinstance(result.get("state"), dict) else {}
+            for key in (
+                payload.get("run_id"),
+                payload.get("run_dir"),
+                state.get("run_id"),
+                state.get("run_dir"),
+            ):
+                if isinstance(key, str) and key:
+                    remote_snapshot_cache[key] = result
+        return result
+    except RemoteConnectionError as exc:
+        if operation == "snapshot":
+            cached = remote_snapshot_cache.get(
+                str(payload.get("run_id") or payload.get("run_dir") or "")
+            )
+            if cached:
+                return {**cached, "connection_lost": True, "stale": True}
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "CYCLONE_UNAVAILABLE",
+                "message": str(exc),
+                "retryable": True,
+            },
+        ) from exc
+    except RemoteExecutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/v1/analysis/files")
+@app.get("/analysis/files")
+async def remote_analysis_files(path: str = "/", cursor: int = 0, limit: int = 100):
+    return await _remote_call("list_files", path=path, cursor=cursor, limit=limit)
+
+
+@app.post("/v1/analysis/datasets/resolve")
+@app.post("/analysis/datasets/resolve")
+async def remote_analysis_sources(req: RemoteSourcesRequest):
+    return await _remote_call("resolve_sources", paths=req.paths)
+
+
+@app.post("/v1/analysis/datasets/preflight")
+@app.post("/analysis/datasets/preflight")
+async def remote_analysis_preflight(req: RemotePreflightRequest):
+    return await _remote_call(
+        "preflight", sources=req.sources, artifacts=req.artifacts, full=req.full
+    )
+
+
+@app.post("/v1/analysis/datasets/fingerprints")
+@app.post("/analysis/datasets/fingerprints")
+async def remote_analysis_fingerprints(req: RemoteFingerprintRequest):
+    return await _remote_call("fingerprints_match", sources=req.sources)
+
+
+@app.get("/v1/analysis/runs/snapshot")
+@app.get("/analysis/runs/snapshot")
+async def remote_analysis_snapshot(
+    run_id: str | None = None, run_dir: str | None = None
+):
+    return await _remote_call("snapshot", run_id=run_id, run_dir=run_dir)
+
+
+@app.get("/v1/analysis/resources")
+@app.get("/analysis/resources")
+async def remote_analysis_resources():
+    return await _remote_call("resources")
+
+
+@app.post("/v1/analysis/evidence/verify")
+@app.post("/analysis/evidence/verify")
+async def remote_analysis_evidence(req: RemoteEvidenceRequest):
+    return await _remote_call(
+        "verify_evidence", run_dir=req.run_dir, telemetry=req.telemetry
+    )
 
 
 @app.post("/v1/analysis/plans/compile")
@@ -216,6 +360,17 @@ async def start_analysis_run(req: StartRunRequest):
             plan_revision=req.plan_revision,
             run_id=req.run_id,
         )
+    except RemoteConnectionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "CYCLONE_UNAVAILABLE",
+                "message": str(exc),
+                "retryable": True,
+            },
+        ) from exc
+    except RemoteExecutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except PlannerError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SessionStateError as exc:
@@ -323,5 +478,6 @@ async def chat(req: ChatRequest, request: Request):
 
 @app.on_event("shutdown")
 async def shutdown_sessions():
+    remote_worker.close()
     if sessions is not None:
         await sessions.close_all()

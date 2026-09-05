@@ -6,9 +6,11 @@ import hashlib
 import json
 import math
 import os
+import resource
 import sqlite3
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -45,7 +47,11 @@ def _load_bucket(count: int | None) -> str:
 
 def count_active_runners(*, exclude_pid: int | None = None) -> int:
     count = 0
-    for entry in Path("/proc").iterdir():
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
         if not entry.name.isdigit() or int(entry.name) == exclude_pid:
             continue
         try:
@@ -82,7 +88,15 @@ def process_tree_rss_mb(root_pid: int | None) -> float:
     if not root_pid:
         return 0.0
     processes: dict[int, tuple[int, int]] = {}
-    for entry in Path("/proc").iterdir():
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        if root_pid == os.getpid():
+            maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+            return maximum / divisor
+        return 0.0
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         try:
@@ -255,7 +269,9 @@ def _run_config_paths(state: dict[str, Any]) -> list[tuple[str, Path]]:
         for phase_dir in sorted((run_dir / "workflows").iterdir()):
             path = phase_dir / "config" / "config.yaml"
             if path.is_file():
-                paths.append((workflow_by_phase.get(phase_dir.name, phase_dir.name), path))
+                paths.append(
+                    (workflow_by_phase.get(phase_dir.name, phase_dir.name), path)
+                )
         return paths
     path = run_dir / "workflow" / "config" / "config.yaml"
     if path.is_file():
@@ -783,9 +799,7 @@ class ResourceCalibrator:
         if isinstance(spec, dict):
             try:
                 workflow_signature, rules = _workflow_signature(spec)
-                input_type = "+".join(
-                    item["type"] for item in spec.get("inputs") or []
-                )
+                input_type = "+".join(item["type"] for item in spec.get("inputs") or [])
                 viral_type = (spec.get("options") or {}).get("viral_type") or ""
                 sample_count = len(_input_records(spec))
                 database_signature, database_versions = _database_profile(

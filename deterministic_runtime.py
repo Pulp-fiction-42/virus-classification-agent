@@ -18,6 +18,7 @@ from pipeline_spec import (
     normalize_execution_spec,
     validate_plan_rules,
 )
+from remote_client import RemoteResourceCalibrator, RemoteWorkerClient
 from resource_calibration import ResourceCalibrator
 from runtime_errors import SessionStateError
 
@@ -40,7 +41,9 @@ class DeterministicRuntime:
         self.analysis_run_root = analysis_run_root.resolve()
         self.analysis_data_root = analysis_data_root.resolve()
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        self.resource_history_path = self.config_dir / "bioagent" / "resource-history.sqlite3"
+        self.resource_history_path = (
+            self.config_dir / "bioagent" / "resource-history.sqlite3"
+        )
         self.resource_history_path.parent.mkdir(parents=True, exist_ok=True)
         self.resource_calibrator = resource_calibrator or ResourceCalibrator(
             self.resource_history_path,
@@ -84,7 +87,9 @@ class DeterministicRuntime:
 
             state = self._write_initial_run_state(plan, normalized_chat_id)
             try:
-                self.runner_launcher(state_path, state_path.parent / "runner-process.log")
+                self.runner_launcher(
+                    state_path, state_path.parent / "runner-process.log"
+                )
             except Exception as exc:
                 state["execution"].update(
                     {
@@ -92,16 +97,22 @@ class DeterministicRuntime:
                         "ok": False,
                         "returncode": -1,
                         "error": f"无法启动分析进程：{exc}",
-                        "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "finished_at": datetime.now()
+                        .astimezone()
+                        .isoformat(timespec="seconds"),
                     }
                 )
-                state["technical_report"].update({"status": "unavailable", "available": False})
+                state["technical_report"].update(
+                    {"status": "unavailable", "available": False}
+                )
                 state["report"].update({"status": "unavailable", "available": False})
                 self._write_json_atomic(state_path, state)
                 raise SessionStateError(f"分析任务启动失败：{exc}") from exc
             return self._analysis_run_item(plan, "running")
 
-    def _write_initial_run_state(self, plan: dict[str, Any], chat_id: str) -> dict[str, Any]:
+    def _write_initial_run_state(
+        self, plan: dict[str, Any], chat_id: str
+    ) -> dict[str, Any]:
         run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
         run_dir = Path(str(run.get("run_dir", ""))).resolve()
         if not self._is_under_analysis_root(run_dir):
@@ -111,7 +122,9 @@ class DeterministicRuntime:
             raise SessionStateError("分析状态路径与运行目录不匹配。")
         if state_path.exists():
             raise SessionStateError("当前分析方案已经启动。")
-        log_path = Path(str(run.get("log_path", run_dir / ".bioagent" / "execution.log"))).resolve()
+        log_path = Path(
+            str(run.get("log_path", run_dir / ".bioagent" / "execution.log"))
+        ).resolve()
         if not self._is_under_analysis_root(log_path):
             raise SessionStateError("分析日志不在 BIOAGENT_RUN_ROOT 内。")
 
@@ -137,7 +150,18 @@ class DeterministicRuntime:
             "execution_spec": execution_spec,
             "steps": [
                 {
-                    **{key: step[key] for key in ("id", "label", "tool", "rules", "depends_on", "produces") if key in step},
+                    **{
+                        key: step[key]
+                        for key in (
+                            "id",
+                            "label",
+                            "tool",
+                            "rules",
+                            "depends_on",
+                            "produces",
+                        )
+                        if key in step
+                    },
                     "is_deliverable": step.get("is_deliverable") is True,
                     "status": "pending",
                 }
@@ -145,7 +169,11 @@ class DeterministicRuntime:
                 if isinstance(step, dict) and step.get("id") and step.get("label")
             ],
             "resource_estimate": plan.get("resource_estimate"),
-            **({"routing": plan["routing"]} if isinstance(plan.get("routing"), dict) else {}),
+            **(
+                {"routing": plan["routing"]}
+                if isinstance(plan.get("routing"), dict)
+                else {}
+            ),
             "resource_history_db": str(self.resource_history_path),
             "execution": {
                 "started": True,
@@ -176,7 +204,9 @@ class DeterministicRuntime:
             (bioagent_dir / "agent-trace.jsonl").touch(exist_ok=True)
             self._write_json_atomic(state_path, state)
         except OSError as exc:
-            raise SessionStateError("无法创建分析运行目录，请检查 BIOAGENT_RUN_ROOT 写权限。") from exc
+            raise SessionStateError(
+                "无法创建分析运行目录，请检查 BIOAGENT_RUN_ROOT 写权限。"
+            ) from exc
         return state
 
     def _validate_execution_dataset(self, plan: dict[str, Any], current: Any) -> None:
@@ -195,11 +225,15 @@ class DeterministicRuntime:
         for artifact in current.get("artifacts", []):
             for record in artifact.get("records", []):
                 for value in (record.get("files") or {}).values():
-                    if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+                    if not isinstance(value, dict) or not isinstance(
+                        value.get("path"), str
+                    ):
                         raise SessionStateError("数据集缺少有效文件指纹。")
                     path = Path(value["path"]).resolve()
                     if not self._is_under_data_root(path):
-                        raise SessionStateError("数据集文件不在 BIOAGENT_DATA_ROOT 内。")
+                        raise SessionStateError(
+                            "数据集文件不在 BIOAGENT_DATA_ROOT 内。"
+                        )
                     try:
                         stat = path.stat()
                     except OSError as exc:
@@ -216,7 +250,12 @@ class DeterministicRuntime:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab") as runner_log:
             process = subprocess.Popen(
-                [sys.executable, str(self.project_root / "analysis_runner.py"), "--state", str(state_path)],
+                [
+                    sys.executable,
+                    str(self.project_root / "analysis_runner.py"),
+                    "--state",
+                    str(state_path),
+                ],
                 cwd=self.project_root,
                 stdin=subprocess.DEVNULL,
                 stdout=runner_log,
@@ -224,7 +263,9 @@ class DeterministicRuntime:
                 start_new_session=True,
                 close_fds=True,
             )
-        threading.Thread(target=process.wait, name=f"bioagent-runner-{process.pid}", daemon=True).start()
+        threading.Thread(
+            target=process.wait, name=f"bioagent-runner-{process.pid}", daemon=True
+        ).start()
         return process.pid
 
     @staticmethod
@@ -262,12 +303,40 @@ class DeterministicRuntime:
             "type": "analysis_run",
             "id": f"analysis_run_{run.get('run_id')}",
             "status": status,
-            "run": {key: run.get(key) for key in ("run_id", "run_dir", "state_path", "log_path")},
+            "run": {
+                key: run.get(key)
+                for key in ("run_id", "run_dir", "state_path", "log_path")
+            },
         }
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(f"{path.suffix}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
         temporary.replace(path)
+
+
+class RemoteDeterministicRuntime:
+    """Deterministic runtime whose files and runner live on Cyclone."""
+
+    def __init__(self, client: RemoteWorkerClient | None = None) -> None:
+        self.remote = client or RemoteWorkerClient()
+        self.analysis_run_root = config.ANALYSIS_RUN_ROOT
+        self.analysis_data_root = config.ANALYSIS_DATA_ROOT
+        self.resource_calibrator = RemoteResourceCalibrator(self.remote)
+
+    async def launch_deterministic_plan(
+        self, plan: dict[str, Any], chat_id: str
+    ) -> dict[str, Any]:
+        normalized_chat_id = DeterministicRuntime._validate_chat_id(chat_id)
+        run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
+        return await self.remote.invoke(
+            "launch",
+            plan=plan,
+            dataset=plan.get("dataset"),
+            chat_id=normalized_chat_id,
+            run_id=run.get("run_id"),
+        )
