@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "suite_id": "m1-development-v1",
+  "split": "development",
+  "biological_ground_truth": false,
+  "bundle_sha256": "43a2e26300d2cdd0e801669bc6d2ed9df1ce6d9380d0507702565bde2593da9e",
+  "asset_sha256": {
+    "knowledge.json": "3c5a2551ae4f55c3cff98c3b38f89707873a01ecb9919212fa4122d999691d67",
+    "releases.json": "51d1065895d5662236acdc0b942609ece99c6b89eae7923864a54c47e07a0c26",
+    "rules.json": "1e5eb5fdb7f24807c75bc8fbe41cfd69ea3ff47b426b4ab9d8d9961b2c5faff9"
+  },
+  "cases": [
+    {
+      "id": "intent_clarification-1",
+      "task_kind": "intent_clarification",
+      "prompt": "请解释 BioAgent 可以完成哪些分析。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "respond"
+    },
+    {
+      "id": "intent_clarification-2",
+      "task_kind": "intent_clarification",
+      "prompt": "我想调整病毒类型，但还没决定选 RNA、DNA 还是两者，请先问我。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "clarify"
+    },
+    {
+      "id": "intent_clarification-3",
+      "task_kind": "intent_clarification",
+      "prompt": "我只想做质控，不要组装。请解释当前是否支持，不要替我扩大分析范围。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "respond"
+    },
+    {
+      "id": "intent_clarification-4",
+      "task_kind": "intent_clarification",
+      "prompt": "我还没决定要分析宿主还是病毒，请先让我明确目标。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "clarify"
+    },
+    {
+      "id": "controlled_patch-1",
+      "task_kind": "controlled_patch",
+      "prompt": "请把病毒类型改成 RNA，其他保持不变。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "propose_patch",
+      "expected_patch": {
+        "viral_type": "RNA"
+      }
+    },
+    {
+      "id": "controlled_patch-2",
+      "task_kind": "controlled_patch",
+      "prompt": "请把分析目标改成病毒鉴定，其他保持不变。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "propose_patch",
+      "expected_patch": {
+        "goals": ["virus_summary"]
+      }
+    },
+    {
+      "id": "controlled_patch-3",
+      "task_kind": "controlled_patch",
+      "prompt": "请把分析目标改成宿主鉴定，其他保持不变。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "propose_patch",
+      "expected_patch": {
+        "goals": ["host_summary"]
+      }
+    },
+    {
+      "id": "controlled_patch-4",
+      "task_kind": "controlled_patch",
+      "prompt": "请把病毒类型改成 DNA，分析目标改成病毒鉴定。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "expected_action": "propose_patch",
+      "expected_patch": {
+        "goals": ["virus_summary"],
+        "viral_type": "DNA"
+      }
+    },
+    {
+      "id": "citation_qa-1",
+      "task_kind": "citation_qa",
+      "prompt": "根据资料说明配对 reads 计数需要注意什么，注明待审核和出处。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "query": "Kraken paired fragments 配对"
+    },
+    {
+      "id": "citation_qa-2",
+      "task_kind": "citation_qa",
+      "prompt": "根据资料解释初筛比例的分母，注明待审核和出处。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "query": "分母 sample_fraction sampled_pairs"
+    },
+    {
+      "id": "citation_qa-3",
+      "task_kind": "citation_qa",
+      "prompt": "根据资料说明 fastp 方法的用途，注明待审核和出处。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "query": "fastp quality"
+    },
+    {
+      "id": "citation_qa-4",
+      "task_kind": "citation_qa",
+      "prompt": "本次没有相关材料，请明确说明知识不足，不要补造引用。",
+      "review_status": "pending",
+      "source_kind": "synthetic_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "query": "zzzz_unmatched_m1_query"
+    },
+    {
+      "id": "evidence_explanation-1",
+      "task_kind": "evidence_explanation",
+      "prompt": "解释抽样初筛候选计数及其限制，不提升为确定分类。",
+      "review_status": "pending",
+      "source_kind": "real_observation_with_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "variant": "original"
+    },
+    {
+      "id": "evidence_explanation-2",
+      "task_kind": "evidence_explanation",
+      "prompt": "解释候选比例的分母差异，并保留全部规则限制。",
+      "review_status": "pending",
+      "source_kind": "real_observation_with_engineering_prompt",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "variant": "original"
+    },
+    {
+      "id": "evidence_explanation-3",
+      "task_kind": "evidence_explanation",
+      "prompt": "这是人为移除一个观测值的工程异常样例，请保留缺失提示。",
+      "review_status": "pending",
+      "source_kind": "synthetic_mutation_of_real_observation",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "variant": "missing"
+    },
+    {
+      "id": "evidence_explanation-4",
+      "task_kind": "evidence_explanation",
+      "prompt": "这是人为把比例改为越界值的工程异常样例，请保留冲突提示。",
+      "review_status": "pending",
+      "source_kind": "synthetic_mutation_of_real_observation",
+      "source": "Existing ConversationAction contract and frozen M0 development package",
+      "variant": "conflict"
+    }
+  ]
+}
