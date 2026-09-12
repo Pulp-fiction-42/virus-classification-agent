@@ -159,12 +159,18 @@ class Citation(BaseModel):
     retrieved_at: str
     score: float | None = None
     quality: CitationQuality = "unverified"
+    snapshot_id: str | None = None
+    source_sha256: str | None = None
+    review_status: Literal["pending", "approved"] = "pending"
+    review_record: str | None = None
 
 
 class RetrievalResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str
+    corpora: list[Corpus] = Field(default_factory=list)
+    snapshot_id: str | None = None
     passages: list[Citation] = Field(default_factory=list)
     insufficient: bool = False
     error_code: Literal["KNOWLEDGE_INSUFFICIENT", "RETRIEVAL_UNAVAILABLE"] | None = None
@@ -175,6 +181,8 @@ class RetrievalRequest:
     query: str
     corpora: tuple[Corpus, ...]
     limit: int = 8
+    taxid: str | None = None
+    include_unreviewed: bool = False
 
 
 class RetrievalAdapter:

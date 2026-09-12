@@ -1,0 +1,64 @@
+{
+  "release_id": "m0-screening-rules-v1",
+  "review_status": "pending",
+  "review_record": null,
+  "scope": "engineering_checks_only",
+  "rules": [
+    {
+      "rule_id": "SCREENING_ONLY",
+      "severity": "limitation",
+      "message": "仅为抽样初筛分类信号；工程路由门槛不代表确定分类或临床诊断。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "CORRELATED_EVIDENCE",
+      "severity": "limitation",
+      "message": "候选计数及多个比例来自同一批分类输入，不是相互独立的支持证据。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "REVIEW_PENDING",
+      "severity": "limitation",
+      "message": "资料、规则与生成说明待审核；引用可定位不代表语义适用性已确认。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "CONTROLS_MISSING",
+      "severity": "missing",
+      "message": "当前结果包未提供对照，不能据此排除污染或评估病原关联。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "REFERENCE_UNKNOWN",
+      "severity": "limitation",
+      "message": "参考库历史版本与完整性未确认；目录名称不能证明数据库版本。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "KNOWLEDGE_INSUFFICIENT",
+      "severity": "missing",
+      "message": "没有可用且符合审核范围的知识片段，未生成研判。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "EVIDENCE_MISSING",
+      "severity": "missing",
+      "message": "存在未提供的观测；缺失值不能按零处理。",
+      "kind": "engineering",
+      "review_status": "pending"
+    },
+    {
+      "rule_id": "COUNT_CONFLICT",
+      "severity": "conflict",
+      "message": "比例、单位或分母存在冲突，须保留冲突并复核原始证据。",
+      "kind": "engineering",
+      "review_status": "pending"
+    }
+  ]
+}

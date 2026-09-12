@@ -9,10 +9,6 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
-
 import config
 from conversation_events import (
     InvalidSessionError,
@@ -22,6 +18,9 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -236,12 +235,14 @@ async def analysis_health():
         },
         "conversation_model": {
             "id": "BioAgent",
-            "status": "ready" if config.MINIMAX_API_KEY else "unavailable",
+            "status": "ready" if config.MODEL_POLICY == "minimax_explicit" and config.MINIMAX_API_KEY else "unavailable",
             "provider": config.MODEL,
+            "policy": config.MODEL_POLICY,
         },
         "knowledge": {
-            "status": "configured" if config.TAXONAGENT_MCP_URL else "unavailable",
-            "provider": "taxonagent",
+            "status": "unavailable",
+            "provider": "none",
+            "development_replay": "sqlite_fts5",
         },
         "execution": remote,
     }

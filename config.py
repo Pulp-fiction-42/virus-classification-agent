@@ -5,15 +5,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODEL = "MiniMax-M3"
+MODEL_POLICY = os.getenv("BIOAGENT_MODEL_POLICY", "local_only")
+if MODEL_POLICY not in {"local_only", "minimax_explicit"}:
+    raise ValueError("BIOAGENT_MODEL_POLICY must be local_only or minimax_explicit")
 ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic"
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 CLAUDE_STATE_DIR = PROJECT_ROOT / ".claude" / "sessions"
-CLAUDE_RUNTIME_CONFIG_DIR = Path(
-    os.getenv(
-        "CLAUDE_RUNTIME_CONFIG_DIR", f"/tmp/bioagent-claude-runtime-{os.getuid()}"
-    )
-)
-SESSION_IDLE_TIMEOUT_SECONDS = 30 * 60
 CONVERSATION_TIMEOUT_SECONDS = float(
     os.getenv("BIOAGENT_CONVERSATION_TIMEOUT_SECONDS", "180")
 )
@@ -76,8 +73,8 @@ and viral_type. Put the complete user-visible answer in message and use an empty
 until a retrieval result is supplied. If structured output is unavailable, use the exact
 conversation_action fenced JSON fallback requested in the user prompt.
 
-When the user asks about ICTV virus taxonomy, demarcation criteria, classification rules, marker genes,
-genome type, or a specific virus family, use ictv_family_info from the taxonagent MCP server.
+Knowledge retrieval and citation verification belong to the host. Never call tools or claim
+that unreviewed knowledge is approved. Do not invent taxonomy criteria or sources.
 """
 
 TAXONAGENT_MCP_URL = os.getenv("TAXONAGENT_MCP_URL", "http://172.24.202.246:8765/mcp")

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "releases": [
+    {
+      "asset_id": "m0-screening-knowledge",
+      "asset_type": "knowledge",
+      "version": "1",
+      "source": "BioAgent M0 development package",
+      "license": "unknown; development only",
+      "review_status": "pending",
+      "files": {
+        "knowledge.json": "3c5a2551ae4f55c3cff98c3b38f89707873a01ecb9919212fa4122d999691d67"
+      },
+      "compatible_with": ["candidate-evidence-v1"]
+    },
+    {
+      "asset_id": "m0-screening-rules",
+      "asset_type": "rules",
+      "version": "1",
+      "source": "BioAgent M0 development package",
+      "license": "unknown; development only",
+      "review_status": "pending",
+      "files": {
+        "rules.json": "1e5eb5fdb7f24807c75bc8fbe41cfd69ea3ff47b426b4ab9d8d9961b2c5faff9"
+      },
+      "compatible_with": ["candidate-evidence-v1"]
+    }
+  ]
+}

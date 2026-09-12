@@ -10,12 +10,12 @@ adapter.py
   | protocol conversion
   v
 SessionManager (runtime.py)
-  | ClaudeAgentOptions(resume=<claude_session_id>)
+  | bounded ProviderRequest / strict action validation
   v
-Claude Agent SDK client.query(prompt)
-  | only TaxonAgent MCP; structured conversation_action output
+MiniMaxProvider (provider.py)
+  | one SDK query, structured output, no business tools
   v
-MiniMax Anthropic-compatible API
+MiniMax Anthropic-compatible API (explicit opt-in)
 ```
 
 ## 模块职责
@@ -28,21 +28,14 @@ MiniMax Anthropic-compatible API
 - 将 SDK 文本增量转换为 OpenAI SSE，或生成非流式 completion。
 - 不保存数据库会话，不访问 Open WebUI 存储。
 
-### `runtime.py`
+### `runtime.py` 与 `provider.py`
 
-- `SessionManager` 通过 chat-map 保存 Open WebUI chat ID 对应的 Claude session ID。
-- 为每个 chat ID 创建并复用一个常驻 `ClaudeSDKClient`。
-- 用每个 session 自己的 `asyncio.Lock` 串行同一聊天的请求。
-- 新 session 固定使用 `dontAsk`，不加载 Claude Code preset、project Skills、文件工具或额外目录，只保留 TaxonAgent MCP。
-- 对话输出经过 `ConversationAction` schema 验证；模型只能回答、追问或提出 goals/viral_type patch，不能直接修改方案或启动分析。
-- `DeterministicRuntime` 独立拥有资源估算与 runner admission；`DeterministicPlanner` 复用 catalog/compiler，执行前重编并把 backend plan reference 写入 state。
-- 成功 run 由固定 runner 写入版本化交付指标与报告可用状态；runtime 不发送报告 output item，Open WebUI 从 run 状态提供下载入口，后端按需确定性渲染分析报告，不接收模型生成的 HTML。
-- 方案中的资源数字不由模型生成。runtime 根据已验证的 execution spec、输入序列规模与 SQLite 历史索引生成 P50/P90、峰值内存、安全余量和置信度。
-- 首次建立 SDK context 时兼容性引导 Open WebUI 已有历史；已有 transcript 或已引导后只发送最新用户消息。
-- SDK 不设置 thinking budget；执行稽核以 Open WebUI 保存的 deterministic decision events 为准。
-- 校验 transcript、SDK 执行结果和返回的 session ID。
-
-`SessionManager` 持有内存 client registry 和文件式 chat-map，但不访问 `webui.db`。
+- `runtime.py` 构造受控历史与确定性业务摘要，验证 `ConversationAction`，发送现有文本、trace 与 proposal 事件；规划和执行仍由确定性模块拥有。
+- `provider.py` 接收四类结构化任务、schema 与预算，统一返回模型身份、耗时、结构化输出或错误；默认禁用云端，不持有 MCP、文件或计算工具。
+- MiniMax 适配器每次调用关闭 SDK 连接，将 session／resume 映射及 transcript 保存在 `.claude/sessions/providers/minimax-m0`。累计上下文超过预算时使用宿主提供的有限历史开启新 SDK session，旧 transcript 保留作审计。
+- SDK 限制单轮生成；若它在提交 `StructuredOutput` 后报告轮次上限，只接受完整且通过 schema 校验的该载荷，不追加确认或修复调用。
+- 模型不能启动计算、改写证据或批准资料。普通聊天暂不加载 M0 待审核知识包，项目授权检索留到 B2。
+- `evidence_replay.py`、`knowledge.py`、`evidence_contract.py` 提供供应方无关的候选、资产、规则与引用模块。根仓库 CLI 连接这些模块与后端纯报告函数，不读取业务数据库。
 
 ### `config.py`
 
@@ -68,13 +61,13 @@ MiniMax Anthropic-compatible API
 Claude SDK 将 transcript 写入：
 
 ```text
-/data/bioagent/agent/.claude/sessions/projects/-data-bioagent-agent/<claude_session_id>.jsonl
+agent/.claude/sessions/providers/minimax-m0/sdk/projects/<project>/<sdk_session_id>.jsonl
 ```
 
-Open WebUI 继续独立保存 UI 消息和账号数据。runtime 保存 chat UUID 到 Claude session ID 的映射及版本化 Agent 审计 JSONL，不读取或修改 Open WebUI 数据库。
+Open WebUI 继续独立保存 UI 消息和账号数据。MiniMax provider 保存 chat UUID 到内部 SDK session ID 的映射，不读取或修改 Open WebUI 数据库；公共结果不包含 SDK session ID。
 
 资源校准记录保存在 `.claude/sessions/bioagent/resource-history.sqlite3`。agent 启动时按 telemetry mtime 增量补漏，规划时只查询索引；输入统计按文件身份缓存且不保存原始路径。
 
 ## 并发与进程
 
-当前部署使用单个 uvicorn worker。多个 worker 会各自持有不同的内存 client registry，不适合作为第一版部署方式。同一聊天内部已通过 session lock 串行写入 SDK stream。
+当前部署使用单个 uvicorn worker。同一聊天通过 provider 内的锁串行生成；不同进程的锁不共享，暂不支持多个 worker 同时写入相同的会话映射。
