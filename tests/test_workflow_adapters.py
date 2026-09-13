@@ -6,6 +6,7 @@ from pathlib import Path
 from pipeline_spec import ExecutionSpecError, canonical_steps, normalize_execution_spec
 from workflow_adapters import (
     AdapterSettings,
+    _prepare_workflow1_inputs,
     _rewrite_workflow1_config,
     prepare_execution,
 )
@@ -195,6 +196,37 @@ class PipelineSpecTests(unittest.TestCase):
 
 
 class PipelinePreparationTests(unittest.TestCase):
+    def test_technical_replicates_keep_run_identity_and_share_sample(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            records = []
+            for run in ("run-a", "run-b"):
+                reads = {}
+                for role in ("read1", "read2"):
+                    path = root / f"{run}-{role}"
+                    path.write_text("synthetic\n")
+                    reads[role] = str(path)
+                records.append({"run_id": run, "sample_id": "sample-a", **reads})
+            runs, samples = _prepare_workflow1_inputs(
+                {"entry_rule": "fastp", "records": records},
+                root / "workflow",
+                root / "results",
+            )
+            self.assertEqual(runs, ["run-a", "run-b"])
+            self.assertEqual(samples, ["sample-a"])
+            rows = (root / "workflow/data/samples.txt").read_text().splitlines()
+            self.assertEqual(
+                [row.split()[:2] for row in rows],
+                [["run-a", "sample-a"], ["run-b", "sample-a"]],
+            )
+            self.assertEqual(
+                [row.split()[2:] for row in rows],
+                [
+                    [str(Path(r["read1"]).resolve()), str(Path(r["read2"]).resolve())]
+                    for r in records
+                ],
+            )
+
     def test_workflow1_run_local_config_uses_configured_seqkit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
