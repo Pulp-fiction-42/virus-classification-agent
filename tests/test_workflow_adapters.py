@@ -176,13 +176,15 @@ class PipelineSpecTests(unittest.TestCase):
 
         auto = normalize_execution_spec(pipeline([reads], ["read_qc"], mode="auto"))
         self.assertTrue(auto["policy"]["adaptive"])
-        self.assertEqual(auto["policy"]["short_circuit_scope"], "pipeline")
+        self.assertEqual(auto["policy"]["routing_policy_version"], 2)
+        self.assertEqual(auto["policy"]["completion_behavior"], "screen_then_full")
         self.assertEqual(canonical_steps(auto)[0]["id"], "adaptive_screen")
 
         emergency = normalize_execution_spec(
             pipeline([reads], ["read_qc"], mode="emergency")
         )
         self.assertEqual(emergency["policy"]["effective_mode"], "emergency")
+        self.assertEqual(emergency["policy"]["completion_behavior"], "screen_only")
         self.assertNotIn("deadline_seconds", emergency["policy"])
 
         fallback = normalize_execution_spec(
@@ -193,6 +195,7 @@ class PipelineSpecTests(unittest.TestCase):
             fallback["policy"]["applicability_reason"],
             "paired_reads_unavailable",
         )
+        self.assertEqual(fallback["policy"]["completion_behavior"], "full_only")
 
 
 class PipelinePreparationTests(unittest.TestCase):

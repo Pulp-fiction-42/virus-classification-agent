@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -1836,6 +1837,8 @@ def _attach_report_evidence(
     state: dict[str, Any],
     run_dir: Path,
     telemetry: dict[str, Any] | None = None,
+    telemetry_source: str = ".bioagent/telemetry.json",
+    use_special_sources: bool = True,
 ) -> dict[str, Any]:
     delivery["schema_version"] = 4
     evidence = []
@@ -1869,9 +1872,14 @@ def _attach_report_evidence(
                     ],
                 }
         if "derivation" not in record:
-            record["source"] = _special_evidence_source(pointer, delivery, run_dir) or {
+            special_source = (
+                _special_evidence_source(pointer, delivery, run_dir)
+                if use_special_sources
+                else None
+            )
+            record["source"] = special_source or {
                 "type": "json",
-                "path": ".bioagent/telemetry.json",
+                "path": telemetry_source,
                 "pointer": f"/delivery_report{pointer}",
             }
         evidence.append(record)
@@ -1892,7 +1900,7 @@ def _attach_report_evidence(
                     "telemetry_pointer": pointer,
                     "source": {
                         "type": "json",
-                        "path": ".bioagent/telemetry.json",
+                        "path": telemetry_source,
                         "pointer": pointer,
                     },
                 }
@@ -2246,7 +2254,6 @@ def _terminal_adaptive_state(
     status: str,
     returncode: int,
     error: str | None = None,
-    report_available: bool = False,
 ) -> int:
     finished_at = _now()
     state["execution"].update(
@@ -2266,9 +2273,10 @@ def _terminal_adaptive_state(
         "telemetry": str(state_path.parent / "telemetry.json"),
         "telemetry_version": 3,
     }
-    state["report"] = {
-        "status": "ready" if report_available else "unavailable",
-        "available": report_available,
+    reports = state.setdefault("reports", {})
+    reports["final"] = {
+        "status": "unavailable",
+        "available": False,
         "schema_version": 4,
         "telemetry": str(state_path.parent / "telemetry.json"),
     }
@@ -2283,6 +2291,60 @@ def _terminal_adaptive_state(
     _write_json_atomic(state_path.parent / "telemetry.json", telemetry)
     _write_json_atomic(state_path, state)
     return returncode
+
+
+def _publish_preliminary_report(
+    state_path: Path,
+    state: dict[str, Any],
+    telemetry: dict[str, Any],
+    routing: dict[str, Any],
+    screening: dict[str, Any],
+) -> dict[str, Any]:
+    path = state_path.parent / "preliminary-telemetry.json"
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        delivery = existing.get("delivery_report") or {}
+        if (
+            existing.get("run_id") != state.get("run_id")
+            or delivery.get("report_kind")
+            not in {"preliminary_screen", "preliminary_alert"}
+        ):
+            raise ValueError("existing preliminary report does not match this run")
+        preliminary = existing
+    else:
+        generated_at = _now()
+        preliminary = {
+            **telemetry,
+            "generated_at": generated_at,
+            "routing": routing,
+        }
+        preliminary["delivery_report"] = _attach_report_evidence(
+            {
+                "schema_version": 4,
+                "kind": "analysis_pipeline",
+                "report_kind": routing["decision"]["report_kind"],
+                "generated_at": generated_at,
+                "routing": routing,
+                "screening": screening,
+            },
+            state,
+            Path(state["run_dir"]),
+            preliminary,
+            telemetry_source=".bioagent/preliminary-telemetry.json",
+            use_special_sources=False,
+        )
+        _write_json_atomic(path, preliminary)
+    report_kind = preliminary["delivery_report"]["report_kind"]
+    state.setdefault("reports", {})["preliminary"] = {
+        "status": "ready",
+        "available": True,
+        "schema_version": 4,
+        "report_kind": report_kind,
+        "telemetry": str(path),
+        "generated_at": preliminary.get("generated_at"),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    return preliminary
 
 
 def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
@@ -2308,11 +2370,12 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     history = calibrator.history_summary(full_spec)
     started_at = _now()
     routing_record: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "run_id": state.get("run_id"),
         "requested_mode": policy["requested_mode"],
         "effective_mode": policy["effective_mode"],
-        "short_circuit_scope": "pipeline",
+        "routing_policy_version": policy["routing_policy_version"],
+        "completion_behavior": policy["completion_behavior"],
         "applicability_reason": policy["applicability_reason"],
         "request": routing_request,
         "phase": "screening_admission",
@@ -2396,12 +2459,8 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     routing_record["screening"] = screening
     _set_step_status(state, "adaptive_screen", "completed")
     _set_step_status(state, "adaptive_route", "running")
-    decision = decide_route(
-        routing_request,
-        screening,
-        history=history,
-    )
-    if decision["selected_route"] == "B":
+    decision = decide_route(routing_request, screening, history=history)
+    if policy["completion_behavior"] == "screen_then_full":
         estimate = state.get("resource_estimate") or {}
         calibrated_requirement = estimate.get("status") == "calibrated"
         full_resources = collect_resource_snapshot(
@@ -2434,6 +2493,15 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     _write_json_atomic(routing_path, routing_record)
     _write_json_atomic(state_path, state)
 
+    _publish_preliminary_report(
+        state_path,
+        state,
+        telemetry,
+        routing_record,
+        screening,
+    )
+    _write_json_atomic(state_path, state)
+
     if decision["phase"] == "blocked":
         for step in state.get("steps", []):
             if step.get("status") == "pending":
@@ -2441,18 +2509,9 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         _finish_routing_record(routing_record, phase="blocked", success=False)
         state["routing"] = routing_record
         telemetry["routing"] = routing_record
-        telemetry["delivery_report"] = _attach_report_evidence(
-            {
-                "schema_version": 4,
-                "kind": "analysis_pipeline",
-                "report_kind": "preliminary_screen",
-                "routing": routing_record,
-                "screening": screening,
-            },
-            state,
-            run_dir,
-            telemetry,
-        )
+        telemetry["delivery_report"] = json.loads(
+            (bioagent_dir / "preliminary-telemetry.json").read_text(encoding="utf-8")
+        )["delivery_report"]
         _write_json_atomic(routing_path, routing_record)
         return _terminal_adaptive_state(
             state_path,
@@ -2461,28 +2520,18 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
             status="blocked",
             returncode=2,
             error="完整分析资源不足",
-            report_available=True,
         )
 
-    if decision["selected_route"] == "A":
+    if policy["completion_behavior"] == "screen_only":
         for step in state.get("steps", []):
             if step.get("status") == "pending":
                 step["status"] = "skipped"
         _finish_routing_record(routing_record, phase="completed", success=True)
         state["routing"] = routing_record
         telemetry["routing"] = routing_record
-        telemetry["delivery_report"] = _attach_report_evidence(
-            {
-                "schema_version": 4,
-                "kind": "analysis_pipeline",
-                "report_kind": decision["report_kind"],
-                "routing": routing_record,
-                "screening": screening,
-            },
-            state,
-            run_dir,
-            telemetry,
-        )
+        telemetry["delivery_report"] = json.loads(
+            (bioagent_dir / "preliminary-telemetry.json").read_text(encoding="utf-8")
+        )["delivery_report"]
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
             f"Adaptive route A completed: {decision['report_kind']}\n",
@@ -2495,7 +2544,6 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
             telemetry,
             status="completed",
             returncode=0,
-            report_available=True,
         )
 
     state["adaptive_execution_spec"] = spec
@@ -2523,7 +2571,18 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     final_state["routing"] = routing_record
     final_telemetry["routing"] = routing_record
     if isinstance(final_telemetry.get("delivery_report"), dict):
-        final_telemetry["delivery_report"]["routing"] = routing_record
+        report_data = {
+            key: value
+            for key, value in final_telemetry["delivery_report"].items()
+            if key not in {"evidence", "conclusions"}
+        }
+        report_data["routing"] = routing_record
+        final_telemetry["delivery_report"] = _attach_report_evidence(
+            report_data,
+            final_state,
+            run_dir,
+            final_telemetry,
+        )
     _write_json_atomic(routing_path, routing_record)
     _write_json_atomic(state_path, final_state)
     _write_json_atomic(telemetry_path, final_telemetry)
@@ -2957,14 +3016,17 @@ def run(args: argparse.Namespace) -> int:
             "telemetry": str(telemetry_path),
             "telemetry_version": 3,
         }
-        state["report"] = {
+        state.setdefault("reports", {})["final"] = {
             "status": "ready" if returncode == 0 else "unavailable",
             "available": returncode == 0,
             "schema_version": 4,
+            "report_kind": "final_analysis",
             "telemetry": str(telemetry_path),
         }
+        report_data = _pipeline_report_data(state, run_dir, telemetry)
+        report_data["report_kind"] = "final_analysis"
         telemetry["delivery_report"] = _attach_report_evidence(
-            _pipeline_report_data(state, run_dir, telemetry),
+            report_data,
             state,
             run_dir,
             telemetry,
@@ -3023,7 +3085,7 @@ def main(argv: list[str] | None = None) -> int:
             state.setdefault("technical_report", {}).update(
                 {"status": "unavailable", "available": False}
             )
-            state.setdefault("report", {}).update(
+            state.setdefault("reports", {}).setdefault("final", {}).update(
                 {"status": "unavailable", "available": False}
             )
             _write_json_atomic(state_path, state)

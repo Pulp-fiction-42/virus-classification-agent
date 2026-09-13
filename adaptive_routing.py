@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 ROUTING_MODES = {"auto", "emergency", "standard"}
 MIN_KNOWN_VIRUS_READS = 1_000
 MIN_SAMPLE_FRACTION = 0.01
@@ -249,7 +248,7 @@ def decide_route(
         )
 
     blocked = (
-        selected_route == "B"
+        mode == "auto"
         and full_resources is not None
         and not full_resources.get("admission_ok", True)
     )
@@ -261,9 +260,5 @@ def decide_route(
         "selected_route": selected_route,
         "confidence": "high" if high_confidence else "low",
         "reason_codes": list(dict.fromkeys(reasons)),
-        "report_kind": (
-            "preliminary_screen"
-            if blocked or (selected_route == "A" and not high_confidence)
-            else ("preliminary_alert" if selected_route == "A" else "full_analysis")
-        ),
+        "report_kind": "preliminary_alert" if high_confidence else "preliminary_screen",
     }

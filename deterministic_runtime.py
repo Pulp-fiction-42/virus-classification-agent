@@ -105,7 +105,9 @@ class DeterministicRuntime:
                 state["technical_report"].update(
                     {"status": "unavailable", "available": False}
                 )
-                state["report"].update({"status": "unavailable", "available": False})
+                state["reports"]["final"].update(
+                    {"status": "unavailable", "available": False}
+                )
                 self._write_json_atomic(state_path, state)
                 raise SessionStateError(f"分析任务启动失败：{exc}") from exc
             return self._analysis_run_item(plan, "running")
@@ -190,11 +192,21 @@ class DeterministicRuntime:
                 "telemetry_version": 3,
                 "agent_trace": str(run_dir / ".bioagent" / "agent-trace.jsonl"),
             },
-            "report": {
-                "status": "collecting",
-                "available": False,
-                "schema_version": 4,
-                "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
+            "reports": {
+                "preliminary": {
+                    "status": "pending",
+                    "available": False,
+                    "schema_version": 4,
+                    "telemetry": str(
+                        run_dir / ".bioagent" / "preliminary-telemetry.json"
+                    ),
+                },
+                "final": {
+                    "status": "collecting",
+                    "available": False,
+                    "schema_version": 4,
+                    "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
+                },
             },
         }
         try:

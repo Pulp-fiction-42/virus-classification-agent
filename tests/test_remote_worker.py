@@ -186,6 +186,36 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         persisted = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["execution"]["status"], "interrupted")
 
+    def test_snapshot_selects_preliminary_telemetry(self):
+        run_id = "analysis-reports"
+        path = self._state(run_id, "completed")
+        preliminary = path.parent / "preliminary-telemetry.json"
+        final = path.parent / "telemetry.json"
+        preliminary.write_text(
+            json.dumps({"version": 3, "report": "preliminary"}), encoding="utf-8"
+        )
+        final.write_text(
+            json.dumps({"version": 3, "report": "final"}), encoding="utf-8"
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["reports"] = {
+            "preliminary": {"telemetry": str(preliminary), "available": True},
+            "final": {"telemetry": str(final), "available": True},
+        }
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        with patch("remote_worker._session_exists", return_value=False):
+            result = remote_worker.snapshot(
+                {
+                    "settings": self.settings,
+                    "run_id": run_id,
+                    "worker_version": "abc",
+                    "report_kind": "preliminary",
+                }
+            )
+
+        self.assertEqual(result["telemetry"]["report"], "preliminary")
+
     def test_private_tmux_session_receives_runner_environment(self):
         run_id = "analysis-command"
         state_path = self._state(run_id, "queued")

@@ -16,7 +16,6 @@ from workflow_catalog import (
     stage_rules,
 )
 
-
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -282,10 +281,17 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
     adaptive = requested_mode in {"auto", "emergency"} and paired_type is not None
     effective_mode = requested_mode if adaptive else "standard"
     policy = {
+        "routing_policy_version": 2,
         "requested_mode": requested_mode,
         "effective_mode": effective_mode,
         "adaptive": adaptive,
-        "short_circuit_scope": "pipeline",
+        "completion_behavior": (
+            "screen_then_full"
+            if adaptive and requested_mode == "auto"
+            else "screen_only"
+            if adaptive and requested_mode == "emergency"
+            else "full_only"
+        ),
         "applicability_reason": (
             "paired_reads_available"
             if adaptive

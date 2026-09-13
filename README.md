@@ -9,7 +9,7 @@ BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化
 - `/v1/analysis/runs/start`：验证 dataset revision 后排队远端 run。
 - `/v1/analysis/files`：列举 Cyclone data root 的 logical 文件树。
 - `/v1/analysis/datasets/resolve|preflight|fingerprints`：symlink-aware 解析、FASTQ quick/full check 与二次指纹验证。
-- `/v1/analysis/runs/snapshot`：state、队列/tmux、progress、telemetry、trace 与报告资料。
+- `/v1/analysis/runs/snapshot`：state、队列/tmux、progress、telemetry、trace 与报告资料；传 `report_kind=preliminary|final` 选择对应 telemetry。
 - `/v1/analysis/resources`：Cyclone CPU、内存、run-root storage 和 active/queued 数量。
 - `/v1/analysis/evidence/verify`：在 Cyclone 对报告数值做原始产物复算。
 

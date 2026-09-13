@@ -606,11 +606,19 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
             "telemetry_version": 3,
             "agent_trace": str(run_dir / ".bioagent" / "agent-trace.jsonl"),
         },
-        "report": {
-            "status": "collecting",
-            "available": False,
-            "schema_version": 4,
-            "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
+        "reports": {
+            "preliminary": {
+                "status": "pending",
+                "available": False,
+                "schema_version": 4,
+                "telemetry": str(run_dir / ".bioagent" / "preliminary-telemetry.json"),
+            },
+            "final": {
+                "status": "collecting",
+                "available": False,
+                "schema_version": 4,
+                "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
+            },
         },
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -653,7 +661,10 @@ def diagnostic_launch(request: dict[str, Any]) -> dict[str, Any]:
             "log": str(run_dir / ".bioagent" / "execution.log"),
         },
         "technical_report": {"status": "collecting", "available": False},
-        "report": {"status": "collecting", "available": False},
+        "reports": {
+            "preliminary": {"status": "pending", "available": False},
+            "final": {"status": "collecting", "available": False},
+        },
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     (state_path.parent / "execution.log").touch(exist_ok=True)
@@ -742,7 +753,16 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
         state["technical_report"].update({"status": "ready", "available": True})
         _write_json_atomic(state_path, state)
         status = "interrupted"
-    telemetry_text = _read_optional(state_path.parent / "telemetry.json")
+    requested_report = request.get("report_kind")
+    telemetry_path = state_path.parent / "telemetry.json"
+    if requested_report in {"preliminary", "final"}:
+        reports = state.get("reports") if isinstance(state.get("reports"), dict) else {}
+        report = reports.get(requested_report)
+        if isinstance(report, dict) and isinstance(report.get("telemetry"), str):
+            candidate = Path(report["telemetry"])
+            if candidate.is_absolute() and _lexical_under(candidate, state_path.parent.parent):
+                telemetry_path = candidate
+    telemetry_text = _read_optional(telemetry_path)
     try:
         telemetry = json.loads(telemetry_text) if telemetry_text else None
     except json.JSONDecodeError:

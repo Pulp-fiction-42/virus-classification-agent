@@ -13,7 +13,7 @@ from pipeline_spec import (
     validate_plan_rules,
 )
 
-PLANNER_VERSION = 1
+PLANNER_VERSION = 2
 GOAL_LABELS = {
     "contig_filter": "质控与组装",
     "virus_summary": "病毒识别",

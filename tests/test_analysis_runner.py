@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,8 +11,8 @@ import tempfile
 import time
 import unittest
 import zipfile
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
 from analysis_runner import (
     _attach_report_evidence,
@@ -21,16 +22,16 @@ from analysis_runner import (
     _parse_benchmarks,
     _parse_fastp,
     _parse_log,
-    _pipeline_report_data,
     _parse_seqkit_table,
+    _pipeline_report_data,
     _stage_records,
     _upstream_metrics,
     _workflow1_report_data,
     _workflow6_input_is_empty,
-    main as runner_main,
     redact_text,
     run,
 )
+from analysis_runner import main as runner_main
 from pipeline_spec import canonical_steps, normalize_execution_spec
 from workflow_adapters import PreparedExecution, PreparedPhase
 
@@ -336,6 +337,151 @@ rule merge:
         self.assertNotIn("deadline_seconds", routing)
         self.assertIsInstance(routing["actual_duration_seconds"], (int, float))
         self.assertEqual(telemetry["delivery_report"]["kind"], "analysis_pipeline")
+        self.assertTrue(state["reports"]["preliminary"]["available"])
+        self.assertFalse(state["reports"]["final"]["available"])
+
+    def test_auto_high_and_low_confidence_publish_preliminary_then_run_full(self):
+        for high_confidence, selected_route in ((True, "A"), (False, "B")):
+            with self.subTest(high_confidence=high_confidence), tempfile.TemporaryDirectory() as temp_dir:
+                state_path = self._write_adaptive_state(
+                    Path(temp_dir) / "run", mode="auto"
+                )
+                screening = {
+                    "sample_fraction": 0.05,
+                    "known_virus_high_confidence": high_confidence,
+                    "samples": [],
+                }
+                admitted = {"admission_ok": True, "reason_codes": []}
+                frozen_preliminary = None
+
+                def finish_full(_args, current_state_path=state_path):
+                    nonlocal frozen_preliminary
+                    frozen_preliminary = (
+                        current_state_path.parent / "preliminary-telemetry.json"
+                    ).read_bytes()
+                    state = json.loads(current_state_path.read_text(encoding="utf-8"))
+                    state["execution"].update(
+                        {"status": "completed", "ok": True, "returncode": 0}
+                    )
+                    state.setdefault("reports", {})["final"] = {
+                        "status": "ready",
+                        "available": True,
+                        "schema_version": 4,
+                        "report_kind": "final_analysis",
+                        "telemetry": str(current_state_path.parent / "telemetry.json"),
+                    }
+                    current_state_path.write_text(json.dumps(state), encoding="utf-8")
+                    (current_state_path.parent / "telemetry.json").write_text(
+                        json.dumps(
+                            {
+                                "version": 3,
+                                "delivery_report": {
+                                    "schema_version": 4,
+                                    "kind": "analysis_pipeline",
+                                    "report_kind": "final_analysis",
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    return 0
+
+                with (
+                    patch(
+                        "analysis_runner.ResourceCalibrator.history_summary",
+                        return_value={},
+                    ),
+                    patch(
+                        "analysis_runner.collect_resource_snapshot",
+                        side_effect=[admitted.copy(), admitted.copy()],
+                    ),
+                    patch("analysis_runner.run_rapid_screen", return_value=screening),
+                    patch("analysis_runner.run", side_effect=finish_full) as full_run,
+                ):
+                    returncode = run(argparse.Namespace(state=str(state_path)))
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                preliminary_path = state_path.parent / "preliminary-telemetry.json"
+                preliminary_bytes = preliminary_path.read_bytes()
+                preliminary = json.loads(preliminary_bytes)
+                self.assertEqual(returncode, 0)
+                full_run.assert_called_once()
+                self.assertEqual(
+                    state["routing"]["decision"]["selected_route"], selected_route
+                )
+                self.assertEqual(
+                    state["routing"]["completion_behavior"], "screen_then_full"
+                )
+                self.assertTrue(state["reports"]["preliminary"]["available"])
+                self.assertTrue(state["reports"]["final"]["available"])
+                self.assertEqual(preliminary_bytes, frozen_preliminary)
+                self.assertEqual(
+                    state["reports"]["preliminary"]["sha256"],
+                    hashlib.sha256(preliminary_bytes).hexdigest(),
+                )
+                json_evidence_paths = {
+                    item["source"]["path"]
+                    for item in preliminary["delivery_report"]["evidence"]
+                    if (item.get("source") or {}).get("type") == "json"
+                }
+                self.assertIn(
+                    ".bioagent/preliminary-telemetry.json", json_evidence_paths
+                )
+                self.assertEqual(
+                    json_evidence_paths,
+                    {".bioagent/preliminary-telemetry.json"},
+                )
+                self.assertIn(
+                    preliminary["delivery_report"]["report_kind"],
+                    {"preliminary_alert", "preliminary_screen"},
+                )
+                self.assertNotIn("skipped", {step["status"] for step in state["steps"]})
+
+    def test_auto_full_failure_keeps_preliminary_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = self._write_adaptive_state(Path(temp_dir) / "run", mode="auto")
+            screening = {
+                "sample_fraction": 0.05,
+                "known_virus_high_confidence": True,
+                "samples": [],
+            }
+            admitted = {"admission_ok": True, "reason_codes": []}
+
+            def fail_full(_args):
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["execution"].update(
+                    {"status": "failed", "ok": False, "returncode": 7}
+                )
+                state.setdefault("reports", {})["final"] = {
+                    "status": "unavailable",
+                    "available": False,
+                    "schema_version": 4,
+                    "telemetry": str(state_path.parent / "telemetry.json"),
+                }
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                (state_path.parent / "telemetry.json").write_text(
+                    json.dumps({"version": 3}), encoding="utf-8"
+                )
+                return 7
+
+            with (
+                patch(
+                    "analysis_runner.ResourceCalibrator.history_summary", return_value={}
+                ),
+                patch(
+                    "analysis_runner.collect_resource_snapshot",
+                    side_effect=[admitted.copy(), admitted.copy()],
+                ),
+                patch("analysis_runner.run_rapid_screen", return_value=screening),
+                patch("analysis_runner.run", side_effect=fail_full),
+            ):
+                returncode = run(argparse.Namespace(state=str(state_path)))
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(returncode, 7)
+            self.assertTrue(state["reports"]["preliminary"]["available"])
+            self.assertFalse(state["reports"]["final"]["available"])
+            self.assertTrue((state_path.parent / "preliminary-telemetry.json").is_file())
 
     def test_route_b_resource_failure_is_blocked_without_queueing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -376,7 +522,8 @@ rule merge:
         self.assertEqual(
             routing["resources"]["full_analysis"]["requirement_source"], "minimum"
         )
-        self.assertTrue(state["report"]["available"])
+        self.assertTrue(state["reports"]["preliminary"]["available"])
+        self.assertFalse(state["reports"]["final"]["available"])
         self.assertEqual(telemetry["delivery_report"]["kind"], "analysis_pipeline")
         self.assertEqual(
             telemetry["delivery_report"]["report_kind"], "preliminary_screen"
@@ -806,8 +953,10 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     ["fastp", "bowtie2", "merge"],
                 )
                 self.assertTrue(state["technical_report"]["available"])
-                self.assertEqual(state["report"]["available"], exit_code == 0)
-                self.assertEqual(state["report"]["schema_version"], 4)
+                self.assertEqual(
+                    state["reports"]["final"]["available"], exit_code == 0
+                )
+                self.assertEqual(state["reports"]["final"]["schema_version"], 4)
                 self.assertEqual(
                     telemetry["delivery_report"]["schema_version"],
                     4,
@@ -909,7 +1058,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
         self.assertEqual(result, 1)
         self.assertEqual(state["execution"]["status"], "failed")
         self.assertTrue(state["technical_report"]["available"])
-        self.assertFalse(state["report"]["available"])
+        self.assertFalse(state["reports"]["final"]["available"])
         self.assertIn("does not exist", telemetry["error"])
 
     def test_multiphase_execution_stops_after_first_failure(self):
@@ -1143,7 +1292,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
         self.assertEqual(state["phases"][0]["status"], "cancelled")
         self.assertEqual(telemetry["phases"][0]["status"], "cancelled")
         self.assertTrue(state["technical_report"]["available"])
-        self.assertFalse(state["report"]["available"])
+        self.assertFalse(state["reports"]["final"]["available"])
 
     def test_delivery_report_aggregates_runs_and_preserves_rrna_alignment(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -7,7 +7,11 @@ import logging
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 import config
 from conversation_events import (
@@ -18,9 +22,6 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -318,9 +319,13 @@ async def remote_analysis_fingerprints(req: RemoteFingerprintRequest):
 @app.get("/v1/analysis/runs/snapshot")
 @app.get("/analysis/runs/snapshot")
 async def remote_analysis_snapshot(
-    run_id: str | None = None, run_dir: str | None = None
+    run_id: str | None = None,
+    run_dir: str | None = None,
+    report_kind: Literal["preliminary", "final"] | None = None,
 ):
-    return await _remote_call("snapshot", run_id=run_id, run_dir=run_dir)
+    return await _remote_call(
+        "snapshot", run_id=run_id, run_dir=run_dir, report_kind=report_kind
+    )
 
 
 @app.get("/v1/analysis/resources")
