@@ -3053,6 +3053,38 @@ def run(args: argparse.Namespace) -> int:
                 print(
                     f"BioAgent resource history update failed: {exc}", file=sys.stderr
                 )
+        if returncode == 0:
+            report_python = os.getenv(
+                "BIOAGENT_REPORT_PYTHON",
+                "/home/liufangzhou/.pixi/bin/bioagent-report-python",
+            )
+            report_script = Path(__file__).resolve().with_name("standard_report.py")
+            try:
+                report_result = subprocess.run(
+                    [report_python, str(report_script), "--state", str(state_path)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                current_state = _read_state(state_path)
+                current_state["standard_delivery"] = {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "generated_at": _now(),
+                    "error": redact_text(str(exc) or exc.__class__.__name__),
+                    "artifacts": {},
+                }
+                _write_json_atomic(state_path, current_state)
+                print(f"Standard delivery report failed: {exc}", file=sys.stderr)
+            else:
+                if report_result.returncode:
+                    print(
+                        (report_result.stderr or "Standard delivery report failed").strip(),
+                        file=sys.stderr,
+                    )
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
     return returncode

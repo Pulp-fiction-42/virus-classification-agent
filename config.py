@@ -31,6 +31,15 @@ REMOTE_TMUX = os.getenv("BIOAGENT_REMOTE_TMUX", "/data/user/liufangzhou/bin/tmux
 REMOTE_WORKER_ROOT = os.getenv(
     "BIOAGENT_REMOTE_WORKER_ROOT", "/data/user/liufangzhou/.bioagent/worker"
 )
+REPORT_PYTHON = os.getenv(
+    "BIOAGENT_REPORT_PYTHON", "/home/liufangzhou/.pixi/bin/bioagent-report-python"
+)
+REPORT_RSCRIPT = os.getenv(
+    "BIOAGENT_RSCRIPT", "/home/liufangzhou/.pixi/bin/bioagent-rscript"
+)
+REPORT_WEASYPRINT = os.getenv(
+    "BIOAGENT_WEASYPRINT", "/home/liufangzhou/.pixi/bin/bioagent-weasyprint"
+)
 REMOTE_DATA_ALLOWED_ROOTS = tuple(
     value.strip()
     for value in os.getenv(

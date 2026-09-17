@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -559,6 +561,7 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         "title": plan.get("title"),
         "dataset": dataset,
         "plan": {**plan, "dataset": dataset},
+        "metadata_snapshot": plan.get("metadata_snapshot"),
         "execution_spec": execution_spec,
         "steps": [
             {
@@ -619,6 +622,11 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
                 "schema_version": 4,
                 "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
             },
+        },
+        "standard_delivery": {
+            "schema_version": 1,
+            "status": "pending",
+            "artifacts": {},
         },
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -893,6 +901,49 @@ def verify_evidence(request: dict[str, Any]) -> dict[str, Any]:
     return verify_report_evidence(telemetry=telemetry, run_dir=run_dir)
 
 
+def delivery_artifact(request: dict[str, Any]) -> dict[str, Any]:
+    run_dir = Path(str(request.get("run_dir") or ""))
+    root = Path(request["settings"]["run_root"])
+    format_name = str(request.get("format") or "")
+    if format_name not in {"html", "pdf"}:
+        raise WorkerError("Unsupported delivery report format")
+    if not run_dir.is_absolute() or not _lexical_under(run_dir, root):
+        raise WorkerError("Run directory is outside the analysis run root")
+    resolved_root = root.resolve()
+    resolved_run = run_dir.resolve()
+    if resolved_root not in resolved_run.parents:
+        raise WorkerError("Run directory is outside the analysis run root")
+    state_path = resolved_run / ".bioagent" / "state.json"
+    state = _read_json(state_path)
+    delivery = state.get("standard_delivery")
+    artifacts = delivery.get("artifacts") if isinstance(delivery, dict) else None
+    artifact = artifacts.get(format_name) if isinstance(artifacts, dict) else None
+    if not (
+        isinstance(delivery, dict)
+        and delivery.get("schema_version") == 1
+        and delivery.get("status") == "ready"
+        and isinstance(artifact, dict)
+    ):
+        raise WorkerError("Delivery report is not ready")
+    relative = artifact.get("path")
+    if not isinstance(relative, str) or Path(relative).is_absolute():
+        raise WorkerError("Delivery report artifact path is invalid")
+    path = (resolved_run / relative).resolve()
+    if resolved_run not in path.parents or not path.is_file():
+        raise WorkerError("Delivery report artifact is unavailable")
+    data = path.read_bytes()
+    if len(data) > 32 * 1024 * 1024:
+        raise WorkerError("Delivery report artifact exceeds the transfer limit")
+    if len(data) != artifact.get("bytes") or hashlib.sha256(data).hexdigest() != artifact.get("sha256"):
+        raise WorkerError("Delivery report artifact validation failed")
+    return {
+        "format": format_name,
+        "media_type": artifact.get("media_type"),
+        "sha256": artifact.get("sha256"),
+        "content_base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
 def _runner_environment(settings: dict[str, Any]) -> dict[str, str]:
     return {
         key: value
@@ -939,6 +990,19 @@ def toolchain(request: dict[str, Any]) -> dict[str, Any]:
     tmux["socket"] = str(settings["tmux_socket"])
     snakemake = version([runner_environment["BIOAGENT_SNAKEMAKE"], "--version"])
     seqkit = version([runner_environment["BIOAGENT_SEQKIT"], "version"])
+    report_python = version(
+        [
+            runner_environment.get("BIOAGENT_REPORT_PYTHON", ""),
+            "-c",
+            "import pandas, scipy, openpyxl; print('report-python ready')",
+        ]
+    )
+    rscript = version(
+        [runner_environment.get("BIOAGENT_RSCRIPT", ""), "--version"]
+    )
+    weasyprint = version(
+        [runner_environment.get("BIOAGENT_WEASYPRINT", ""), "--version"]
+    )
     workflows = {
         key: {
             "path": path,
@@ -946,13 +1010,25 @@ def toolchain(request: dict[str, Any]) -> dict[str, Any]:
         }
         for key, path in workflow_paths.items()
     }
-    checks = [python, tmux, snakemake, seqkit, *workflows.values()]
+    checks = [
+        python,
+        tmux,
+        snakemake,
+        seqkit,
+        report_python,
+        rscript,
+        weasyprint,
+        *workflows.values(),
+    ]
     return {
         "ok": all(item["available"] for item in checks),
         "python": python,
         "tmux": tmux,
         "snakemake": snakemake,
         "seqkit": seqkit,
+        "report_python": report_python,
+        "rscript": rscript,
+        "weasyprint": weasyprint,
         "workflows": workflows,
     }
 
@@ -1083,6 +1159,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
         return estimate(request)
     if operation == "verify_evidence":
         return verify_evidence(request)
+    if operation == "delivery_artifact":
+        return delivery_artifact(request)
     if operation == "dry_run":
         return dry_run(request)
     raise WorkerError(f"unsupported worker operation: {operation}")

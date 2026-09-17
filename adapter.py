@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -10,7 +11,7 @@ import uuid
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config
@@ -325,6 +326,21 @@ async def remote_analysis_snapshot(
 ):
     return await _remote_call(
         "snapshot", run_id=run_id, run_dir=run_dir, report_kind=report_kind
+    )
+
+
+@app.get("/v1/analysis/runs/delivery-report")
+@app.get("/analysis/runs/delivery-report")
+async def remote_analysis_delivery_report(run_dir: str, format: Literal["html", "pdf"]):
+    result = await _remote_call("delivery_artifact", run_dir=run_dir, format=format)
+    try:
+        content = base64.b64decode(result["content_base64"], validate=True)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Cyclone returned an invalid report artifact") from exc
+    return Response(
+        content=content,
+        media_type=str(result.get("media_type") or ("application/pdf" if format == "pdf" else "text/html; charset=utf-8")),
+        headers={"X-Content-Type-Options": "nosniff"},
     )
 
 

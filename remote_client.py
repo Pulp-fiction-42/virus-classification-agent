@@ -29,6 +29,7 @@ class RemoteConnectionError(RemoteExecutionError):
 WORKER_FILES = (
     "remote_worker.py",
     "analysis_runner.py",
+    "standard_report.py",
     "adaptive_routing.py",
     "adaptive_screening.py",
     "pipeline_spec.py",
@@ -48,6 +49,9 @@ RUNNER_ENV_DEFAULTS = {
     "BIOAGENT_WORKFLOW5_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow5_virus_quantification",
     "BIOAGENT_WORKFLOW6_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow6_virus_annotation",
     "BIOAGENT_SNAKEMAKE_CORES": "8",
+    "BIOAGENT_REPORT_PYTHON": "/home/liufangzhou/.pixi/bin/bioagent-report-python",
+    "BIOAGENT_RSCRIPT": "/home/liufangzhou/.pixi/bin/bioagent-rscript",
+    "BIOAGENT_WEASYPRINT": "/home/liufangzhou/.pixi/bin/bioagent-weasyprint",
 }
 
 
@@ -107,6 +111,7 @@ class RemoteWorkerClient:
 
     def _source_files(self) -> list[tuple[Path, str]]:
         files = [(self.project_root / name, name) for name in WORKER_FILES]
+        files.append((self.project_root / "extract_io.py", "scripts/extract_io.py"))
         evidence = (
             self.project_root.parent
             / "open-webui"
@@ -248,7 +253,9 @@ class RemoteWorkerClient:
         with tempfile.TemporaryDirectory(prefix="bioagent-worker-") as temporary:
             source_root = Path(temporary)
             for source, name in self._source_files():
-                shutil.copyfile(source, source_root / name)
+                target = source_root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
             try:
                 self._ensure_master()
                 self._run(

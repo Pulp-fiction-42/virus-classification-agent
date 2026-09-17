@@ -149,6 +149,7 @@ class DeterministicRuntime:
             "title": plan.get("title"),
             "dataset": plan.get("dataset"),
             "plan": plan,
+            "metadata_snapshot": plan.get("metadata_snapshot"),
             "execution_spec": execution_spec,
             "steps": [
                 {
@@ -207,6 +208,11 @@ class DeterministicRuntime:
                     "schema_version": 4,
                     "telemetry": str(run_dir / ".bioagent" / "telemetry.json"),
                 },
+            },
+            "standard_delivery": {
+                "schema_version": 1,
+                "status": "pending",
+                "artifacts": {},
             },
         }
         try:

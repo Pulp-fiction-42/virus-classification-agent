@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -216,6 +218,83 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
 
         self.assertEqual(result["telemetry"]["report"], "preliminary")
 
+    def test_delivery_artifact_requires_registered_hash_matched_file(self):
+        run_id = "analysis-delivery"
+        state_path = self._state(run_id, "completed")
+        run_dir = state_path.parent.parent
+        report = run_dir / "reports" / "standard" / "report.html"
+        report.parent.mkdir(parents=True)
+        report.write_bytes(b"<html>delivery</html>")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["standard_delivery"] = {
+            "schema_version": 1,
+            "status": "ready",
+            "artifacts": {
+                "html": {
+                    "path": "reports/standard/report.html",
+                    "bytes": report.stat().st_size,
+                    "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+                    "media_type": "text/html; charset=utf-8",
+                }
+            },
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = remote_worker.delivery_artifact(
+            {"settings": self.settings, "run_dir": str(run_dir), "format": "html"}
+        )
+        self.assertEqual(base64.b64decode(result["content_base64"]), report.read_bytes())
+
+        report.write_bytes(b"tampered")
+        with self.assertRaises(remote_worker.WorkerError):
+            remote_worker.delivery_artifact(
+                {"settings": self.settings, "run_dir": str(run_dir), "format": "html"}
+            )
+
+        outside_run = self.root / "outside" / "analysis-escaped"
+        outside_state = outside_run / ".bioagent" / "state.json"
+        outside_report = outside_run / "reports" / "standard" / "report.html"
+        outside_state.parent.mkdir(parents=True)
+        outside_report.parent.mkdir(parents=True)
+        outside_report.write_bytes(b"<html>outside</html>")
+        outside_state.write_text(
+            json.dumps(
+                {
+                    "standard_delivery": {
+                        "schema_version": 1,
+                        "status": "ready",
+                        "artifacts": {
+                            "html": {
+                                "path": "reports/standard/report.html",
+                                "bytes": outside_report.stat().st_size,
+                                "sha256": hashlib.sha256(
+                                    outside_report.read_bytes()
+                                ).hexdigest(),
+                            }
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        escaped_run = self.runs / "analysis-escaped"
+        escaped_run.symlink_to(outside_run, target_is_directory=True)
+        with self.assertRaises(remote_worker.WorkerError):
+            remote_worker.delivery_artifact(
+                {
+                    "settings": self.settings,
+                    "run_dir": str(escaped_run),
+                    "format": "html",
+                }
+            )
+
+        state["standard_delivery"]["artifacts"]["html"]["path"] = "../outside/report.html"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaises(remote_worker.WorkerError):
+            remote_worker.delivery_artifact(
+                {"settings": self.settings, "run_dir": str(run_dir), "format": "html"}
+            )
+
     def test_private_tmux_session_receives_runner_environment(self):
         run_id = "analysis-command"
         state_path = self._state(run_id, "queued")
@@ -249,6 +328,9 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         runner_environment = {
             "BIOAGENT_SNAKEMAKE": "/tools/snakemake",
             "BIOAGENT_SEQKIT": "/tools/seqkit",
+            "BIOAGENT_REPORT_PYTHON": "/tools/report-python",
+            "BIOAGENT_RSCRIPT": "/tools/Rscript",
+            "BIOAGENT_WEASYPRINT": "/tools/weasyprint",
         }
         for index in range(1, 7):
             workflow = self.root / f"workflow{index}"
@@ -270,6 +352,9 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(result["snakemake"]["error"], "timeout")
         self.assertTrue(result["tmux"]["available"])
         self.assertTrue(result["seqkit"]["available"])
+        self.assertTrue(result["report_python"]["available"])
+        self.assertTrue(result["rscript"]["available"])
+        self.assertTrue(result["weasyprint"]["available"])
         self.assertTrue(all(item["available"] for item in result["workflows"].values()))
 
 

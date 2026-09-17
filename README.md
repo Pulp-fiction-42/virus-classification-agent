@@ -10,6 +10,7 @@ BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化
 - `/v1/analysis/files`：列举 Cyclone data root 的 logical 文件树。
 - `/v1/analysis/datasets/resolve|preflight|fingerprints`：symlink-aware 解析、FASTQ quick/full check 与二次指纹验证。
 - `/v1/analysis/runs/snapshot`：state、队列/tmux、progress、telemetry、trace 与报告资料；传 `report_kind=preliminary|final` 选择对应 telemetry。
+- `/v1/analysis/runs/delivery-report?format=html|pdf`：校验 run-local 登记、大小与 SHA-256 后传输标准交付报告。
 - `/v1/analysis/resources`：Cyclone CPU、内存、run-root storage 和 active/queued 数量。
 - `/v1/analysis/evidence/verify`：在 Cyclone 对报告数值做原始产物复算。
 
@@ -28,6 +29,8 @@ BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化
 完整的新机器部署、Cyclone 路径和 `.env` 配置见根目录 [Developer Guide](../README.md#developer-guide)。本机 `agent/.env` 被 Git 忽略，tracked `agent/.env.example` 是唯一配置模板。
 
 RPC 控制进程、tmux supervisor 与 analysis runner 使用同一套 home Pixi Python；Snakemake 与 SeqKit 使用 Pixi 的全局入口。这样可避开高负载 `/data` 上大量小文件读取，也无需维护第二套 adapter。缺少这些路径时 toolchain 会拒绝新任务，不会回退旧环境；新增命令行工具时使用 `pixi global install -c bioconda <tool>`。
+
+标准交付报告使用独立的 `BIOAGENT_REPORT_PYTHON`、`BIOAGENT_RSCRIPT` 与 `BIOAGENT_WEASYPRINT`；正常 run 完成后自动生成，也可用 `standard_report.py --state <run>/.bioagent/state.json` 单独重建。
 
 Workflow 1 在 run root 建立副本时会把 run-local `config.yaml` 的 `software.seqkit` 改为上述 Pixi 入口；Cyclone 上的 Workflow 源码保持不变。
 
