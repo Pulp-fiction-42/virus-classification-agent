@@ -21,6 +21,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from pipeline_spec import (
+    ExecutionSpecError,
+    normalize_execution_spec,
+    validate_plan_rules,
+)
+
 RUN_ID_RE = re.compile(r"^analysis-[A-Za-z0-9_.-]+$")
 TERMINAL_STATUSES = {"completed", "failed", "blocked", "interrupted"}
 FASTQ_EXTENSION_RE = re.compile(r"(?i)(\.fastq|\.fq)(\.gz)?$")
@@ -529,6 +535,19 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
     dataset = request.get("dataset")
     if not isinstance(plan, dict) or not isinstance(dataset, dict):
         raise WorkerError("analysis plan or dataset is missing")
+    raw_execution_spec = plan.get("execution_spec")
+    if not isinstance(raw_execution_spec, dict) or not isinstance(
+        raw_execution_spec.get("capability_contract"), dict
+    ):
+        raise WorkerError(
+            "analysis execution spec is invalid: capability contract is missing"
+        )
+    try:
+        execution_spec = normalize_execution_spec(raw_execution_spec)
+        validate_plan_rules(execution_spec, plan.get("steps") or [])
+    except ExecutionSpecError as exc:
+        raise WorkerError(f"analysis execution spec is invalid: {exc}") from exc
+    plan = {**plan, "execution_spec": execution_spec}
     _validate_dataset(dataset, settings)
     if state_path.exists():
         state = _read_json(state_path)
@@ -541,7 +560,7 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
             _start_session(settings, state_path, str(request["worker_version"]))
         return _run_item(run_id, settings, status)
     run_dir = state_path.parent.parent
-    execution_spec = plan.get("execution_spec")
+    execution_spec = plan["execution_spec"]
     steps = plan.get("steps") or []
     log_path = run_dir / ".bioagent" / "execution.log"
     state = {
@@ -768,7 +787,9 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
         report = reports.get(requested_report)
         if isinstance(report, dict) and isinstance(report.get("telemetry"), str):
             candidate = Path(report["telemetry"])
-            if candidate.is_absolute() and _lexical_under(candidate, state_path.parent.parent):
+            if candidate.is_absolute() and _lexical_under(
+                candidate, state_path.parent.parent
+            ):
                 telemetry_path = candidate
     telemetry_text = _read_optional(telemetry_path)
     try:
@@ -934,7 +955,9 @@ def delivery_artifact(request: dict[str, Any]) -> dict[str, Any]:
     data = path.read_bytes()
     if len(data) > 32 * 1024 * 1024:
         raise WorkerError("Delivery report artifact exceeds the transfer limit")
-    if len(data) != artifact.get("bytes") or hashlib.sha256(data).hexdigest() != artifact.get("sha256"):
+    if len(data) != artifact.get("bytes") or hashlib.sha256(
+        data
+    ).hexdigest() != artifact.get("sha256"):
         raise WorkerError("Delivery report artifact validation failed")
     return {
         "format": format_name,
@@ -997,9 +1020,7 @@ def toolchain(request: dict[str, Any]) -> dict[str, Any]:
             "import pandas, scipy, openpyxl; print('report-python ready')",
         ]
     )
-    rscript = version(
-        [runner_environment.get("BIOAGENT_RSCRIPT", ""), "--version"]
-    )
+    rscript = version([runner_environment.get("BIOAGENT_RSCRIPT", ""), "--version"])
     weasyprint = version(
         [runner_environment.get("BIOAGENT_WEASYPRINT", ""), "--version"]
     )

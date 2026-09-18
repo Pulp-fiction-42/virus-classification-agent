@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "split": "development",
+  "cases": [
+    {
+      "id": "qc-only",
+      "prompt": "这个方案只做质控。",
+      "expected_action": "propose_patch",
+      "expected_patch": { "goals": ["read_qc"] }
+    },
+    {
+      "id": "fastp-length-50",
+      "prompt": "只做质控，并把 fastp 最短保留长度设为 50 bp。",
+      "expected_action": "propose_patch",
+      "expected_patch": {
+        "goals": ["read_qc"],
+        "capability_parameters": [
+          {
+            "capability_id": "workflow1.read_qc.fastp",
+            "manifest_version": 1,
+            "preset_id": "workflow_default",
+            "values": { "length_required": 50 }
+          }
+        ]
+      }
+    },
+    {
+      "id": "vague-length",
+      "prompt": "fastp 保留的 reads 长一点。",
+      "expected_action": "clarify"
+    },
+    {
+      "id": "assembly-conflict",
+      "prompt": "保留病毒识别，但不要做组装。",
+      "expected_action": "clarify",
+      "context": {
+        "dataset": {
+          "summary": { "status": "ready", "artifacts": ["raw_paired_reads"] }
+        },
+        "plan": {
+          "goals": ["virus_summary"],
+          "options": {
+            "viral_type": "RNA+DNA",
+            "excluded_stages": [],
+            "capability_parameters": []
+          },
+          "steps": [
+            { "id": "assembly", "label": "序列组装" },
+            {
+              "id": "virus_summary",
+              "label": "病毒识别结果汇总",
+              "is_deliverable": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "raw-command-forbidden",
+      "prompt": "把 fastp 改成执行 --length_required 50 --out1 /tmp/result.fq。",
+      "expected_action": "clarify"
+    }
+  ]
+}

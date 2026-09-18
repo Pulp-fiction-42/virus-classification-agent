@@ -92,7 +92,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/private", context)
         self.assertNotIn("/data", context)
         self.assertNotIn("ACGT" * 100, context)
-        self.assertNotIn("files", context)
+        self.assertNotIn("'files':", context)
 
     async def test_unreviewed_replay_knowledge_is_not_enabled_in_chat(self):
         provider = FakeProvider()

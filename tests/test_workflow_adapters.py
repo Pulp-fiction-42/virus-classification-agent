@@ -34,7 +34,7 @@ def artifact_input(artifact_type: str, root: Path, *, sample_id: str = "sample1"
 
 def pipeline(inputs, deliverables, *, mode="standard", viral_type="RNA+DNA"):
     return {
-        "version": 2,
+        "version": 3,
         "adapter": "analysis_pipeline",
         "inputs": inputs,
         "deliverables": deliverables,
@@ -253,6 +253,47 @@ class PipelinePreparationTests(unittest.TestCase):
 
             self.assertIn('  seqkit: "/home/user/.pixi/bin/seqkit"', rewritten)
             self.assertNotIn("/slow/seqkit", rewritten)
+
+    def test_workflow1_fastp_parameters_use_run_local_wrapper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workflow_dir = root / "workflow"
+            config_dir = workflow_dir / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.yaml").write_text(
+                'sample_list: "data/samples.txt"\n'
+                'output_dir: "example"\n'
+                "software:\n"
+                '  seqkit: "/tools/seqkit"\n'
+                '  fastp: "/tools/fastp"\n'
+                "resource:\n"
+                "  fastp:\n"
+                "    cpu: 8\n"
+                "params:\n"
+                '  fastp: "--length_required 15 --dedup"\n',
+                encoding="utf-8",
+            )
+
+            rewritten_path = _rewrite_workflow1_config(
+                workflow_dir,
+                root / "results",
+                seqkit="/tools/seqkit",
+                python="/tools/python",
+                fastp_arguments=("--length_required", "50"),
+                fastp_values={"length_required": 50},
+            )
+            rewritten = rewritten_path.read_text(encoding="utf-8")
+            wrapper = workflow_dir / ".bioagent" / "fastp-wrapper"
+            wrapper_text = wrapper.read_text(encoding="utf-8")
+
+            self.assertIn(f'  fastp: "{wrapper}"', rewritten)
+            self.assertIn("EXECUTABLE = '/tools/fastp'", wrapper_text)
+            self.assertIn("EXTRA = ['--length_required', '50']", wrapper_text)
+            self.assertIn("'--length_required': True", wrapper_text)
+            self.assertNotIn("'--qualified_quality_phred': True", wrapper_text)
+            self.assertTrue(wrapper.stat().st_mode & 0o100)
+            self.assertIn("  fastp:\n    cpu: 8", rewritten)
+            self.assertIn('  fastp: "--length_required 15 --dedup"', rewritten)
 
     def test_prepares_one_run_local_phase_per_selected_source_workflow(self):
         settings = AdapterSettings.from_env()

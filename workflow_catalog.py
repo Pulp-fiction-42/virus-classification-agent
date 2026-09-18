@@ -46,6 +46,166 @@ class StageSpec:
         return self.rules(options, bindings) if callable(self.rules) else self.rules
 
 
+@dataclass(frozen=True)
+class ParameterSpec:
+    id: str
+    label: str
+    kind: str
+    minimum: int | None
+    maximum: int | None
+    unit: str | None
+    description: str
+    flag: str
+
+
+@dataclass(frozen=True)
+class CapabilityManifest:
+    id: str
+    version: int
+    stage_id: str
+    tool_id: str
+    label: str
+    validation_status: str
+    adapter_version: int
+    impact: str
+    parameters: tuple[ParameterSpec, ...]
+    presets: tuple[tuple[str, tuple[tuple[str, int | bool], ...]], ...]
+
+
+PUBLIC_DELIVERABLES: dict[str, dict[str, str]] = {
+    "read_qc": {
+        "label": "仅序列质控",
+        "description": "仅执行 fastp，输出质控后双端 reads 与质控报告",
+        "group": "workflow1",
+    },
+    "rrna_filter": {
+        "label": "质控与去 rRNA",
+        "description": "执行 fastp 与 rRNA 去除，输出 clean reads",
+        "group": "workflow1",
+    },
+    "sample_merge": {
+        "label": "质控、去 rRNA 与样本合并",
+        "description": "完成 run 级清理并合并同一样本的技术重复",
+        "group": "workflow1",
+    },
+    "assembly": {
+        "label": "质控与序列组装",
+        "description": "完成上游清理、样本合并与 MEGAHIT 组装",
+        "group": "workflow1",
+    },
+    "contig_filter": {
+        "label": "质控与组装",
+        "description": "完成 reads 质控、去 rRNA、组装与 contig 过滤",
+        "group": "primary",
+    },
+    "virus_summary": {
+        "label": "病毒识别",
+        "description": "搜索病毒候选并汇总分类证据",
+        "group": "primary",
+    },
+    "host_summary": {
+        "label": "宿主识别",
+        "description": "完成宿主比对、覆盖度、BLAST 与整合",
+        "group": "primary",
+    },
+    "microbe_summary": {
+        "label": "微生物谱",
+        "description": "生成 Kraken2、Bracken 与分类摘要",
+        "group": "primary",
+    },
+    "virus_rpm": {
+        "label": "病毒定量",
+        "description": "计算病毒覆盖度与 RPM 丰度",
+        "group": "primary",
+    },
+    "annotation_delivery": {
+        "label": "病毒注释",
+        "description": "完成质量、结构与功能注释交付",
+        "group": "primary",
+    },
+}
+
+PUBLIC_DELIVERABLE_IDS = tuple(PUBLIC_DELIVERABLES)
+FASTP_CAPABILITY_ID = "workflow1.read_qc.fastp"
+FASTP_MANIFEST_VERSION = 1
+WORKFLOW_ADAPTER_VERSION = 1
+FASTP_PARAMETERS = (
+    ParameterSpec(
+        "length_required",
+        "最短保留长度",
+        "integer",
+        1,
+        1000,
+        "bp",
+        "短于该长度的 reads 会被丢弃；提高此值会减少保留 reads 数量。",
+        "--length_required",
+    ),
+    ParameterSpec(
+        "qualified_quality_phred",
+        "合格碱基 Phred",
+        "integer",
+        0,
+        40,
+        "Phred",
+        "定义单个碱基达到合格质量的 Phred 阈值。",
+        "--qualified_quality_phred",
+    ),
+    ParameterSpec(
+        "unqualified_percent_limit",
+        "不合格碱基比例上限",
+        "integer",
+        0,
+        100,
+        "%",
+        "超过该比例的不合格碱基会导致 read 或 read pair 被丢弃。",
+        "--unqualified_percent_limit",
+    ),
+    ParameterSpec(
+        "n_base_limit",
+        "N 碱基上限",
+        "integer",
+        0,
+        1000,
+        "bases",
+        "N 碱基数超过该值的 read 或 read pair 会被丢弃。",
+        "--n_base_limit",
+    ),
+    ParameterSpec(
+        "average_qual",
+        "平均质量下限",
+        "integer",
+        0,
+        40,
+        "Phred",
+        "平均质量低于该值的 read 或 read pair 会被丢弃；0 表示不限制。",
+        "--average_qual",
+    ),
+    ParameterSpec(
+        "detect_adapter_for_pe",
+        "双端 adapter 自动检测",
+        "boolean",
+        None,
+        None,
+        None,
+        "启用双端数据 adapter 自动检测。",
+        "--detect_adapter_for_pe",
+    ),
+)
+FASTP_MANIFEST = CapabilityManifest(
+    id=FASTP_CAPABILITY_ID,
+    version=FASTP_MANIFEST_VERSION,
+    stage_id="read_qc",
+    tool_id="fastp",
+    label="fastp 序列质控",
+    validation_status="validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="参数变化可能改变保留 reads 的数量和后续分析输入；不会修改原始 FASTQ。",
+    parameters=FASTP_PARAMETERS,
+    presets=(("workflow_default", ()),),
+)
+CAPABILITY_MANIFESTS = {FASTP_MANIFEST.id: FASTP_MANIFEST}
+
+
 def _virus_prep_rules(
     _options: dict[str, Any], bindings: dict[str, str]
 ) -> tuple[str, ...]:
@@ -462,3 +622,194 @@ def stage_rules(
     stage: StageSpec, options: dict[str, Any], bindings: dict[str, str]
 ) -> tuple[str, ...]:
     return stage.selected_rules(options, bindings)
+
+
+def _parameter_catalog(parameter: ParameterSpec) -> dict[str, Any]:
+    return {
+        "id": parameter.id,
+        "label": parameter.label,
+        "type": parameter.kind,
+        **({"minimum": parameter.minimum} if parameter.minimum is not None else {}),
+        **({"maximum": parameter.maximum} if parameter.maximum is not None else {}),
+        **({"unit": parameter.unit} if parameter.unit else {}),
+        "description": parameter.description,
+    }
+
+
+def capability_catalog() -> dict[str, Any]:
+    """Return the public, path-free capability catalog used by UI and providers."""
+
+    manifests = []
+    for manifest in CAPABILITY_MANIFESTS.values():
+        manifests.append(
+            {
+                "id": manifest.id,
+                "version": manifest.version,
+                "stage_id": manifest.stage_id,
+                "tool_id": manifest.tool_id,
+                "label": manifest.label,
+                "validation_status": manifest.validation_status,
+                "adapter_version": manifest.adapter_version,
+                "impact": manifest.impact,
+                "input_artifacts": [
+                    artifact
+                    for alternatives in STAGE_BY_ID[manifest.stage_id].requirements
+                    for artifact in alternatives
+                ],
+                "output_artifact": STAGE_BY_ID[manifest.stage_id].produces,
+                "parameters": [
+                    _parameter_catalog(parameter) for parameter in manifest.parameters
+                ],
+                "presets": [
+                    {
+                        "id": preset_id,
+                        "values": dict(values),
+                    }
+                    for preset_id, values in manifest.presets
+                ],
+            }
+        )
+    return {
+        "schema_version": 1,
+        "deliverables": [
+            {
+                "id": deliverable_id,
+                **metadata,
+                "dependencies": [
+                    PRODUCER_BY_ARTIFACT[alternatives[0]].id
+                    for alternatives in STAGE_BY_ID[deliverable_id].requirements
+                    if alternatives[0] in PRODUCER_BY_ARTIFACT
+                ],
+                "input_artifacts": [
+                    artifact
+                    for alternatives in STAGE_BY_ID[deliverable_id].requirements
+                    for artifact in alternatives
+                ],
+                "output_artifact": STAGE_BY_ID[deliverable_id].produces,
+            }
+            for deliverable_id, metadata in PUBLIC_DELIVERABLES.items()
+        ],
+        "capabilities": manifests,
+    }
+
+
+def normalize_capability_parameters(raw: Any) -> list[dict[str, Any]]:
+    """Validate and canonicalize user-controlled tool parameters."""
+
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("capability_parameters must be a list")  # noqa: TRY004
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(raw):
+        if not isinstance(value, dict):
+            raise ValueError(  # noqa: TRY004
+                f"capability_parameters[{index}] must be an object"
+            )
+        unsupported = set(value) - {
+            "capability_id",
+            "manifest_version",
+            "preset_id",
+            "values",
+        }
+        if unsupported:
+            raise ValueError(
+                "capability parameter selection contains unsupported fields: "
+                + ", ".join(sorted(unsupported))
+            )
+        capability_id = value.get("capability_id")
+        manifest = CAPABILITY_MANIFESTS.get(capability_id)
+        if manifest is None:
+            raise ValueError(f"unknown capability: {capability_id}")
+        if capability_id in seen:
+            raise ValueError(f"duplicate capability parameters: {capability_id}")
+        seen.add(capability_id)
+        version = value.get("manifest_version")
+        if version != manifest.version:
+            raise ValueError(
+                f"capability manifest version is unavailable: {capability_id}@{version}"
+            )
+        preset_id = value.get("preset_id", "workflow_default")
+        presets = {preset: dict(values) for preset, values in manifest.presets}
+        if preset_id not in presets:
+            raise ValueError(f"unknown capability preset: {capability_id}/{preset_id}")
+        raw_values = value.get("values") or {}
+        if not isinstance(raw_values, dict):
+            raise ValueError(  # noqa: TRY004
+                f"capability values must be an object: {capability_id}"
+            )
+        specs = {parameter.id: parameter for parameter in manifest.parameters}
+        unknown = set(raw_values) - set(specs)
+        if unknown:
+            raise ValueError(
+                f"unknown capability parameter for {capability_id}: "
+                + ", ".join(sorted(unknown))
+            )
+        effective = presets[preset_id]
+        for parameter_id, parameter_value in raw_values.items():
+            spec = specs[parameter_id]
+            if spec.kind == "boolean":
+                if not isinstance(parameter_value, bool):
+                    raise ValueError(
+                        f"{capability_id}.{parameter_id} must be a boolean"
+                    )
+            elif (
+                not isinstance(parameter_value, int)
+                or isinstance(parameter_value, bool)
+                or (spec.minimum is not None and parameter_value < spec.minimum)
+                or (spec.maximum is not None and parameter_value > spec.maximum)
+            ):
+                raise ValueError(
+                    f"{capability_id}.{parameter_id} is outside the allowed range"
+                )
+            effective[parameter_id] = parameter_value
+        normalized.append(
+            {
+                "capability_id": capability_id,
+                "manifest_version": manifest.version,
+                "preset_id": preset_id,
+                "values": {key: effective[key] for key in sorted(effective)},
+            }
+        )
+    return sorted(normalized, key=lambda item: item["capability_id"])
+
+
+def capability_parameter_arguments(
+    capability_parameters: list[dict[str, Any]], capability_id: str
+) -> tuple[str, ...]:
+    selection = next(
+        (
+            item
+            for item in capability_parameters
+            if item.get("capability_id") == capability_id
+        ),
+        None,
+    )
+    if selection is None:
+        return ()
+    manifest = CAPABILITY_MANIFESTS[capability_id]
+    specs = {parameter.id: parameter for parameter in manifest.parameters}
+    arguments: list[str] = []
+    for parameter_id, value in selection.get("values", {}).items():
+        spec = specs[parameter_id]
+        if spec.kind == "boolean":
+            if value is True:
+                arguments.append(spec.flag)
+        else:
+            arguments.extend((spec.flag, str(value)))
+    return tuple(arguments)
+
+
+def capability_parameter_values(
+    capability_parameters: list[dict[str, Any]], capability_id: str
+) -> dict[str, int | bool]:
+    selection = next(
+        (
+            item
+            for item in capability_parameters
+            if item.get("capability_id") == capability_id
+        ),
+        None,
+    )
+    return dict(selection.get("values", {})) if selection else {}

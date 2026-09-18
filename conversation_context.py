@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from workflow_catalog import capability_catalog
+
 
 def _dataset_summary(dataset: object) -> dict[str, Any] | None:
     if not isinstance(dataset, dict) or not isinstance(dataset.get("summary"), dict):
@@ -47,6 +49,10 @@ def _plan_summary(plan: object) -> dict[str, Any] | None:
     }
     if "viral_type" in options:
         value["viral_type"] = options["viral_type"]
+    if "excluded_stages" in options:
+        value["excluded_stages"] = options["excluded_stages"]
+    if "capability_parameters" in options:
+        value["capability_parameters"] = options["capability_parameters"]
     routing = _routing_summary(plan.get("routing"))
     if routing:
         value["routing"] = routing
@@ -67,4 +73,5 @@ def build_conversation_context(
         "routing": _routing_summary(routing),
         "dataset": _dataset_summary(dataset),
         "plan": _plan_summary(plan),
+        "capability_catalog": capability_catalog(),
     }

@@ -70,8 +70,12 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             routing=overrides.get("routing", {"mode": "standard"}),
         )
 
-    def test_six_goals_map_to_fixed_deliverables(self):
+    def test_public_goals_map_to_fixed_deliverables(self):
         inputs = {
+            "read_qc": dataset(RAW),
+            "rrna_filter": dataset(RAW),
+            "sample_merge": dataset(RAW),
+            "assembly": dataset(RAW),
             "contig_filter": dataset(RAW),
             "virus_summary": dataset(CONTIGS),
             "host_summary": dataset(RAW, CONTIGS),
@@ -83,6 +87,119 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(goal=goal):
                 plan = self.compile(inputs[goal], [goal])
                 self.assertEqual(plan["execution_spec"]["deliverables"], [goal])
+
+    def test_workflow1_terminal_goals_compile_minimal_prefixes(self):
+        expected = {
+            "read_qc": ["read_qc"],
+            "rrna_filter": ["read_qc", "rrna_filter"],
+            "sample_merge": ["read_qc", "rrna_filter", "sample_merge"],
+            "assembly": ["read_qc", "rrna_filter", "sample_merge", "assembly"],
+            "contig_filter": [
+                "read_qc",
+                "rrna_filter",
+                "sample_merge",
+                "assembly",
+                "contig_filter",
+            ],
+        }
+        for goal, stages in expected.items():
+            with self.subTest(goal=goal):
+                plan = self.compile(dataset(RAW), [goal])
+                self.assertEqual(
+                    [stage["id"] for stage in plan["execution_spec"]["stages"]],
+                    stages,
+                )
+
+    def test_excluded_stage_conflict_is_structured(self):
+        with self.assertRaises(PlannerError) as raised:
+            self.compile(
+                dataset(RAW),
+                ["contig_filter"],
+                options={
+                    "viral_type": "RNA+DNA",
+                    "excluded_stages": ["assembly"],
+                },
+            )
+        self.assertEqual(raised.exception.code, "PATCH_DEPENDENCY_CONFLICT")
+
+        plan = self.compile(
+            dataset(CONTIGS),
+            ["virus_summary"],
+            options={
+                "viral_type": "RNA+DNA",
+                "excluded_stages": ["assembly"],
+            },
+        )
+        self.assertNotIn("assembly", [stage["id"] for stage in plan["steps"]])
+
+    def test_fastp_parameters_are_normalized_and_must_apply(self):
+        selection = {
+            "capability_id": "workflow1.read_qc.fastp",
+            "manifest_version": 1,
+            "preset_id": "workflow_default",
+            "values": {"length_required": 50, "detect_adapter_for_pe": True},
+        }
+        plan = self.compile(
+            dataset(RAW),
+            ["read_qc"],
+            options={
+                "viral_type": "RNA+DNA",
+                "capability_parameters": [selection],
+            },
+        )
+        self.assertEqual(
+            plan["options"]["capability_parameters"][0]["values"],
+            {"detect_adapter_for_pe": True, "length_required": 50},
+        )
+        self.assertEqual(
+            plan["execution_spec"]["capability_contract"],
+            {
+                "adapter_version": 1,
+                "manifests": [
+                    {
+                        "capability_id": "workflow1.read_qc.fastp",
+                        "manifest_version": 1,
+                        "preset_id": "workflow_default",
+                        "effective_values": {
+                            "detect_adapter_for_pe": True,
+                            "length_required": 50,
+                        },
+                    }
+                ],
+            },
+        )
+        with self.assertRaises(PlannerError) as inapplicable:
+            self.compile(
+                dataset(CONTIGS),
+                ["virus_summary"],
+                options={
+                    "viral_type": "RNA+DNA",
+                    "capability_parameters": [selection],
+                },
+            )
+        self.assertEqual(inapplicable.exception.code, "PARAMETER_NOT_APPLICABLE")
+        invalid = {**selection, "values": {"length_required": 0}}
+        with self.assertRaises(PlannerError) as out_of_range:
+            self.compile(
+                dataset(RAW),
+                ["read_qc"],
+                options={
+                    "viral_type": "RNA+DNA",
+                    "capability_parameters": [invalid],
+                },
+            )
+        self.assertEqual(out_of_range.exception.code, "PARAMETER_OUT_OF_RANGE")
+        unknown = {**selection, "values": {"raw_cli": "--output /tmp/x"}}
+        with self.assertRaises(PlannerError) as unknown_parameter:
+            self.compile(
+                dataset(RAW),
+                ["read_qc"],
+                options={
+                    "viral_type": "RNA+DNA",
+                    "capability_parameters": [unknown],
+                },
+            )
+        self.assertEqual(unknown_parameter.exception.code, "PARAMETER_UNKNOWN")
 
     def test_multiple_goals_share_upstream_and_ignore_unused_artifacts(self):
         plan = self.compile(dataset(RAW, CONTIGS), ["virus_summary", "microbe_summary"])

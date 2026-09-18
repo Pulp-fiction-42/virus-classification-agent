@@ -131,7 +131,7 @@ rule merge:
         }[exit_rule]
         execution_spec = normalize_execution_spec(
             {
-                "version": 2,
+                "version": 3,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -207,7 +207,7 @@ rule merge:
     def _contig_spec(path: Path, viral_type: str = "RNA+DNA") -> dict:
         return normalize_execution_spec(
             {
-                "version": 2,
+                "version": 3,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -237,7 +237,7 @@ rule merge:
         read2.write_text("@read/2\nTG\n+\nII\n", encoding="utf-8")
         execution_spec = normalize_execution_spec(
             {
-                "version": 2,
+                "version": 3,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -342,7 +342,10 @@ rule merge:
 
     def test_auto_high_and_low_confidence_publish_preliminary_then_run_full(self):
         for high_confidence, selected_route in ((True, "A"), (False, "B")):
-            with self.subTest(high_confidence=high_confidence), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(high_confidence=high_confidence),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 state_path = self._write_adaptive_state(
                     Path(temp_dir) / "run", mode="auto"
                 )
@@ -466,7 +469,8 @@ rule merge:
 
             with (
                 patch(
-                    "analysis_runner.ResourceCalibrator.history_summary", return_value={}
+                    "analysis_runner.ResourceCalibrator.history_summary",
+                    return_value={},
                 ),
                 patch(
                     "analysis_runner.collect_resource_snapshot",
@@ -481,7 +485,9 @@ rule merge:
             self.assertEqual(returncode, 7)
             self.assertTrue(state["reports"]["preliminary"]["available"])
             self.assertFalse(state["reports"]["final"]["available"])
-            self.assertTrue((state_path.parent / "preliminary-telemetry.json").is_file())
+            self.assertTrue(
+                (state_path.parent / "preliminary-telemetry.json").is_file()
+            )
 
     def test_route_b_resource_failure_is_blocked_without_queueing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -953,9 +959,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     ["fastp", "bowtie2", "merge"],
                 )
                 self.assertTrue(state["technical_report"]["available"])
-                self.assertEqual(
-                    state["reports"]["final"]["available"], exit_code == 0
-                )
+                self.assertEqual(state["reports"]["final"]["available"], exit_code == 0)
                 self.assertEqual(state["reports"]["final"]["schema_version"], 4)
                 self.assertEqual(
                     telemetry["delivery_report"]["schema_version"],
@@ -1308,7 +1312,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             ]
             execution_spec = normalize_execution_spec(
                 {
-                    "version": 2,
+                    "version": 3,
                     "adapter": "analysis_pipeline",
                     "inputs": [
                         {
@@ -1479,7 +1483,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     }
                 execution_spec = normalize_execution_spec(
                     {
-                        "version": 2,
+                        "version": 3,
                         "adapter": "analysis_pipeline",
                         "inputs": [
                             {
@@ -1536,7 +1540,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             state = {
                 "execution_spec": normalize_execution_spec(
                     {
-                        "version": 2,
+                        "version": 3,
                         "adapter": "analysis_pipeline",
                         "inputs": [
                             {

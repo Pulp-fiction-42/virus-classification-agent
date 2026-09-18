@@ -59,35 +59,41 @@ class ResourceCalibrationTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def workflow1_spec(self) -> dict:
-        return normalize_execution_spec({
-            "version": 2,
-            "adapter": "analysis_pipeline",
-            "inputs": [
-                {
-                    "id": "primary",
-                    "type": "raw_paired_reads",
-                    "records": [{
-                        "run_id": "run",
-                        "sample_id": "sample",
-                        "files": {
-                            "read1": str(self.read1),
-                            "read2": str(self.read2),
-                        },
-                    }],
-                }
-            ],
-            "deliverables": ["rrna_filter"],
-            "policy": {"mode": "standard"},
-        })
+        return normalize_execution_spec(
+            {
+                "version": 3,
+                "adapter": "analysis_pipeline",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "raw_paired_reads",
+                        "records": [
+                            {
+                                "run_id": "run",
+                                "sample_id": "sample",
+                                "files": {
+                                    "read1": str(self.read1),
+                                    "read2": str(self.read2),
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "deliverables": ["rrna_filter"],
+                "policy": {"mode": "standard"},
+            }
+        )
 
     def classification_spec(self) -> dict:
         raw = self.workflow1_spec()
-        return normalize_execution_spec({
-            **raw,
-            "deliverables": ["virus_summary"],
-            "options": {"viral_type": "RNA"},
-            "policy": {"mode": "standard"},
-        })
+        return normalize_execution_spec(
+            {
+                **raw,
+                "deliverables": ["virus_summary"],
+                "options": {"viral_type": "RNA"},
+                "policy": {"mode": "standard"},
+            }
+        )
 
     def record(
         self,

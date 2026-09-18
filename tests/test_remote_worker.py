@@ -161,6 +161,37 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         )
         return path
 
+    def test_launch_revalidates_execution_spec_before_queueing(self):
+        with self.assertRaisesRegex(
+            remote_worker.WorkerError, "execution spec is invalid"
+        ):
+            remote_worker.launch(
+                {
+                    "settings": self.settings,
+                    "run_id": "analysis-forged",
+                    "worker_version": "abc",
+                    "chat_id": "chat",
+                    "dataset": {"status": "ready", "artifacts": []},
+                    "plan": {
+                        "execution_spec": {
+                            "version": 3,
+                            "adapter": "analysis_pipeline",
+                            "options": {
+                                "capability_parameters": [
+                                    {
+                                        "capability_id": "workflow1.read_qc.fastp",
+                                        "manifest_version": 1,
+                                        "preset_id": "workflow_default",
+                                        "values": {"raw_cli": "--output /tmp/x"},
+                                    }
+                                ]
+                            },
+                        },
+                        "steps": [],
+                    },
+                }
+            )
+
     def test_missing_queued_session_is_relaunched(self):
         run_id = "analysis-queued"
         self._state(run_id, "queued")
@@ -243,7 +274,9 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         result = remote_worker.delivery_artifact(
             {"settings": self.settings, "run_dir": str(run_dir), "format": "html"}
         )
-        self.assertEqual(base64.b64decode(result["content_base64"]), report.read_bytes())
+        self.assertEqual(
+            base64.b64decode(result["content_base64"]), report.read_bytes()
+        )
 
         report.write_bytes(b"tampered")
         with self.assertRaises(remote_worker.WorkerError):
@@ -288,7 +321,9 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
                 }
             )
 
-        state["standard_delivery"]["artifacts"]["html"]["path"] = "../outside/report.html"
+        state["standard_delivery"]["artifacts"]["html"]["path"] = (
+            "../outside/report.html"
+        )
         state_path.write_text(json.dumps(state), encoding="utf-8")
         with self.assertRaises(remote_worker.WorkerError):
             remote_worker.delivery_artifact(

@@ -9,18 +9,26 @@ from typing import Any
 from adaptive_routing import normalize_routing_request
 from workflow_catalog import (
     ARTIFACTS,
+    CAPABILITY_MANIFESTS,
     PAIRED_READ_TYPES,
     PRODUCER_BY_ARTIFACT,
     STAGE_BY_ID,
     STAGE_ORDER,
+    WORKFLOW_ADAPTER_VERSION,
+    normalize_capability_parameters,
     stage_rules,
 )
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+EXECUTION_SPEC_VERSION = 3
 
 
 class ExecutionSpecError(ValueError):
     """Raised when an execution spec cannot be validated or compiled."""
+
+    def __init__(self, message: str, *, code: str = "PLAN_INPUT_INVALID") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _required_id(value: Any, field: str) -> str:
@@ -86,10 +94,55 @@ def _normalize_input(raw: Any, index: int) -> dict[str, Any]:
 
 def _normalize_options(raw: Any) -> dict[str, Any]:
     value = raw if isinstance(raw, dict) else {}
+    unsupported = set(value) - {
+        "viral_type",
+        "excluded_stages",
+        "capability_parameters",
+    }
+    if unsupported:
+        raise ExecutionSpecError(
+            "unsupported analysis options: " + ", ".join(sorted(unsupported)),
+            code="PARAMETER_UNKNOWN",
+        )
     viral_type = value.get("viral_type", "RNA+DNA")
     if viral_type not in {"RNA", "DNA", "RNA+DNA"}:
         raise ExecutionSpecError("options.viral_type must be RNA, DNA, or RNA+DNA")
-    return {"viral_type": viral_type}
+    excluded = value.get("excluded_stages") or []
+    if not isinstance(excluded, list) or any(
+        not isinstance(stage_id, str) for stage_id in excluded
+    ):
+        raise ExecutionSpecError(
+            "options.excluded_stages must be a list of stage IDs",
+            code="PATCH_DEPENDENCY_CONFLICT",
+        )
+    if len(excluded) != len(set(excluded)):
+        raise ExecutionSpecError(
+            "options.excluded_stages must not contain duplicates",
+            code="PATCH_DEPENDENCY_CONFLICT",
+        )
+    unknown_stages = set(excluded) - set(STAGE_BY_ID)
+    if unknown_stages:
+        raise ExecutionSpecError(
+            "unknown excluded analysis stage: " + ", ".join(sorted(unknown_stages)),
+            code="PATCH_DEPENDENCY_CONFLICT",
+        )
+    try:
+        parameters = normalize_capability_parameters(value.get("capability_parameters"))
+    except ValueError as exc:
+        message = str(exc)
+        code = (
+            "CAPABILITY_VERSION_UNAVAILABLE"
+            if "version is unavailable" in message
+            else "PARAMETER_OUT_OF_RANGE"
+            if "outside the allowed range" in message
+            else "PARAMETER_UNKNOWN"
+        )
+        raise ExecutionSpecError(message, code=code) from exc
+    return {
+        "viral_type": viral_type,
+        "excluded_stages": sorted(excluded, key=STAGE_ORDER.__getitem__),
+        "capability_parameters": parameters,
+    }
 
 
 def _choose_requirement(
@@ -176,6 +229,21 @@ def _compile(
     for deliverable in deliverables:
         _select_stage(deliverable, available, selected, bindings, set())
 
+    excluded_required = set(options["excluded_stages"]) & selected
+    if excluded_required:
+        raise ExecutionSpecError(
+            "excluded analysis stage is required by the selected deliverables: "
+            + ", ".join(sorted(excluded_required, key=STAGE_ORDER.__getitem__)),
+            code="PATCH_DEPENDENCY_CONFLICT",
+        )
+    for selection in options["capability_parameters"]:
+        manifest = CAPABILITY_MANIFESTS[selection["capability_id"]]
+        if manifest.stage_id not in selected:
+            raise ExecutionSpecError(
+                f"capability parameters are not applicable because {manifest.stage_id} is not selected",
+                code="PARAMETER_NOT_APPLICABLE",
+            )
+
     ordered = sorted(selected, key=STAGE_ORDER.__getitem__)
     produced_by = {STAGE_BY_ID[stage_id].produces: stage_id for stage_id in ordered}
     stages: list[dict[str, Any]] = []
@@ -230,8 +298,13 @@ def _validate_sample_alignment(
 def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ExecutionSpecError("missing execution_spec")
-    if raw.get("adapter") != "analysis_pipeline" or raw.get("version") != 2:
-        raise ExecutionSpecError("execution_spec must use analysis_pipeline version 2")
+    if (
+        raw.get("adapter") != "analysis_pipeline"
+        or raw.get("version") != EXECUTION_SPEC_VERSION
+    ):
+        raise ExecutionSpecError(
+            f"execution_spec must use analysis_pipeline version {EXECUTION_SPEC_VERSION}"
+        )
 
     raw_inputs = raw.get("inputs")
     if not isinstance(raw_inputs, list) or not raw_inputs:
@@ -258,6 +331,43 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
 
     options = _normalize_options(raw.get("options"))
     stages, used_types = _compile(inputs, deliverables, options)
+    selected_stage_ids = {stage["id"] for stage in stages}
+    capability_contract = {
+        "adapter_version": WORKFLOW_ADAPTER_VERSION,
+        "manifests": [
+            {
+                "capability_id": manifest.id,
+                "manifest_version": manifest.version,
+                "preset_id": next(
+                    (
+                        item["preset_id"]
+                        for item in options["capability_parameters"]
+                        if item["capability_id"] == manifest.id
+                    ),
+                    "workflow_default",
+                ),
+                "effective_values": next(
+                    (
+                        item["values"]
+                        for item in options["capability_parameters"]
+                        if item["capability_id"] == manifest.id
+                    ),
+                    {},
+                ),
+            }
+            for manifest in CAPABILITY_MANIFESTS.values()
+            if manifest.stage_id in selected_stage_ids
+        ],
+    }
+    if (
+        not allow_unused_inputs
+        and raw.get("capability_contract") is not None
+        and raw.get("capability_contract") != capability_contract
+    ):
+        raise ExecutionSpecError(
+            "execution_spec capability contract is unavailable",
+            code="CAPABILITY_VERSION_UNAVAILABLE",
+        )
     unused = [item["id"] for item in inputs if item["type"] not in used_types]
     if unused and not allow_unused_inputs:
         raise ExecutionSpecError("unused execution inputs: " + ", ".join(unused))
@@ -308,11 +418,12 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
         ),
     }
     return {
-        "version": 2,
+        "version": EXECUTION_SPEC_VERSION,
         "adapter": "analysis_pipeline",
         "inputs": inputs,
         "deliverables": deliverables,
         "options": options,
+        "capability_contract": capability_contract,
         "policy": policy,
         "stages": stages,
     }

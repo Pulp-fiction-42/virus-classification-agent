@@ -6,21 +6,18 @@ import re
 from typing import Any
 
 from pipeline_spec import (
+    EXECUTION_SPEC_VERSION,
     ExecutionSpecError,
     canonical_steps,
     compile_execution_spec,
     normalize_execution_spec,
     validate_plan_rules,
 )
+from workflow_catalog import PUBLIC_DELIVERABLES
 
-PLANNER_VERSION = 2
+PLANNER_VERSION = 3
 GOAL_LABELS = {
-    "contig_filter": "质控与组装",
-    "virus_summary": "病毒识别",
-    "host_summary": "宿主识别",
-    "microbe_summary": "微生物谱",
-    "virus_rpm": "病毒定量",
-    "annotation_delivery": "病毒注释",
+    goal_id: metadata["label"] for goal_id, metadata in PUBLIC_DELIVERABLES.items()
 }
 GOAL_ORDER = tuple(GOAL_LABELS)
 VIRAL_TYPES = {"RNA", "DNA", "RNA+DNA"}
@@ -30,6 +27,10 @@ RUN_ID_RE = re.compile(r"^analysis-[A-Za-z0-9_.-]+$")
 
 class PlannerError(ValueError):
     """Raised when structured planning input is invalid."""
+
+    def __init__(self, message: str, *, code: str = "PLAN_INPUT_INVALID") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _dataset_inputs(dataset: dict[str, Any]) -> list[dict[str, Any]]:
@@ -81,12 +82,17 @@ def _normalize_goals(raw: Any) -> list[str]:
     return [goal for goal in GOAL_ORDER if goal in raw]
 
 
-def _normalize_options(raw: Any) -> dict[str, str]:
+def _normalize_options(raw: Any) -> dict[str, Any]:
     value = raw if isinstance(raw, dict) else {}
     viral_type = value.get("viral_type", "RNA+DNA")
     if viral_type not in VIRAL_TYPES:
         raise PlannerError("viral_type must be RNA, DNA, or RNA+DNA")
-    return {"viral_type": viral_type}
+    return {
+        **value,
+        "viral_type": viral_type,
+        "excluded_stages": value.get("excluded_stages") or [],
+        "capability_parameters": value.get("capability_parameters") or [],
+    }
 
 
 def _normalize_routing(raw: Any) -> dict[str, Any]:
@@ -148,15 +154,14 @@ class DeterministicPlanner:
         disabled = set(normalized_goals) - set(self.enabled_goals)
         if disabled:
             raise PlannerError(
-                "analysis goal is not enabled: "
-                + ", ".join(sorted(disabled))
+                "analysis goal is not enabled: " + ", ".join(sorted(disabled))
             )
         normalized_options = _normalize_options(options)
         normalized_routing = _normalize_routing(routing)
         try:
             execution_spec = compile_execution_spec(
                 {
-                    "version": 2,
+                    "version": EXECUTION_SPEC_VERSION,
                     "adapter": "analysis_pipeline",
                     "inputs": _dataset_inputs(dataset),
                     "deliverables": normalized_goals,
@@ -165,7 +170,9 @@ class DeterministicPlanner:
                 }
             )
         except ExecutionSpecError as exc:
-            raise PlannerError(str(exc)) from exc
+            raise PlannerError(str(exc), code=exc.code) from exc
+
+        normalized_options = execution_spec["options"]
 
         steps = canonical_steps(execution_spec)
         labels = [GOAL_LABELS[goal] for goal in normalized_goals]

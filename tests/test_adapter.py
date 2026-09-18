@@ -131,6 +131,14 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["conversation_model"]["id"], "BioAgent")
         self.assertEqual(result["knowledge"]["status"], "unavailable")
 
+    async def test_capability_catalog_is_public_and_path_free(self):
+        result = await adapter.analysis_capabilities()
+        self.assertIn("read_qc", {item["id"] for item in result["deliverables"]})
+        fastp = result["capabilities"][0]
+        self.assertEqual(fastp["id"], "workflow1.read_qc.fastp")
+        self.assertEqual(fastp["version"], 1)
+        self.assertNotIn("path", json.dumps(result).lower())
+
     async def test_start_api_forwards_backend_owned_run_reference(self):
         fake = FakePlanner()
         adapter.planner = fake

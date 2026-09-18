@@ -29,6 +29,7 @@ from remote_client import (
     RemoteWorkerClient,
 )
 from runtime_errors import ConversationPublicError, SessionStateError
+from workflow_catalog import capability_catalog
 
 app = FastAPI()
 remote_worker = RemoteWorkerClient()
@@ -237,7 +238,9 @@ async def analysis_health():
         },
         "conversation_model": {
             "id": "BioAgent",
-            "status": "ready" if config.MODEL_POLICY == "minimax_explicit" and config.MINIMAX_API_KEY else "unavailable",
+            "status": "ready"
+            if config.MODEL_POLICY == "minimax_explicit" and config.MINIMAX_API_KEY
+            else "unavailable",
             "provider": config.MODEL,
             "policy": config.MODEL_POLICY,
         },
@@ -248,6 +251,12 @@ async def analysis_health():
         },
         "execution": remote,
     }
+
+
+@app.get("/v1/analysis/capabilities")
+@app.get("/analysis/capabilities")
+async def analysis_capabilities():
+    return capability_catalog()
 
 
 def _remote_required() -> RemoteWorkerClient:
@@ -336,10 +345,15 @@ async def remote_analysis_delivery_report(run_dir: str, format: Literal["html", 
     try:
         content = base64.b64decode(result["content_base64"], validate=True)
     except (KeyError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="Cyclone returned an invalid report artifact") from exc
+        raise HTTPException(
+            status_code=502, detail="Cyclone returned an invalid report artifact"
+        ) from exc
     return Response(
         content=content,
-        media_type=str(result.get("media_type") or ("application/pdf" if format == "pdf" else "text/html; charset=utf-8")),
+        media_type=str(
+            result.get("media_type")
+            or ("application/pdf" if format == "pdf" else "text/html; charset=utf-8")
+        ),
         headers={"X-Content-Type-Options": "nosniff"},
     )
 
@@ -368,7 +382,10 @@ async def compile_analysis_plan(req: CompilePlanRequest):
             routing=req.routing,
         )
     except PlannerError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": str(exc), "retryable": False},
+        ) from exc
 
 
 @app.post("/v1/analysis/runs/start")

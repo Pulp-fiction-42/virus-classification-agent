@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-import unittest
 import json
+import unittest
 from pathlib import Path
 
 import config
 from conversation_contract import (
     ConversationContractError,
     KnowledgeInsufficientError,
+    RetrievalRequest,
     parse_conversation_action,
     proposal_output,
-    RetrievalRequest,
     validate_conversation_action,
 )
 from taxonagent_adapter import TaxonAgentRetrievalAdapter, taxonagent_citation
 
 
 class ConversationContractTests(unittest.IsolatedAsyncioTestCase):
-    def test_prompt_keeps_unsupported_qc_only_outside_fixed_goals(self):
-        self.assertIn("quality control only", config.SYSTEM_PROMPT)
-        self.assertIn("six fixed goals", config.SYSTEM_PROMPT)
+    def test_prompt_supports_controlled_qc_and_requires_explicit_values(self):
+        self.assertIn('goals=["read_qc"]', config.SYSTEM_PROMPT)
+        self.assertIn("exact value", config.SYSTEM_PROMPT)
+        self.assertIn("dependency conflict", config.SYSTEM_PROMPT)
 
     def test_accepts_all_actions(self):
         respond = parse_conversation_action(
@@ -37,14 +38,55 @@ class ConversationContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clarify.action, "clarify")
         self.assertEqual(proposal_output(patch)["patch"]["viral_type"], "RNA")
 
+        qc = validate_conversation_action(
+            {
+                "action": "propose_patch",
+                "message": "只做质控。",
+                "proposed_patch": {"goals": ["read_qc"]},
+                "citations": [],
+            }
+        )
+        fastp = validate_conversation_action(
+            {
+                "action": "propose_patch",
+                "message": "把最短保留长度改为 50 bp。",
+                "proposed_patch": {
+                    "capability_parameters": [
+                        {
+                            "capability_id": "workflow1.read_qc.fastp",
+                            "manifest_version": 1,
+                            "preset_id": "workflow_default",
+                            "values": {"length_required": 50},
+                        }
+                    ]
+                },
+                "citations": [],
+            }
+        )
+        self.assertEqual(qc.proposed_patch.goals, ["read_qc"])
+        self.assertEqual(
+            fastp.proposed_patch.capability_parameters[0].values,
+            {"length_required": 50},
+        )
+
     def test_rejects_forbidden_patch_fields_and_invalid_envelopes(self):
         values = [
             "plain text",
             '```conversation_action\n{"action":"unknown","message":"x"}\n```',
-            "```conversation_action\n"
-            '{"action":"propose_patch","message":"x","proposed_patch":{"mode":"emergency"}}\n```',
-            "```conversation_action\n"
-            '{"action":"propose_patch","message":"x","proposed_patch":{"goals":["unknown"]}}\n```',
+            (
+                "```conversation_action\n"
+                '{"action":"propose_patch","message":"x","proposed_patch":{"mode":"emergency"}}\n```'
+            ),
+            (
+                "```conversation_action\n"
+                '{"action":"propose_patch","message":"x","proposed_patch":{"goals":["unknown"]}}\n```'
+            ),
+            (
+                "```conversation_action\n"
+                '{"action":"propose_patch","message":"x","proposed_patch":{"capability_parameters":['
+                '{"capability_id":"workflow1.read_qc.fastp","manifest_version":1,'
+                '"values":{"command":"rm"}}]}}\n```'
+            ),
         ]
         for value in values:
             with (

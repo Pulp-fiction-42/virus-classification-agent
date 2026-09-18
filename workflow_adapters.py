@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,11 @@ from pipeline_spec import (
     normalize_execution_spec,
     selected_rules,
     validate_plan_rules,
+)
+from workflow_catalog import (
+    FASTP_CAPABILITY_ID,
+    capability_parameter_arguments,
+    capability_parameter_values,
 )
 
 WORKFLOW1_RULES = (
@@ -82,6 +88,7 @@ class AdapterSettings:
     snakemake: str
     seqkit: str
     cores: int
+    python: str = sys.executable
     workflow3_source: Path = Path(
         "/data/user/guojindan/Projects/Workflows/workflow3_hostid"
     )
@@ -303,19 +310,131 @@ def _prepare_workflow1_inputs(
     return list(dict.fromkeys(run_ids)), list(dict.fromkeys(sample_ids))
 
 
+def _write_fastp_wrapper(
+    workflow_dir: Path,
+    *,
+    python: str,
+    executable: str,
+    arguments: tuple[str, ...],
+    values: dict[str, int | bool],
+) -> Path:
+    wrapper = workflow_dir / ".bioagent" / "fastp-wrapper"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    flag_variants = {
+        "length_required": (("--length_required", True), ("-l", True)),
+        "qualified_quality_phred": (
+            ("--qualified_quality_phred", True),
+            ("-q", True),
+        ),
+        "unqualified_percent_limit": (
+            ("--unqualified_percent_limit", True),
+            ("-u", True),
+        ),
+        "n_base_limit": (("--n_base_limit", True), ("-n", True)),
+        "average_qual": (("--average_qual", True), ("-e", True)),
+        "detect_adapter_for_pe": (
+            ("--detect_adapter_for_pe", False),
+            ("-2", False),
+        ),
+    }
+    managed = {
+        flag: takes_value
+        for parameter_id in values
+        for flag, takes_value in flag_variants[parameter_id]
+    }
+    wrapper.write_text(
+        "\n".join(
+            [
+                f"#!{python}",
+                "import os",
+                "import sys",
+                f"EXECUTABLE = {executable!r}",
+                f"MANAGED = {dict(sorted(managed.items()))!r}",
+                f"EXTRA = {list(arguments)!r}",
+                "args = sys.argv[1:]",
+                "kept = []",
+                "index = 0",
+                "while index < len(args):",
+                "    argument = args[index]",
+                "    key = argument.split('=', 1)[0]",
+                "    takes_value = MANAGED.get(key)",
+                "    if key in MANAGED:",
+                "        index += 2 if takes_value and '=' not in argument else 1",
+                "        continue",
+                "    kept.append(argument)",
+                "    index += 1",
+                "os.execv(EXECUTABLE, [EXECUTABLE, *kept, *EXTRA])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    return wrapper
+
+
+def _yaml_scalar(line: str) -> str:
+    value = line.split(":", 1)[1].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    return value
+
+
 def _rewrite_workflow1_config(
-    workflow_dir: Path, results_dir: Path, *, seqkit: str
+    workflow_dir: Path,
+    results_dir: Path,
+    *,
+    seqkit: str,
+    python: str = sys.executable,
+    fastp_arguments: tuple[str, ...] = (),
+    fastp_values: dict[str, int | bool] | None = None,
 ) -> Path:
     config_path = workflow_dir / "config" / "config.yaml"
+    source_lines = config_path.read_text(encoding="utf-8").splitlines()
+    software_lines: set[int] = set()
+    in_software = False
+    for index, line in enumerate(source_lines):
+        if line and not line[0].isspace():
+            in_software = line.strip() == "software:"
+        elif in_software and line.strip():
+            software_lines.add(index)
+    fastp_executable = next(
+        (
+            _yaml_scalar(source_lines[index])
+            for index in software_lines
+            if source_lines[index].strip().startswith("fastp:")
+        ),
+        None,
+    )
+    if fastp_values and not fastp_executable:
+        raise ExecutionSpecError("workflow1 fastp executable is not configured")
+    fastp_wrapper = (
+        _write_fastp_wrapper(
+            workflow_dir,
+            python=python,
+            executable=str(fastp_executable),
+            arguments=fastp_arguments,
+            values=fastp_values,
+        )
+        if fastp_values
+        else None
+    )
     lines = []
-    for line in config_path.read_text(encoding="utf-8").splitlines():
+    for index, line in enumerate(source_lines):
         if line.startswith("sample_list:"):
             lines.append(f'sample_list: "{workflow_dir / "data" / "samples.txt"}"')
         elif line.startswith("output_dir:"):
             lines.append(f'output_dir: "{results_dir}"')
-        elif line.strip().startswith("seqkit:"):
+        elif index in software_lines and line.strip().startswith("seqkit:"):
             indent = line[: len(line) - len(line.lstrip())]
             lines.append(f'{indent}seqkit: "{seqkit}"')
+        elif (
+            fastp_wrapper
+            and index in software_lines
+            and line.strip().startswith("fastp:")
+        ):
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(f'{indent}fastp: "{fastp_wrapper}"')
         else:
             lines.append(line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -415,6 +534,8 @@ def _prepare_workflow1_phase(
     *,
     phase_id: str = "upstream",
     phase_rules: tuple[str, ...] = (),
+    fastp_arguments: tuple[str, ...] = (),
+    fastp_values: dict[str, int | bool] | None = None,
 ) -> tuple[PreparedPhase, list[str]]:
     workflow_dir = run_dir / "workflows" / phase_id
     results_dir = run_dir / "results" / phase_id
@@ -422,7 +543,12 @@ def _prepare_workflow1_phase(
     _copy_workflow(settings.workflow1_source, workflow_dir)
     run_ids, sample_ids = _prepare_workflow1_inputs(spec, workflow_dir, results_dir)
     config_path = _rewrite_workflow1_config(
-        workflow_dir, results_dir, seqkit=settings.seqkit
+        workflow_dir,
+        results_dir,
+        seqkit=settings.seqkit,
+        python=settings.python,
+        fastp_arguments=fastp_arguments,
+        fastp_values=fastp_values,
     )
     targets = _workflow1_targets(
         spec["exit_rule"],
@@ -626,6 +752,14 @@ def _prepare_pipeline_workflow1(
         run_dir,
         phase_id="upstream",
         phase_rules=_phase_rules(stages),
+        fastp_arguments=capability_parameter_arguments(
+            spec["options"].get("capability_parameters", []),
+            FASTP_CAPABILITY_ID,
+        ),
+        fastp_values=capability_parameter_values(
+            spec["options"].get("capability_parameters", []),
+            FASTP_CAPABILITY_ID,
+        ),
     )
     run_ids = [record.get("run_id", record["sample_id"]) for record in records]
     produced: dict[str, dict[str, Any]] = {}

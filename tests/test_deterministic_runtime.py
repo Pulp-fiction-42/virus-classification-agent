@@ -89,7 +89,7 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         spec = normalize_execution_spec(
             {
-                "version": 2,
+                "version": 3,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -170,7 +170,9 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
         state_path.write_text('{"sentinel":true}', encoding="utf-8")
         with self.assertRaisesRegex(SessionStateError, "不匹配"):
             await self.runtime.launch_deterministic_plan(plan, self.chat_id)
-        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), {"sentinel": True})
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8")), {"sentinel": True}
+        )
 
     async def test_launch_failure_is_terminal_and_visible(self):
         plan = self.plan()

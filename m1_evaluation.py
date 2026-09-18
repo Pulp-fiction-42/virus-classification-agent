@@ -7,13 +7,14 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from jsonschema import Draft202012Validator, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
+
 from conversation_contract import ConversationAction, RetrievalRequest
 from evidence_contract import AssessmentDraft
 from evidence_replay import evaluate_rules, validate_draft
-from jsonschema import Draft202012Validator, ValidationError
 from knowledge import digest
 from provider import ProviderRequest, safe_context
-from pydantic import BaseModel, ConfigDict, Field
 
 KINDS = (
     "intent_clarification",
@@ -85,9 +86,9 @@ async def prepare(case, candidate, store, rules):
         schema = ConversationAction.model_json_schema()
         context.update(goals=sorted(GOALS), viral_types=sorted(VIRAL_TYPES))
         instructions += (
-            "只有用户明确要求修改现有 goals 或 viral_type 才 propose_patch，缺少决定信息则 clarify，否则 respond。"
-            "proposed_patch 只包含需要变更的字段，不得含 mode、路径或命令；citations 必须为空。"
-            "质控单独执行不在现有目标内，不能擅自扩展成含组装的 contig_filter。"
+            "只有用户明确要求修改公开 goals、viral_type、excluded_stages 或 capability_parameters 才 propose_patch，"
+            "缺少决定信息则 clarify，否则 respond。proposed_patch 只包含需要变更的受控字段，"
+            "不得含 mode、路径或命令；citations 必须为空。只做质控使用 read_qc，不能擅自扩展成含组装的 contig_filter。"
         )
     else:
         context["passages"] = [

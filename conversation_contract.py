@@ -10,18 +10,26 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-GOALS = {
-    "contig_filter",
-    "virus_summary",
-    "host_summary",
-    "microbe_summary",
-    "virus_rpm",
-    "annotation_delivery",
-}
+from workflow_catalog import (
+    PUBLIC_DELIVERABLE_IDS,
+    STAGE_BY_ID,
+    normalize_capability_parameters,
+)
+
+GOALS = set(PUBLIC_DELIVERABLE_IDS)
 VIRAL_TYPES = {"RNA", "DNA", "RNA+DNA"}
 ACTION_BLOCK_RE = re.compile(
     r"^\s*```conversation_action\s*([\s\S]*?)```\s*$", re.IGNORECASE
 )
+
+
+class CapabilityParameterPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability_id: str
+    manifest_version: int
+    preset_id: str = "workflow_default"
+    values: dict[str, int | bool] = Field(default_factory=dict)
 
 
 class ProposedPatch(BaseModel):
@@ -29,6 +37,8 @@ class ProposedPatch(BaseModel):
 
     goals: list[str] | None = None
     viral_type: str | None = None
+    excluded_stages: list[str] | None = None
+    capability_parameters: list[CapabilityParameterPatch] | None = None
 
     @model_validator(mode="after")
     def validate_values(self) -> ProposedPatch:
@@ -39,6 +49,15 @@ class ProposedPatch(BaseModel):
                 raise ValueError("proposed_patch contains an unsupported goal")
         if self.viral_type is not None and self.viral_type not in VIRAL_TYPES:
             raise ValueError("viral_type must be RNA, DNA, or RNA+DNA")
+        if self.excluded_stages is not None:
+            if len(self.excluded_stages) != len(set(self.excluded_stages)):
+                raise ValueError("excluded_stages must be unique")
+            if any(stage_id not in STAGE_BY_ID for stage_id in self.excluded_stages):
+                raise ValueError("excluded_stages contains an unsupported stage")
+        if self.capability_parameters is not None:
+            normalize_capability_parameters(
+                [value.model_dump() for value in self.capability_parameters]
+            )
         return self
 
 
@@ -55,6 +74,8 @@ class ConversationAction(BaseModel):
         patch_is_empty = self.proposed_patch is None or (
             self.proposed_patch.goals is None
             and self.proposed_patch.viral_type is None
+            and self.proposed_patch.excluded_stages is None
+            and self.proposed_patch.capability_parameters is None
         )
         if self.action == "propose_patch" and patch_is_empty:
             raise ValueError("propose_patch requires proposed_patch")
@@ -127,7 +148,11 @@ def action_trace_output(
     return {
         "type": "conversation_action_trace",
         "id": f"conversation_action_{uuid.uuid4().hex}",
-        "status": "rejected" if action and error_code else "completed" if action else "failed",
+        "status": "rejected"
+        if action and error_code
+        else "completed"
+        if action
+        else "failed",
         "schema_valid": action is not None,
         "action": action.action if action else None,
         "model": model,
