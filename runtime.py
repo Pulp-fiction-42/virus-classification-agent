@@ -59,11 +59,12 @@ class SessionManager:
             allow_cloud=config.MODEL_POLICY == "minimax_explicit"
         )
 
-    async def ensure_session(self, chat_id: str | None) -> None:
+    async def ensure_session(self, chat_id: str | None) -> str | None:
+        """Use persistent SDK sessions only for durable Open WebUI UUIDs."""
         try:
-            uuid.UUID(chat_id or "")
-        except (ValueError, AttributeError) as exc:
-            raise InvalidSessionError("A valid Open WebUI chat ID is required") from exc
+            return str(uuid.UUID(chat_id or ""))
+        except (ValueError, AttributeError):
+            return None
 
     async def stream_turn(
         self,
@@ -73,7 +74,7 @@ class SessionManager:
         dataset_context: dict | None = None,
         plan_context: dict | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
-        await self.ensure_session(chat_id)
+        conversation_id = await self.ensure_session(chat_id)
         history = _history(messages)
         latest = next(
             (item["content"] for item in reversed(history) if item["role"] == "user"),
@@ -102,7 +103,7 @@ class SessionManager:
                     ),
                 }
             ),
-            conversation_id=chat_id,
+            conversation_id=conversation_id,
             timeout_seconds=config.CONVERSATION_TIMEOUT_SECONDS,
         )
         result = await self.provider.generate(request)

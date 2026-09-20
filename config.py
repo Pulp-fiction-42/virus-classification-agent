@@ -5,10 +5,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODEL = "MiniMax-M3"
+CLAUDE_MODEL = "MiniMax-M3[1m]"
+CLAUDE_AGENT_SDK_VERSION = "0.2.103"
 MODEL_POLICY = os.getenv("BIOAGENT_MODEL_POLICY", "local_only")
 if MODEL_POLICY not in {"local_only", "minimax_explicit"}:
     raise ValueError("BIOAGENT_MODEL_POLICY must be local_only or minimax_explicit")
-ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic"
+ANTHROPIC_BASE_URL = "https://api.minimax.cn/anthropic"
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 CLAUDE_STATE_DIR = PROJECT_ROOT / ".claude" / "sessions"
 CONVERSATION_TIMEOUT_SECONDS = float(

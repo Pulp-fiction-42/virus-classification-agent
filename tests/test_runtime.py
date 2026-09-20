@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import uuid
 
-from conversation_events import InvalidSessionError, OutputItemAdded, TextDelta
+from conversation_events import OutputItemAdded, TextDelta
 from provider import ProviderResult
 from runtime import SessionManager
 from runtime_errors import ConversationPublicError
@@ -114,13 +114,27 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(raised.exception.code, code)
             self.assertIn("方案与执行功能不受影响", str(raised.exception))
 
-    async def test_session_validation_does_not_connect_model(self):
+    async def test_only_uuid_chat_ids_use_persistent_provider_sessions(self):
         provider = FakeProvider()
         manager = SessionManager(provider=provider)
-        await manager.ensure_session(str(uuid.uuid4()))
+        chat_id = str(uuid.uuid4())
+        self.assertEqual(await manager.ensure_session(chat_id), chat_id)
+        self.assertIsNone(await manager.ensure_session(None))
+        self.assertIsNone(await manager.ensure_session("local:socket-id"))
+        self.assertIsNone(await manager.ensure_session("../invalid"))
         self.assertEqual(provider.requests, [])
-        with self.assertRaises(InvalidSessionError):
-            await manager.ensure_session("../invalid")
+
+    async def test_missing_or_local_chat_id_uses_ephemeral_provider_session(self):
+        for chat_id in (None, "local:socket-id"):
+            provider = FakeProvider()
+            events = [
+                event
+                async for event in SessionManager(provider=provider).stream_turn(
+                    [{"role": "user", "content": "解释方案"}], chat_id
+                )
+            ]
+            self.assertTrue(any(isinstance(event, TextDelta) for event in events))
+            self.assertIsNone(provider.requests[0].conversation_id)
 
     async def test_background_task_has_no_persistent_session(self):
         provider = FakeProvider({"message": "标题"})

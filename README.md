@@ -36,13 +36,13 @@ Workflow 1 在 run root 建立副本时会把 run-local `config.yaml` 的 `softw
 
 远端 fingerprint 验证暂时不可用与指纹真实变化是不同状态：前者可重试且不会把 dataset 标记 stale，后者才会阻止规划或执行。
 
-不要把 `MINIMAX_API_KEY` 写入 `.env`；`start.sh` 由 login zsh 启动并从现有 shell 环境继承。
+不要把 `MINIMAX_API_KEY` 写入 `.env`；`start.sh` 由 login zsh 启动并从现有 shell 环境继承。依赖通过 `requirements.txt` 安装，其中固定 `claude-agent-sdk==0.2.103`（Claude Code 2.1.179）。MiniMax 使用中国大陆 `https://api.minimax.cn/anthropic` 端点，SDK 内部默认模型映射为 `MiniMax-M3[1m]`，对外 provider 契约仍回报 `MiniMax-M3`。
 
 `BIOAGENT_MODEL_POLICY` 默认 `local_only`，目前尚未安装本地后端，模型入口会明确不可用。当前开发实例获得授权后使用 `minimax_explicit`；缺少密钥不阻止确定性服务启动。
 
 ## M0 开发回放
 
-- `provider.py` 定义四类任务的统一请求／结果；MiniMax SDK 的会话与审计文件使用独立 `minimax-m0` 命名空间，旧会话文件保留。宿主管理受控历史、动作校验和执行权限，provider 不持有业务工具。
+- `provider.py` 定义四类任务的统一请求／结果；MiniMax SDK 的会话与审计文件使用独立 `minimax-m0` 命名空间，旧会话文件保留。有效 Open WebUI UUID 使用既有 SDK session/resume；缺失、`local:` 或其他非 UUID chat ID 以宿主传入的有限历史执行单次临时 SDK session。宿主管理受控历史、动作校验和执行权限，provider 不持有业务工具。
 - `evidence_replay.py` 将真实初筛统计复算为候选证据；数值占位符、引用身份和规则发现由宿主校验。源码中既有 `reads` 字段对应的配对分类计数，在新证据中显式记为 `read_pairs`。
 - `assets/m0` 是约 16 KiB 的开发资料与规则包。`knowledge.py` 验证哈希后构建内存 SQLite 关系表和 FTS5 索引；索引可从冻结 JSON 重建。所有片段仍待审核，默认检索不返回它们。
 - 根仓库 `m0-replay.py` 用 `--include-unreviewed` 开启开发草稿，用 `--allow-cloud` 显式授权本次 MiniMax 调用。这些开关不启用多人知识服务或正式报告发布。

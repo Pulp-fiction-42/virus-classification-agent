@@ -23,6 +23,7 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
+from provider import claude_agent_sdk_ready, claude_agent_sdk_version
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -231,6 +232,12 @@ async def analysis_health():
             remote = {"status": "ready", **(await remote_worker.invoke("health"))}
         except RemoteExecutionError:
             remote = {"status": "unavailable"}
+    sdk_version = claude_agent_sdk_version()
+    model_ready = (
+        config.MODEL_POLICY == "minimax_explicit"
+        and bool(config.MINIMAX_API_KEY)
+        and claude_agent_sdk_ready()
+    )
     return {
         "deterministic": {
             "status": "ready",
@@ -238,11 +245,11 @@ async def analysis_health():
         },
         "conversation_model": {
             "id": "BioAgent",
-            "status": "ready"
-            if config.MODEL_POLICY == "minimax_explicit" and config.MINIMAX_API_KEY
-            else "unavailable",
+            "status": "ready" if model_ready else "unavailable",
             "provider": config.MODEL,
             "policy": config.MODEL_POLICY,
+            "sdk_version": sdk_version,
+            "required_sdk_version": config.CLAUDE_AGENT_SDK_VERSION,
         },
         "knowledge": {
             "status": "unavailable",

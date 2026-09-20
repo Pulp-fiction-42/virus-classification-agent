@@ -11,9 +11,10 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-import config
 from jsonschema import Draft202012Validator, ValidationError
 from pydantic import BaseModel, ConfigDict, Field
+
+import config
 
 TaskKind = Literal[
     "intent_clarification", "controlled_patch", "citation_qa", "evidence_explanation"
@@ -55,6 +56,17 @@ class ProviderResult(BaseModel):
 
 class Provider(Protocol):
     async def generate(self, request: ProviderRequest) -> ProviderResult: ...
+
+
+def claude_agent_sdk_version() -> str:
+    try:
+        return version("claude-agent-sdk")
+    except Exception:  # noqa: BLE001 - health must stay available without the SDK
+        return "not_installed"
+
+
+def claude_agent_sdk_ready() -> bool:
+    return claude_agent_sdk_version() == config.CLAUDE_AGENT_SDK_VERSION
 
 
 PRIVATE_KEYS = {
@@ -107,9 +119,15 @@ class MiniMaxProvider:
 
     async def generate(self, request: ProviderRequest) -> ProviderResult:
         started = time.monotonic()
-        result = ProviderResult(provider="minimax", model=request.model)
+        sdk_version = claude_agent_sdk_version()
+        result = ProviderResult(
+            provider="minimax", model=request.model, backend_version=sdk_version
+        )
         if not self.allow_cloud:
             result.error_code = "CLOUD_DISABLED"
+            return result
+        if self.client_factory is None and not claude_agent_sdk_ready():
+            result.error_code = "MODEL_UNAVAILABLE"
             return result
         prompt = json.dumps(safe_context(request.context), ensure_ascii=False)
         if (
@@ -129,7 +147,6 @@ class MiniMaxProvider:
         lock = self._locks.setdefault(key, asyncio.Lock())
         try:
             async with asyncio.timeout(request.timeout_seconds), lock:
-                result.backend_version = version("claude-agent-sdk")
                 result.output = await self._generate(request, prompt, key)
         except TimeoutError:
             result.error_code = "MODEL_TIMEOUT"
@@ -180,7 +197,6 @@ class MiniMaxProvider:
             resume = None
             previous_size = 0
         options = ClaudeAgentOptions(
-            model=request.model,
             system_prompt=request.instructions,
             tools=[],
             allowed_tools=[],
@@ -193,9 +209,13 @@ class MiniMaxProvider:
             cwd=config.PROJECT_ROOT,
             env={
                 "ANTHROPIC_BASE_URL": config.ANTHROPIC_BASE_URL,
-                "ANTHROPIC_API_KEY": config.MINIMAX_API_KEY,
                 "ANTHROPIC_AUTH_TOKEN": config.MINIMAX_API_KEY,
+                "ANTHROPIC_MODEL": config.CLAUDE_MODEL,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": config.CLAUDE_MODEL,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": config.CLAUDE_MODEL,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": config.CLAUDE_MODEL,
                 "CLAUDE_CONFIG_DIR": str(self.state_dir / "sdk"),
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
                 "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(request.max_output_tokens),
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             },

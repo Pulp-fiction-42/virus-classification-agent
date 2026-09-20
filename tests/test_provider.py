@@ -10,6 +10,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+
 from provider import MiniMaxProvider, ProviderRequest
 
 
@@ -105,8 +106,29 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.options.allowed_tools, [])
             self.assertEqual(client.options.mcp_servers, {})
             self.assertEqual(client.options.max_turns, 1)
+            self.assertIsNone(client.options.model)
+            self.assertEqual(
+                client.options.env["ANTHROPIC_BASE_URL"],
+                "https://api.minimax.cn/anthropic",
+            )
+            self.assertEqual(
+                client.options.env["ANTHROPIC_MODEL"], "MiniMax-M3[1m]"
+            )
+            self.assertEqual(
+                client.options.env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+                "MiniMax-M3[1m]",
+            )
+            self.assertEqual(
+                client.options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000"
+            )
+            self.assertNotIn("ANTHROPIC_API_KEY", client.options.env)
             self.assertTrue(client.closed)
             self.assertNotIn("private-sdk-id", result.model_dump_json())
+
+    async def test_unpinned_sdk_is_unavailable_before_network(self):
+        with patch("provider.claude_agent_sdk_ready", return_value=False):
+            result = await MiniMaxProvider(allow_cloud=True).generate(self.request())
+        self.assertEqual(result.error_code, "MODEL_UNAVAILABLE")
 
     async def test_cloud_disabled_does_not_touch_sdk_or_network(self):
         with patch("socket.socket", side_effect=AssertionError("network forbidden")):

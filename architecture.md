@@ -4,7 +4,7 @@
 
 ```text
 Open WebUI
-  | OpenAI chat request + X-OpenWebUI-Chat-Id
+  | OpenAI chat request + optional X-OpenWebUI-Chat-Id
   v
 adapter.py
   | protocol conversion
@@ -32,7 +32,8 @@ MiniMax Anthropic-compatible API (explicit opt-in)
 
 - `runtime.py` 构造受控历史与确定性业务摘要，验证 `ConversationAction`，发送现有文本、trace 与 proposal 事件；规划和执行仍由确定性模块拥有。
 - `provider.py` 接收四类结构化任务、schema 与预算，统一返回模型身份、耗时、结构化输出或错误；默认禁用云端，不持有 MCP、文件或计算工具。
-- MiniMax 适配器每次调用关闭 SDK 连接，将 session／resume 映射及 transcript 保存在 `.claude/sessions/providers/minimax-m0`。累计上下文超过预算时使用宿主提供的有限历史开启新 SDK session，旧 transcript 保留作审计。
+- MiniMax 适配器固定使用 `claude-agent-sdk==0.2.103`（Claude Code 2.1.179）、中国大陆 Anthropic-compatible 端点及 `MiniMax-M3[1m]` SDK 模型映射；不向 Claude CLI 传递对外名称 `MiniMax-M3`。
+- 有效 Open WebUI UUID 将 session／resume 映射及 transcript 保存在 `.claude/sessions/providers/minimax-m0`。缺失、`local:` 或其他非 UUID chat ID 使用宿主传入的有限历史开启单次 SDK session，不保存 resume 映射。累计上下文超过预算时持久会话也开启新 SDK session，旧 transcript 保留作审计。
 - SDK 限制单轮生成；若它在提交 `StructuredOutput` 后报告轮次上限，只接受完整且通过 schema 校验的该载荷，不追加确认或修复调用。
 - 模型不能启动计算、改写证据或批准资料。普通聊天暂不加载 M0 待审核知识包，项目授权检索留到 B2。
 - `evidence_replay.py`、`knowledge.py`、`evidence_contract.py` 提供供应方无关的候选、资产、规则与引用模块。根仓库 CLI 连接这些模块与后端纯报告函数，不读取业务数据库。
@@ -64,7 +65,7 @@ Claude SDK 将 transcript 写入：
 agent/.claude/sessions/providers/minimax-m0/sdk/projects/<project>/<sdk_session_id>.jsonl
 ```
 
-Open WebUI 继续独立保存 UI 消息和账号数据。MiniMax provider 保存 chat UUID 到内部 SDK session ID 的映射，不读取或修改 Open WebUI 数据库；公共结果不包含 SDK session ID。
+Open WebUI 继续独立保存 UI 消息和账号数据。MiniMax provider 只为有效 chat UUID 保存到内部 SDK session ID 的映射；临时 chat ID 不持久化映射。provider 不读取或修改 Open WebUI 数据库，公共结果不包含 SDK session ID。
 
 资源校准记录保存在 `.claude/sessions/bioagent/resource-history.sqlite3`。agent 启动时按 telemetry mtime 增量补漏，规划时只查询索引；输入统计按文件身份缓存且不保存原始路径。
 

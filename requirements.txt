@@ -1,0 +1,6 @@
+claude-agent-sdk==0.2.103
+fastapi
+jsonschema
+pytest
+typer
+uvicorn

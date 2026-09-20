@@ -124,12 +124,28 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(adapter.config, "MINIMAX_API_KEY", ""),
             patch.object(adapter.config, "TAXONAGENT_MCP_URL", ""),
+            patch.object(adapter, "claude_agent_sdk_version", return_value="0.2.103"),
+            patch.object(adapter, "claude_agent_sdk_ready", return_value=True),
         ):
             result = await adapter.analysis_health()
         self.assertEqual(result["deterministic"]["status"], "ready")
         self.assertEqual(result["conversation_model"]["status"], "unavailable")
         self.assertEqual(result["conversation_model"]["id"], "BioAgent")
+        self.assertEqual(result["conversation_model"]["sdk_version"], "0.2.103")
+        self.assertEqual(
+            result["conversation_model"]["required_sdk_version"], "0.2.103"
+        )
         self.assertEqual(result["knowledge"]["status"], "unavailable")
+
+    async def test_health_rejects_unpinned_sdk(self):
+        with (
+            patch.object(adapter.config, "MODEL_POLICY", "minimax_explicit"),
+            patch.object(adapter.config, "MINIMAX_API_KEY", "configured"),
+            patch.object(adapter, "claude_agent_sdk_version", return_value="0.2.152"),
+            patch.object(adapter, "claude_agent_sdk_ready", return_value=False),
+        ):
+            result = await adapter.analysis_health()
+        self.assertEqual(result["conversation_model"]["status"], "unavailable")
 
     async def test_capability_catalog_is_public_and_path_free(self):
         result = await adapter.analysis_capabilities()
@@ -202,6 +218,21 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"type": "analysis_plan"', body)
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
+        self.assertEqual(fake.ephemeral_calls, [])
+
+    async def test_missing_chat_id_uses_one_turn_provider_session(self):
+        fake = FakeSessions()
+        adapter.sessions = fake
+
+        response = await adapter.chat(
+            ChatRequest(messages=[{"role": "user", "content": "first message"}]),
+            request_with_headers(),
+        )
+
+        body = await response_text(response)
+        self.assertIn("persistent", body)
+        self.assertEqual(fake.ensure_calls, [None])
+        self.assertEqual(fake.persistent_calls[0][1], None)
         self.assertEqual(fake.ephemeral_calls, [])
 
     async def test_execute_metadata_cannot_start_runner(self):
