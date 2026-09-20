@@ -7,16 +7,27 @@ from pathlib import Path
 import config
 from conversation_contract import (
     ConversationContractError,
+    ConversationReply,
     KnowledgeInsufficientError,
     RetrievalRequest,
     parse_conversation_action,
     proposal_output,
     validate_conversation_action,
+    validate_conversation_reply,
 )
 from taxonagent_adapter import TaxonAgentRetrievalAdapter, taxonagent_citation
 
 
 class ConversationContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_dashboard_reply_is_message_only(self):
+        reply = validate_conversation_reply({"message": "说明"})
+        self.assertEqual(reply, ConversationReply(message="说明"))
+        for value in ({}, {"message": "说明", "action": "respond"}):
+            with self.subTest(value=value), self.assertRaises(
+                ConversationContractError
+            ):
+                validate_conversation_reply(value)
+
     def test_prompt_supports_controlled_qc_and_requires_explicit_values(self):
         self.assertIn('goals=["read_qc"]', config.SYSTEM_PROMPT)
         self.assertIn("exact value", config.SYSTEM_PROMPT)

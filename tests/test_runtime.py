@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import uuid
 
+import config
 from conversation_events import OutputItemAdded, TextDelta
 from provider import ProviderResult
 from runtime import SessionManager
@@ -34,9 +35,37 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         return [
             event
             async for event in SessionManager(provider=provider).stream_turn(
-                [{"role": "user", "content": message}], str(uuid.uuid4()), **kwargs
+                [{"role": "user", "content": message}],
+                str(uuid.uuid4()),
+                analysis=True,
+                **kwargs,
             )
         ]
+
+    async def test_dashboard_uses_message_only_contract_without_action_events(self):
+        provider = FakeProvider({"message": "普通对话回复"})
+        events = [
+            event
+            async for event in SessionManager(provider=provider).stream_turn(
+                [{"role": "user", "content": "解释宏基因组学"}],
+                "local:dashboard:socket:session",
+            )
+        ]
+
+        self.assertEqual(events, [TextDelta("普通对话回复")])
+        request = provider.requests[0]
+        self.assertEqual(set(request.output_schema["properties"]), {"message"})
+        self.assertEqual(request.instructions, config.DASHBOARD_SYSTEM_PROMPT)
+        self.assertNotIn("analysis", request.context)
+
+    async def test_dashboard_rejects_analysis_action_fields(self):
+        provider = FakeProvider()
+        with self.assertRaises(ConversationPublicError) as raised:
+            async for _event in SessionManager(provider=provider).stream_turn(
+                [{"role": "user", "content": "你好"}], "local:dashboard:test"
+            ):
+                pass
+        self.assertEqual(raised.exception.code, "ACTION_SCHEMA_INVALID")
 
     async def test_action_and_controlled_patch_keep_event_contract(self):
         for output in [
@@ -126,7 +155,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_or_local_chat_id_uses_ephemeral_provider_session(self):
         for chat_id in (None, "local:socket-id"):
-            provider = FakeProvider()
+            provider = FakeProvider({"message": "固定回答"})
             events = [
                 event
                 async for event in SessionManager(provider=provider).stream_turn(

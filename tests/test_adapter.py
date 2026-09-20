@@ -52,10 +52,16 @@ class FakeSessions:
             raise self.ensure_error
 
     async def stream_turn(
-        self, messages, chat_id, routing=None, dataset_context=None, plan_context=None
+        self,
+        messages,
+        chat_id,
+        routing=None,
+        dataset_context=None,
+        plan_context=None,
+        analysis=False,
     ):
         self.persistent_calls.append(
-            (messages, chat_id, routing, dataset_context, plan_context)
+            (messages, chat_id, routing, dataset_context, plan_context, analysis)
         )
         if self.fail:
             raise SessionStateError(
@@ -219,6 +225,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
         self.assertEqual(fake.ephemeral_calls, [])
+        self.assertFalse(fake.persistent_calls[0][5])
 
     async def test_missing_chat_id_uses_one_turn_provider_session(self):
         fake = FakeSessions()
@@ -246,6 +253,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 messages=[{"role": "user", "content": "确认启动分析"}],
                 metadata={
                     "chat_meta": {
+                        "source": "analysis",
                         "analysis_mode": "execute",
                         "analysis_routing": routing,
                     }
@@ -260,6 +268,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake.ensure_calls, [chat_id])
         self.assertEqual(len(fake.persistent_calls), 1)
+        self.assertTrue(fake.persistent_calls[0][5])
         self.assertNotIn('"type": "analysis_run"', body)
 
     async def test_dataset_context_is_forwarded_as_read_only_chat_context(self):
@@ -271,12 +280,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         plan_response = await adapter.chat(
             ChatRequest(
                 messages=[{"role": "user", "content": "plan"}],
-                metadata={"chat_meta": {"analysis_dataset": dataset}},
+                metadata={
+                    "chat_meta": {
+                        "source": "analysis",
+                        "analysis_dataset": dataset,
+                    }
+                },
             ),
             request_with_headers(x_openwebui_chat_id=chat_id),
         )
         await response_text(plan_response)
         self.assertEqual(fake.persistent_calls[0][3], dataset)
+        self.assertTrue(fake.persistent_calls[0][5])
 
     async def test_persisted_plan_summary_is_forwarded_as_read_only_chat_context(self):
         fake = FakeSessions()
@@ -287,12 +302,18 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         response = await adapter.chat(
             ChatRequest(
                 messages=[{"role": "user", "content": "explain this plan"}],
-                metadata={"chat_meta": {"analysis_plan_summary": summary}},
+                metadata={
+                    "chat_meta": {
+                        "source": "analysis",
+                        "analysis_plan_summary": summary,
+                    }
+                },
             ),
             request_with_headers(x_openwebui_chat_id=chat_id),
         )
         await response_text(response)
         self.assertEqual(fake.persistent_calls[0][4], summary)
+        self.assertTrue(fake.persistent_calls[0][5])
 
     async def test_streaming_and_non_streaming_preserve_markdown_boundaries(self):
         fake = FakeSessions(text_parts=["开始检查。", "\n\n## 检查完成"])

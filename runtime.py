@@ -11,9 +11,11 @@ from conversation_context import build_conversation_context
 from conversation_contract import (
     ConversationAction,
     ConversationContractError,
+    ConversationReply,
     action_trace_output,
     proposal_output,
     validate_conversation_action,
+    validate_conversation_reply,
 )
 from conversation_events import (
     InvalidSessionError,
@@ -73,6 +75,7 @@ class SessionManager:
         routing_request: dict | None = None,
         dataset_context: dict | None = None,
         plan_context: dict | None = None,
+        analysis: bool = False,
     ) -> AsyncIterator[RuntimeEvent]:
         conversation_id = await self.ensure_session(chat_id)
         history = _history(messages)
@@ -89,17 +92,30 @@ class SessionManager:
                 "KNOWLEDGE_UNAVAILABLE",
                 "当前对话尚未接入经审核的分类知识，请使用开发回放查看待审核资料。",
             )
+        output_schema = (
+            ConversationAction.model_json_schema()
+            if analysis
+            else ConversationReply.model_json_schema()
+        )
         request = ProviderRequest(
             task_kind="intent_clarification",
-            output_schema=ConversationAction.model_json_schema(),
-            instructions=config.SYSTEM_PROMPT,
+            output_schema=output_schema,
+            instructions=(
+                config.SYSTEM_PROMPT if analysis else config.DASHBOARD_SYSTEM_PROMPT
+            ),
             context=safe_context(
                 {
                     "history": history,
-                    "analysis": build_conversation_context(
-                        routing=routing_request,
-                        dataset=dataset_context,
-                        plan=plan_context,
+                    **(
+                        {
+                            "analysis": build_conversation_context(
+                                routing=routing_request,
+                                dataset=dataset_context,
+                                plan=plan_context,
+                            )
+                        }
+                        if analysis
+                        else {}
                     ),
                 }
             ),
@@ -107,6 +123,20 @@ class SessionManager:
             timeout_seconds=config.CONVERSATION_TIMEOUT_SECONDS,
         )
         result = await self.provider.generate(request)
+        if not analysis:
+            if result.error_code:
+                raise ConversationPublicError(
+                    result.error_code, MODEL_UNAVAILABLE_MESSAGE
+                )
+            try:
+                reply = validate_conversation_reply(result.output)
+            except ConversationContractError as exc:
+                raise ConversationPublicError(
+                    exc.code, MODEL_UNAVAILABLE_MESSAGE
+                ) from exc
+            yield TextDelta(reply.message)
+            return
+
         action = None
         error = result.error_code
         if error is None:
@@ -136,12 +166,7 @@ class SessionManager:
         result = await self.provider.generate(
             ProviderRequest(
                 task_kind="intent_clarification",
-                output_schema={
-                    "type": "object",
-                    "properties": {"message": {"type": "string"}},
-                    "required": ["message"],
-                    "additionalProperties": False,
-                },
+                output_schema=ConversationReply.model_json_schema(),
                 instructions="根据所提供的对话完成标题或摘要任务。仅返回 message 字段，不调用工具，不加入新的事实。",
                 context={"history": _history(messages)},
                 timeout_seconds=config.CONVERSATION_TIMEOUT_SECONDS,
@@ -149,7 +174,11 @@ class SessionManager:
         )
         if result.error_code:
             raise ConversationPublicError(result.error_code, MODEL_UNAVAILABLE_MESSAGE)
-        yield TextDelta(result.output["message"])
+        try:
+            reply = validate_conversation_reply(result.output)
+        except ConversationContractError as exc:
+            raise ConversationPublicError(exc.code, MODEL_UNAVAILABLE_MESSAGE) from exc
+        yield TextDelta(reply.message)
 
     async def close_all(self) -> None:
         # Each bounded provider call closes its SDK connection in finally.

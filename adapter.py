@@ -173,6 +173,12 @@ def analysis_plan_summary(req: ChatRequest) -> dict[str, Any] | None:
     return plan if isinstance(plan, dict) else None
 
 
+def is_analysis_chat(req: ChatRequest) -> bool:
+    metadata = req.metadata if isinstance(req.metadata, dict) else {}
+    chat_meta = metadata.get("chat_meta")
+    return isinstance(chat_meta, dict) and chat_meta.get("source") == "analysis"
+
+
 def error_sse(exc: Exception, response_id: str) -> str:
     payload = {
         "id": response_id,
@@ -431,6 +437,7 @@ async def chat(req: ChatRequest, request: Request):
     routing = analysis_routing(req)
     dataset = analysis_dataset(req)
     plan_summary = analysis_plan_summary(req)
+    analysis = is_analysis_chat(req)
     response_id = completion_id()
     sessions = conversation_sessions()
 
@@ -441,7 +448,12 @@ async def chat(req: ChatRequest, request: Request):
                 if task
                 else (
                     sessions.stream_turn(
-                        req.messages, chat_id, routing, dataset, plan_summary
+                        req.messages,
+                        chat_id,
+                        routing,
+                        dataset,
+                        plan_summary,
+                        analysis=analysis,
                     )
                     if routing
                     else sessions.stream_turn(
@@ -449,6 +461,7 @@ async def chat(req: ChatRequest, request: Request):
                         chat_id,
                         dataset_context=dataset,
                         plan_context=plan_summary,
+                        analysis=analysis,
                     )
                 )
             )
@@ -495,7 +508,12 @@ async def chat(req: ChatRequest, request: Request):
                 if task
                 else (
                     sessions.stream_turn(
-                        req.messages, chat_id, routing, dataset, plan_summary
+                        req.messages,
+                        chat_id,
+                        routing,
+                        dataset,
+                        plan_summary,
+                        analysis=analysis,
                     )
                     if routing
                     else sessions.stream_turn(
@@ -503,6 +521,7 @@ async def chat(req: ChatRequest, request: Request):
                         chat_id,
                         dataset_context=dataset,
                         plan_context=plan_summary,
+                        analysis=analysis,
                     )
                 )
             )

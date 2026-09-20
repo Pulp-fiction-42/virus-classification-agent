@@ -87,6 +87,12 @@ class ConversationAction(BaseModel):
         return self
 
 
+class ConversationReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=20_000)
+
+
 class ConversationContractError(ValueError):
     def __init__(self, message: str, *, code: str = "ACTION_SCHEMA_INVALID") -> None:
         super().__init__(message)
@@ -116,6 +122,15 @@ def validate_conversation_action(value: Any) -> ConversationAction:
         raise ConversationContractError(
             "conversation action envelope is invalid",
             code="PATCH_FIELD_FORBIDDEN" if forbidden else "ACTION_SCHEMA_INVALID",
+        ) from exc
+
+
+def validate_conversation_reply(value: Any) -> ConversationReply:
+    try:
+        return ConversationReply.model_validate(value)
+    except ValidationError as exc:
+        raise ConversationContractError(
+            "conversation reply is invalid", code="ACTION_SCHEMA_INVALID"
         ) from exc
 
 

@@ -175,6 +175,7 @@ class MiniMaxProvider:
             ClaudeAgentOptions,
             ClaudeSDKClient,
             ResultMessage,
+            TextBlock,
             ToolUseBlock,
         )
 
@@ -226,9 +227,15 @@ class MiniMaxProvider:
             await client.query(prompt)
             final = None
             structured = None
+            text_parts = []
+            text_is_safe_fallback = True
             async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
+                    if message.error is not None or message.model == "<synthetic>":
+                        text_is_safe_fallback = False
                     for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text_parts.append(block.text)
                         if (
                             isinstance(block, ToolUseBlock)
                             and block.name == "StructuredOutput"
@@ -240,11 +247,18 @@ class MiniMaxProvider:
                     final = message
             if final is None:
                 raise OSError("generation failed")
+            text = "".join(text_parts)
+            has_text_fallback = text_is_safe_fallback and bool(text.strip())
             # A single-turn SDK call can terminate at its StructuredOutput tool.
-            # Validate that payload directly; do not run a second model turn just
-            # to acknowledge it. Every other SDK error remains a failure.
+            # MiniMax can also finish the turn with plain assistant text. Validate
+            # that text against the caller's schema instead of adding a repair turn.
             if final.is_error and not (
-                final.subtype == "error_max_turns" and structured is not None
+                final.subtype == "error_max_turns"
+                and (
+                    final.structured_output is not None
+                    or structured is not None
+                    or has_text_fallback
+                )
             ):
                 raise OSError("generation failed")
             output = (
@@ -253,7 +267,11 @@ class MiniMaxProvider:
                 else structured
             )
             if output is None:
-                output = json.loads(final.result or "")
+                output = (
+                    {"message": text}
+                    if has_text_fallback
+                    else json.loads(final.result or "")
+                )
             Draft202012Validator(request.output_schema).validate(output)
             if not isinstance(output, dict):
                 raise TypeError("object required")

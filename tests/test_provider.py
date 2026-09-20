@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
-from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
+from conversation_contract import ConversationAction
 from provider import MiniMaxProvider, ProviderRequest
 
 
@@ -21,6 +22,10 @@ class FakeClient:
     hang = False
     malformed = False
     structured_turn_limit = False
+    plain_text: ClassVar[str | None] = None
+    plain_text_turn_limit = False
+    assistant_model = "test"
+    assistant_error = None
 
     def __init__(self, *, options):
         self.options = options
@@ -38,6 +43,12 @@ class FakeClient:
     async def receive_response(self):
         if self.hang:
             await asyncio.Future()
+        if self.plain_text is not None:
+            yield AssistantMessage(
+                content=[TextBlock(text=self.plain_text)],
+                model=self.assistant_model,
+                error=self.assistant_error,
+            )
         if self.structured_turn_limit:
             yield AssistantMessage(
                 content=[
@@ -47,16 +58,32 @@ class FakeClient:
                 ],
                 model="test",
             )
+        is_error = bool(
+            self.structured_turn_limit
+            or self.plain_text_turn_limit
+            or self.assistant_error
+        )
+        subtype = (
+            "error_during_execution"
+            if self.assistant_error
+            else "error_max_turns"
+            if is_error
+            else "success"
+        )
         yield ResultMessage(
-            subtype="error_max_turns" if self.structured_turn_limit else "success",
+            subtype=subtype,
             duration_ms=1,
             duration_api_ms=1,
-            is_error=self.structured_turn_limit,
+            is_error=is_error,
             num_turns=1,
             session_id="private-sdk-id",
-            structured_output=None
-            if self.malformed or self.structured_turn_limit
-            else self.output,
+            structured_output=(
+                None
+                if self.malformed
+                or self.structured_turn_limit
+                or self.plain_text is not None
+                else self.output
+            ),
             result="{invalid" if self.malformed else None,
         )
 
@@ -73,21 +100,29 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         FakeClient.output = {"message": "说明"}
         FakeClient.fail = FakeClient.hang = FakeClient.malformed = False
         FakeClient.structured_turn_limit = False
+        FakeClient.plain_text = None
+        FakeClient.plain_text_turn_limit = False
+        FakeClient.assistant_model = "test"
+        FakeClient.assistant_error = None
         self.provider = MiniMaxProvider(
             allow_cloud=True, state_dir=self.root, client_factory=FakeClient
         )
 
     def request(self, **kwargs):
-        return ProviderRequest(
-            task_kind=kwargs.pop("task_kind", "evidence_explanation"),
-            instructions="仅输出结构化结果",
-            context={"evidence": "有限上下文"},
-            output_schema={
+        output_schema = kwargs.pop(
+            "output_schema",
+            {
                 "type": "object",
                 "properties": {"message": {"type": "string"}},
                 "required": ["message"],
                 "additionalProperties": False,
             },
+        )
+        return ProviderRequest(
+            task_kind=kwargs.pop("task_kind", "evidence_explanation"),
+            instructions="仅输出结构化结果",
+            context={"evidence": "有限上下文"},
+            output_schema=output_schema,
             **kwargs,
         )
 
@@ -146,6 +181,37 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         FakeClient.output = {"shell": "forbidden"}
         result = await self.provider.generate(self.request())
         self.assertEqual(result.error_code, "MODEL_SCHEMA_INVALID")
+
+    async def test_plain_text_turn_is_validated_as_message_output(self):
+        FakeClient.plain_text = "自然语言回答"
+        FakeClient.plain_text_turn_limit = True
+
+        result = await self.provider.generate(self.request())
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual(result.output, {"message": "自然语言回答"})
+        self.assertEqual(len(FakeClient.instances[-1].queries), 1)
+
+    async def test_plain_text_does_not_bypass_analysis_action_schema(self):
+        FakeClient.plain_text = "我已经修改方案。"
+        FakeClient.plain_text_turn_limit = True
+
+        result = await self.provider.generate(
+            self.request(output_schema=ConversationAction.model_json_schema())
+        )
+
+        self.assertEqual(result.error_code, "MODEL_SCHEMA_INVALID")
+        self.assertIsNone(result.output)
+
+    async def test_synthetic_or_api_error_text_is_not_a_reply(self):
+        for model, error in (("<synthetic>", None), ("test", "rate_limit")):
+            with self.subTest(model=model, error=error):
+                FakeClient.plain_text = "上游错误"
+                FakeClient.plain_text_turn_limit = True
+                FakeClient.assistant_model = model
+                FakeClient.assistant_error = error
+                result = await self.provider.generate(self.request())
+                self.assertEqual(result.error_code, "MODEL_UNAVAILABLE")
 
     async def test_context_limit_rejected_before_connect(self):
         result = await self.provider.generate(self.request(max_context_chars=10))
