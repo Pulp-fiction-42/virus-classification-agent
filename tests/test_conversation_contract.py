@@ -23,8 +23,9 @@ class ConversationContractTests(unittest.IsolatedAsyncioTestCase):
         reply = validate_conversation_reply({"message": "说明"})
         self.assertEqual(reply, ConversationReply(message="说明"))
         for value in ({}, {"message": "说明", "action": "respond"}):
-            with self.subTest(value=value), self.assertRaises(
-                ConversationContractError
+            with (
+                self.subTest(value=value),
+                self.assertRaises(ConversationContractError),
             ):
                 validate_conversation_reply(value)
 
@@ -149,14 +150,38 @@ class ConversationContractTests(unittest.IsolatedAsyncioTestCase):
                 validate_conversation_action(value)
             self.assertEqual(raised.exception.code, "PATCH_FIELD_FORBIDDEN")
 
-        uncited = validate_conversation_action(
+        cited = validate_conversation_action(
             {
                 "action": "respond",
                 "message": "一般知识回答",
                 "citations": ["unverified-source"],
             }
         )
-        self.assertEqual(uncited.citations, [])
+        self.assertEqual(cited.citations, ["unverified-source"])
+
+        for invalid in (
+            {
+                "action": "clarify",
+                "message": "请补充目标。",
+                "citations": ["source"],
+            },
+            {
+                "action": "propose_patch",
+                "message": "建议调整。",
+                "proposed_patch": {"goals": ["read_qc"]},
+                "citations": ["source"],
+            },
+            {
+                "action": "respond",
+                "message": "重复引用。",
+                "citations": ["source", "source"],
+            },
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaises(ConversationContractError),
+            ):
+                validate_conversation_action(invalid)
 
         clarify = validate_conversation_action(
             {

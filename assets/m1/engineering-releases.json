@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "active_release": "engineering-knowledge-v1",
+  "releases": [
+    {
+      "release_id": "engineering-knowledge-v1",
+      "scope": "engineering_contract",
+      "catalog_sha256": "2f9edabaf6fa57c92faecacdc367f55e708a962722ec671f34aa8038716437b1",
+      "file": "engineering-knowledge-v1.json",
+      "sha256": "45e70f06d04cd6bf1d748a991a959378acb64c6031f7fd08b576548ee097176e",
+      "review_status": "approved",
+      "review_record": "derived from capability catalog schema v1; engineering contract only",
+      "license": "same as BioAgent source"
+    }
+  ]
+}

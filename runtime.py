@@ -12,6 +12,7 @@ from conversation_contract import (
     ConversationAction,
     ConversationContractError,
     ConversationReply,
+    RetrievalRequest,
     action_trace_output,
     proposal_output,
     validate_conversation_action,
@@ -22,6 +23,15 @@ from conversation_events import (
     OutputItemAdded,
     RuntimeEvent,
     TextDelta,
+)
+from knowledge import (
+    ENGINEERING_CORPORA,
+    MAX_ONLINE_PASSAGE_CHARS,
+    MAX_ONLINE_PASSAGES,
+    MAX_ONLINE_QUERY_CHARS,
+    engineering_knowledge_intent,
+    load_engineering_store,
+    online_citation,
 )
 from provider import MiniMaxProvider, Provider, ProviderRequest, safe_context
 from runtime_errors import ConversationPublicError, SessionStateError  # noqa: F401
@@ -56,10 +66,20 @@ def _history(messages: list[dict]) -> list[dict[str, str]]:
 class SessionManager:
     """Maintain the HTTP/event boundary; providers own their sessions."""
 
-    def __init__(self, *, provider: Provider | None = None):
+    def __init__(self, *, provider: Provider | None = None, knowledge_store=None):
         self.provider = provider or MiniMaxProvider(
             allow_cloud=config.MODEL_POLICY == "minimax_explicit"
         )
+        self.knowledge_store = knowledge_store or load_engineering_store()
+
+    def knowledge_status(self) -> dict:
+        return {
+            "status": "ready",
+            "provider": "sqlite_fts5",
+            "release_id": self.knowledge_store.release_id,
+            "snapshot_id": self.knowledge_store.snapshot_id,
+            "scope": self.knowledge_store.release_scope,
+        }
 
     async def ensure_session(self, chat_id: str | None) -> str | None:
         """Use persistent SDK sessions only for durable Open WebUI UUIDs."""
@@ -92,6 +112,22 @@ class SessionManager:
                 "KNOWLEDGE_UNAVAILABLE",
                 "当前对话尚未接入经审核的分类知识，请使用开发回放查看待审核资料。",
             )
+        retrieval = None
+        if analysis and engineering_knowledge_intent(latest):
+            retrieval = await self.knowledge_store.retrieve(
+                RetrievalRequest(
+                    query=latest[:MAX_ONLINE_QUERY_CHARS],
+                    corpora=ENGINEERING_CORPORA,
+                    limit=MAX_ONLINE_PASSAGES,
+                )
+            )
+            if retrieval.error_code:
+                message = (
+                    "工程知识检索暂时不可用，请稍后重试。"
+                    if retrieval.error_code == "RETRIEVAL_UNAVAILABLE"
+                    else "没有足够且可引用的工程资料回答该问题。"
+                )
+                raise ConversationPublicError(retrieval.error_code, message)
         output_schema = (
             ConversationAction.model_json_schema()
             if analysis
@@ -102,6 +138,12 @@ class SessionManager:
             output_schema=output_schema,
             instructions=(
                 config.SYSTEM_PROMPT if analysis else config.DASHBOARD_SYSTEM_PROMPT
+            )
+            + (
+                "\n本轮提供的是工程契约检索结果，不是生物学审核。必须使用 respond，"
+                "citations 必须列出至少一个且只能使用 context.knowledge.passages 中的 citation_id。"
+                if retrieval
+                else ""
             ),
             context=safe_context(
                 {
@@ -115,6 +157,28 @@ class SessionManager:
                             )
                         }
                         if analysis
+                        else {}
+                    ),
+                    **(
+                        {
+                            "knowledge": {
+                                "scope": "engineering_contract",
+                                "snapshot_id": retrieval.snapshot_id,
+                                "passages": [
+                                    {
+                                        "citation_id": item.citation_id,
+                                        "content": item.content[
+                                            :MAX_ONLINE_PASSAGE_CHARS
+                                        ],
+                                        "source": item.source,
+                                        "source_version": item.source_version,
+                                        "locator": item.locator,
+                                    }
+                                    for item in retrieval.passages
+                                ],
+                            }
+                        }
+                        if retrieval
                         else {}
                     ),
                 }
@@ -155,6 +219,39 @@ class SessionManager:
         if error:
             raise ConversationPublicError(error, MODEL_UNAVAILABLE_MESSAGE)
         assert action is not None
+        if retrieval is not None:
+            registered = {item.citation_id: item for item in retrieval.passages}
+            if action.action != "respond" or not action.citations:
+                raise ConversationPublicError(
+                    "CITATION_INVALID", "工程知识回答缺少有效引用。"
+                )
+            try:
+                cited = [registered[citation_id] for citation_id in action.citations]
+                for citation in cited:
+                    if citation.snapshot_id != retrieval.snapshot_id:
+                        raise ValueError("citation snapshot mismatch")
+                    self.knowledge_store.verify(citation)
+            except (KeyError, ValueError) as exc:
+                raise ConversationPublicError(
+                    "CITATION_INVALID", "工程知识回答包含无效引用。"
+                ) from exc
+            yield OutputItemAdded(
+                {
+                    "type": "analysis_knowledge_citations",
+                    "id": f"analysis_knowledge_{uuid.uuid4().hex}",
+                    "schema_version": 1,
+                    "status": "completed",
+                    "release_id": self.knowledge_store.release_id,
+                    "snapshot_id": retrieval.snapshot_id,
+                    "scope": "engineering_contract",
+                    "query": latest[:MAX_ONLINE_QUERY_CHARS],
+                    "citations": [online_citation(citation) for citation in cited],
+                }
+            )
+        elif action.citations:
+            raise ConversationPublicError(
+                "CITATION_INVALID", "回答引用不属于本轮受控检索。"
+            )
         yield TextDelta(action.message)
         item = proposal_output(action)
         if item:
@@ -182,4 +279,4 @@ class SessionManager:
 
     async def close_all(self) -> None:
         # Each bounded provider call closes its SDK connection in finally.
-        return None
+        self.knowledge_store.close()

@@ -86,8 +86,7 @@ and run admission are owned by structured UI controls and a deterministic planne
 Return exactly one action using the runtime JSON Schema. Use respond for an answer, clarify for
 one necessary question, or propose_patch for a complete controlled requirement change. respond and
 clarify must omit proposed_patch. propose_patch must include proposed_patch, containing only goals
-viral_type, excluded_stages, and capability_parameters. Put the complete user-visible answer in message and use an empty citations list
-until a retrieval result is supplied. If structured output is unavailable, use the exact
+viral_type, excluded_stages, and capability_parameters. Put the complete user-visible answer in message. Use citations only for a respond action when a retrieval result is supplied; otherwise use an empty list. If structured output is unavailable, use the exact
 conversation_action fenced JSON fallback requested in the user prompt.
 
 Knowledge retrieval and citation verification belong to the host. Never call tools or claim

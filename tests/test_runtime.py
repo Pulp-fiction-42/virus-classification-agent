@@ -4,6 +4,7 @@ import unittest
 import uuid
 
 import config
+from conversation_contract import RetrievalResult
 from conversation_events import OutputItemAdded, TextDelta
 from provider import ProviderResult
 from runtime import SessionManager
@@ -128,6 +129,67 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConversationPublicError) as raised:
             await self.turn(provider, "ICTV 的分类标准是什么")
         self.assertEqual(raised.exception.code, "KNOWLEDGE_UNAVAILABLE")
+        self.assertEqual(provider.requests, [])
+
+    async def test_engineering_answer_requires_registered_citations(self):
+        provider = FakeProvider(
+            {
+                "action": "respond",
+                "message": "fastp 的参数来自已发布工程契约。",
+                "citations": ["ENG-K08"],
+            }
+        )
+        events = await self.turn(provider, "fastp 有哪些可控参数")
+        items = [event.item for event in events if isinstance(event, OutputItemAdded)]
+        citation_item = next(
+            item for item in items if item["type"] == "analysis_knowledge_citations"
+        )
+
+        self.assertEqual(citation_item["schema_version"], 1)
+        self.assertEqual(citation_item["scope"], "engineering_contract")
+        self.assertEqual(citation_item["citations"][0]["citation_id"], "ENG-K08")
+        self.assertNotIn("/Users/", str(citation_item))
+        request = provider.requests[0]
+        self.assertEqual(request.context["knowledge"]["scope"], "engineering_contract")
+        self.assertLessEqual(len(request.context["knowledge"]["passages"]), 4)
+
+    async def test_engineering_answer_rejects_missing_and_forged_citations(self):
+        for citations in ([], ["forged-citation"]):
+            provider = FakeProvider(
+                {
+                    "action": "respond",
+                    "message": "无效引用回答。",
+                    "citations": citations,
+                }
+            )
+            with (
+                self.subTest(citations=citations),
+                self.assertRaises(ConversationPublicError) as raised,
+            ):
+                await self.turn(provider, "fastp 有哪些可控参数")
+            self.assertEqual(raised.exception.code, "CITATION_INVALID")
+
+    async def test_unknown_engineering_knowledge_fails_before_model(self):
+        class EmptyStore:
+            async def retrieve(self, request):
+                return RetrievalResult(
+                    query=request.query,
+                    corpora=list(request.corpora),
+                    insufficient=True,
+                    error_code="KNOWLEDGE_INSUFFICIENT",
+                )
+
+        provider = FakeProvider()
+        with self.assertRaises(ConversationPublicError) as raised:
+            async for _event in SessionManager(
+                provider=provider, knowledge_store=EmptyStore()
+            ).stream_turn(
+                [{"role": "user", "content": "unknown_tool.fastp 的参数是什么"}],
+                str(uuid.uuid4()),
+                analysis=True,
+            ):
+                pass
+        self.assertEqual(raised.exception.code, "KNOWLEDGE_INSUFFICIENT")
         self.assertEqual(provider.requests, [])
 
     async def test_provider_errors_keep_deterministic_controls_available(self):

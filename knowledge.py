@@ -8,6 +8,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from conversation_contract import (
     Citation,
@@ -15,6 +16,19 @@ from conversation_contract import (
     RetrievalRequest,
     RetrievalResult,
 )
+from workflow_catalog import capability_catalog
+
+ENGINEERING_ASSETS = Path(__file__).parent / "assets" / "m1"
+ENGINEERING_RELEASES = ENGINEERING_ASSETS / "engineering-releases.json"
+ENGINEERING_CORPORA = (
+    "workflow_capabilities",
+    "artifact_glossary",
+    "tools_databases",
+    "faq_policy",
+)
+MAX_ONLINE_PASSAGES = 4
+MAX_ONLINE_QUERY_CHARS = 500
+MAX_ONLINE_PASSAGE_CHARS = 512
 
 
 def digest(data: bytes) -> str:
@@ -36,6 +50,8 @@ class KnowledgeStore(RetrievalAdapter):
         if digest(raw) != expected_sha256:
             raise ValueError("knowledge release hash mismatch")
         self.package = json.loads(raw)
+        self.release_id = self.package["release_id"]
+        self.release_scope = self.package.get("release_scope")
         self.snapshot_id = f"{self.package['release_id']}@{expected_sha256}"
         self.db = sqlite3.connect(":memory:")
         self.db.executescript("""
@@ -67,6 +83,11 @@ class KnowledgeStore(RetrievalAdapter):
             if not 1 <= start <= end <= len(lines):
                 raise ValueError("invalid source locator")
             content = "\n".join(lines[start - 1 : end])
+            locator = passage.get("locator")
+            if locator is not None and (
+                not isinstance(locator, str) or not locator.startswith("$")
+            ):
+                raise ValueError("invalid JSON locator")
             approved = passage["review_status"] == "approved"
             if approved and not passage.get("review_record"):
                 raise ValueError("approved passage requires review record")
@@ -75,7 +96,7 @@ class KnowledgeStore(RetrievalAdapter):
                 corpus=passage["corpus"],
                 source=source["origin"],
                 source_version=source["version"],
-                locator=f"lines:{start}-{end}; origin:{source['locator']}",
+                locator=locator or f"lines:{start}-{end}; origin:{source['locator']}",
                 content=content,
                 retrieved_at=datetime.now(timezone.utc).isoformat(),
                 quality="verified" if approved else "incomplete",
@@ -159,3 +180,108 @@ class KnowledgeStore(RetrievalAdapter):
 
     def close(self) -> None:
         self.db.close()
+
+
+def canonical_json_digest(value: Any) -> str:
+    return digest(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    )
+
+
+def load_engineering_store(
+    releases_path: Path = ENGINEERING_RELEASES,
+) -> KnowledgeStore:
+    registry = json.loads(releases_path.read_text(encoding="utf-8"))
+    if registry.get("schema_version") != 1:
+        raise ValueError("unsupported engineering knowledge release registry")
+    active = registry.get("active_release")
+    matches = [
+        value
+        for value in registry.get("releases", [])
+        if value.get("release_id") == active
+    ]
+    if len(matches) != 1:
+        raise ValueError("engineering knowledge active release is unavailable")
+    release = matches[0]
+    if release.get("scope") != "engineering_contract":
+        raise ValueError("engineering knowledge release scope is invalid")
+    relative = Path(str(release.get("file") or ""))
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.name != str(relative)
+    ):
+        raise ValueError("engineering knowledge release path is invalid")
+    package_path = releases_path.parent / relative
+    expected_catalog = canonical_json_digest(capability_catalog())
+    if release.get("catalog_sha256") != expected_catalog:
+        raise ValueError("engineering knowledge catalog identity mismatch")
+    store = KnowledgeStore(package_path, str(release.get("sha256") or ""))
+    if (
+        store.release_id != active
+        or store.release_scope != "engineering_contract"
+        or store.package.get("catalog_sha256") != expected_catalog
+    ):
+        store.close()
+        raise ValueError("engineering knowledge package identity mismatch")
+    return store
+
+
+def engineering_knowledge_intent(query: str) -> bool:
+    normalized = query.lower()
+    exact_terms = {
+        "fastp",
+        "read_qc",
+        "rrna_filter",
+        "sample_merge",
+        "assembly",
+        "contig_filter",
+        "virus_summary",
+        "host_summary",
+        "microbe_summary",
+        "virus_rpm",
+        "annotation_delivery",
+        "raw_paired_reads",
+        "qc_paired_reads",
+        "clean_run_paired_reads",
+        "clean_sample_paired_reads",
+        "assembled_contigs",
+        "filtered_contigs",
+        "length_required",
+        "qualified_quality_phred",
+        "unqualified_percent_limit",
+        "n_base_limit",
+        "average_qual",
+        "detect_adapter_for_pe",
+    }
+    if any(term in normalized for term in exact_terms):
+        return True
+    return any(
+        phrase in query
+        for phrase in (
+            "仅序列质控",
+            "去 rRNA",
+            "样本合并",
+            "序列组装",
+            "参数白名单",
+            "能力目录",
+            "工作流能力",
+            "输入 artifact",
+            "输出 artifact",
+        )
+    )
+
+
+def online_citation(citation) -> dict[str, Any]:
+    return {
+        "citation_id": citation.citation_id,
+        "corpus": citation.corpus,
+        "source": citation.source,
+        "source_version": citation.source_version,
+        "locator": citation.locator,
+        "excerpt": citation.content[:MAX_ONLINE_PASSAGE_CHARS],
+        "quality": citation.quality,
+        "review_status": citation.review_status,
+    }

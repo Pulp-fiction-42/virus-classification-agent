@@ -107,6 +107,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.original_sessions = adapter.sessions
         self.original_planner = adapter.planner
+        adapter.sessions = None
 
     def tearDown(self):
         adapter.sessions = self.original_sessions
@@ -141,7 +142,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result["conversation_model"]["required_sdk_version"], "0.2.103"
         )
-        self.assertEqual(result["knowledge"]["status"], "unavailable")
+        self.assertEqual(result["knowledge"]["status"], "ready")
+        self.assertEqual(result["knowledge"]["provider"], "sqlite_fts5")
+        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v1")
+        self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
 
     async def test_health_rejects_unpinned_sdk(self):
         with (

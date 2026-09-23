@@ -58,6 +58,7 @@ def _warm_remote_worker() -> None:
 
 @app.on_event("startup")
 async def warm_remote_worker():
+    conversation_sessions()
     if remote_worker.enabled:
         threading.Thread(
             target=_warm_remote_worker,
@@ -232,6 +233,7 @@ async def list_models():
 @app.get("/v1/analysis/health")
 @app.get("/analysis/health")
 async def analysis_health():
+    knowledge = conversation_sessions().knowledge_status()
     remote = {"status": "local"}
     if remote_worker.enabled:
         try:
@@ -257,11 +259,7 @@ async def analysis_health():
             "sdk_version": sdk_version,
             "required_sdk_version": config.CLAUDE_AGENT_SDK_VERSION,
         },
-        "knowledge": {
-            "status": "unavailable",
-            "provider": "none",
-            "development_replay": "sqlite_fts5",
-        },
+        "knowledge": knowledge,
         "execution": remote,
     }
 

@@ -83,7 +83,10 @@ class ConversationAction(BaseModel):
             if not patch_is_empty:
                 raise ValueError("only propose_patch may include proposed_patch")
             self.proposed_patch = None
-        self.citations = []
+        if len(self.citations) != len(set(self.citations)):
+            raise ValueError("citations must be unique")
+        if self.action != "respond" and self.citations:
+            raise ValueError("only respond may include citations")
         return self
 
 
