@@ -1982,6 +1982,48 @@ def _output_manifest(run_dir: Path) -> dict[str, Any]:
     return {"files": files, "omitted": omitted}
 
 
+def _current_attempt(state: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = state.get("attempts")
+    return attempts[-1] if isinstance(attempts, list) and attempts else None
+
+
+def _attempt_control_dir(state: dict[str, Any], bioagent_dir: Path) -> Path:
+    attempt = _current_attempt(state)
+    value = attempt.get("control_dir") if isinstance(attempt, dict) else None
+    if isinstance(value, str):
+        path = Path(value).resolve()
+        if bioagent_dir.resolve() in path.parents:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    return bioagent_dir
+
+
+def _phase_checkpoint(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    count = 0
+    total = 0
+    for candidate in sorted(path.rglob("*")):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        file_digest = hashlib.sha256()
+        with candidate.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                file_digest.update(chunk)
+        relative = candidate.relative_to(path)
+        size = candidate.stat().st_size
+        digest.update(str(relative).encode())
+        digest.update(b"\0")
+        digest.update(file_digest.hexdigest().encode())
+        count += 1
+        total += size
+    return {
+        "file_count": count,
+        "bytes": total,
+        "sha256": digest.hexdigest(),
+        "created_at": _now(),
+    }
+
+
 def _sequence_metrics(run_dir: Path, input_stats_path: Path) -> list[dict[str, Any]]:
     records = _parse_seqkit_table(input_stats_path, "raw_input")
     final_stats_path = run_dir / ".bioagent" / "final-sequences.tsv"
@@ -2257,6 +2299,8 @@ def _terminal_adaptive_state(
     error: str | None = None,
 ) -> int:
     finished_at = _now()
+    control_dir = _attempt_control_dir(state, state_path.parent)
+    telemetry_path = control_dir / "telemetry.json"
     state["execution"].update(
         {
             "status": status,
@@ -2271,7 +2315,7 @@ def _terminal_adaptive_state(
         **(state.get("technical_report") or {}),
         "status": "ready",
         "available": True,
-        "telemetry": str(state_path.parent / "telemetry.json"),
+        "telemetry": str(telemetry_path),
         "telemetry_version": 3,
     }
     reports = state.setdefault("reports", {})
@@ -2279,7 +2323,7 @@ def _terminal_adaptive_state(
         "status": "unavailable",
         "available": False,
         "schema_version": 4,
-        "telemetry": str(state_path.parent / "telemetry.json"),
+        "telemetry": str(telemetry_path),
     }
     telemetry.update(
         {
@@ -2289,7 +2333,10 @@ def _terminal_adaptive_state(
             **({"error": error} if error else {}),
         }
     )
-    _write_json_atomic(state_path.parent / "telemetry.json", telemetry)
+    attempt = _current_attempt(state)
+    if isinstance(attempt, dict):
+        attempt.update({"status": status, "finished_at": finished_at})
+    _write_json_atomic(telemetry_path, telemetry)
     _write_json_atomic(state_path, state)
     return returncode
 
@@ -2420,7 +2467,7 @@ def _continue_adaptive_full(
     _write_json_atomic(state_path, state)
     result = run(args)
     final_state = _read_state(state_path)
-    telemetry_path = bioagent_dir / "telemetry.json"
+    telemetry_path = _attempt_control_dir(final_state, bioagent_dir) / "telemetry.json"
     final_telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
     _finish_routing_record(
         routing_record,
@@ -2452,6 +2499,7 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     state_path = Path(args.state).resolve()
     run_dir = Path(state["run_dir"]).resolve()
     bioagent_dir = run_dir / ".bioagent"
+    control_dir = _attempt_control_dir(state, bioagent_dir)
     routing_path = bioagent_dir / "routing.json"
     queue = state.get("queue") if isinstance(state.get("queue"), dict) else {}
     if queue.get("waiting_stage") == "full_analysis" and isinstance(
@@ -2539,7 +2587,12 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
         routing_record["phase"] = "screening"
         _write_json_atomic(routing_path, routing_record)
         _write_json_atomic(state_path, state)
-        screening = run_rapid_screen(spec, run_dir, threads=SCREEN_THREADS)
+        screening = run_rapid_screen(
+            spec,
+            run_dir,
+            threads=SCREEN_THREADS,
+            control_dir=control_dir,
+        )
     except Exception as exc:  # noqa: BLE001
         error = redact_text(str(exc))
         routing_record["error"] = error
@@ -2654,16 +2707,20 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("state path does not match run directory")
 
     bioagent_dir = run_dir / ".bioagent"
-    benchmark_root = bioagent_dir / "benchmarks"
-    phase_log_root = bioagent_dir / "phase-logs"
-    telemetry_path = bioagent_dir / "telemetry.json"
-    input_stats_path = bioagent_dir / "input-sequences.tsv"
+    control_dir = _attempt_control_dir(state, bioagent_dir)
+    benchmark_root = control_dir / "benchmarks"
+    phase_log_root = control_dir / "phase-logs"
+    telemetry_path = control_dir / "telemetry.json"
+    input_stats_path = control_dir / "input-sequences.tsv"
     log_path = Path(state["execution"]["log"]).resolve()
     benchmark_root.mkdir(parents=True, exist_ok=True)
     phase_log_root.mkdir(parents=True, exist_ok=True)
 
     started_at = _now()
     state["execution"].update({"started_at": started_at, "status": "running"})
+    attempt = _current_attempt(state)
+    if isinstance(attempt, dict):
+        attempt.update({"status": "running", "started_at": started_at})
     _write_json_atomic(state_path, state)
 
     spec = state.get("execution_spec") or {}
@@ -2684,8 +2741,8 @@ def run(args: argparse.Namespace) -> int:
         "fastp": [],
         "manifest": {"files": [], "omitted": 0},
         "manifest_paths": {
-            "input": str(bioagent_dir / "input-manifest.json"),
-            "output": str(bioagent_dir / "output-manifest.json"),
+            "input": str(control_dir / "input-manifest.json"),
+            "output": str(control_dir / "output-manifest.json"),
         },
     }
 
@@ -2719,13 +2776,19 @@ def run(args: argparse.Namespace) -> int:
         prepared = prepare_execution(state, settings)
         workflow_id = prepared.workflow_id
         state["workflow_id"] = workflow_id
+        completed_phase_ids = set(
+            (state.get("resume_context") or {}).get("completed_phase_ids") or []
+        )
         state["phases"] = [
             {
                 "id": phase.id,
                 "workflow_id": phase.workflow_id,
                 "workflow_dir": str(phase.workflow_dir),
                 "results_dir": str(phase.results_dir),
-                "status": "pending",
+                "status": (
+                    "completed" if phase.id in completed_phase_ids else "pending"
+                ),
+                **({"reused": True} if phase.id in completed_phase_ids else {}),
             }
             for phase in prepared.phases
         ]
@@ -2746,6 +2809,32 @@ def run(args: argparse.Namespace) -> int:
             prepared.phases[0].workflow_dir,
             input_stats_path,
         )
+        if (state.get("resume_context") or {}).get("attempt") == state.get(
+            "current_attempt"
+        ):
+            prepared = PreparedExecution(
+                workflow_id=prepared.workflow_id,
+                phases=tuple(
+                    phase
+                    if phase.id in completed_phase_ids
+                    else PreparedPhase(
+                        id=phase.id,
+                        workflow_id=phase.workflow_id,
+                        workflow_dir=phase.workflow_dir,
+                        results_dir=phase.results_dir,
+                        command=[
+                            *phase.command,
+                            "--rerun-incomplete",
+                            "--forcerun",
+                            *phase.selected_rules,
+                        ],
+                        selected_rules=phase.selected_rules,
+                    )
+                    for phase in prepared.phases
+                ),
+                seqkit=prepared.seqkit,
+                selected_rules=prepared.selected_rules,
+            )
         telemetry["runner_commands"] = [
             [redact_text(value) for value in phase.command] for phase in prepared.phases
         ]
@@ -2762,6 +2851,21 @@ def run(args: argparse.Namespace) -> int:
         with log_path.open("w", encoding="utf-8") as log_file:
             for phase_index, phase in enumerate(prepared.phases):
                 active_phase = phase
+                if phase.id in completed_phase_ids:
+                    telemetry["phases"].append(
+                        {
+                            "id": phase.id,
+                            "workflow_id": phase.workflow_id,
+                            "workflow_dir": str(phase.workflow_dir),
+                            "results_dir": str(phase.results_dir),
+                            "command": [],
+                            "status": "completed",
+                            "returncode": 0,
+                            "reused": True,
+                        }
+                    )
+                    returncode = 0
+                    continue
                 phase_started_at = _now()
                 state["phases"][phase_index].update(
                     {"status": "running", "started_at": phase_started_at}
@@ -2852,6 +2956,12 @@ def run(args: argparse.Namespace) -> int:
                 _write_json_atomic(state_path, state)
                 if returncode != 0:
                     break
+                contract = state.get("recovery_contract")
+                if isinstance(contract, dict):
+                    contract.setdefault("phase_checkpoints", {})[phase.id] = (
+                        _phase_checkpoint(phase.results_dir)
+                    )
+                    _write_json_atomic(state_path, state)
     except Exception as exc:  # noqa: BLE001
         error = redact_text(str(exc))
         returncode = 128 + cancelled_signal if cancelled_signal else 1
@@ -3012,14 +3122,14 @@ def run(args: argparse.Namespace) -> int:
             telemetry["rrna_alignment_percents"],
         )
         _write_json_atomic(
-            bioagent_dir / "input-manifest.json",
+            control_dir / "input-manifest.json",
             {
                 "version": 1,
                 "files": telemetry.get("input_collection", {}).get("paths", []),
             },
         )
         _write_json_atomic(
-            bioagent_dir / "output-manifest.json",
+            control_dir / "output-manifest.json",
             {"version": 1, **telemetry["manifest"]},
         )
         completed_rules = {
@@ -3062,6 +3172,14 @@ def run(args: argparse.Namespace) -> int:
                 **({"cancelled": True} if cancelled_signal else {}),
             }
         )
+        current_attempt = _current_attempt(state)
+        if isinstance(current_attempt, dict):
+            current_attempt.update(
+                {
+                    "status": state["execution"]["status"],
+                    "finished_at": telemetry["finished_at"],
+                }
+            )
         state["technical_report"] = {
             **(state.get("technical_report") or {}),
             "status": "ready",

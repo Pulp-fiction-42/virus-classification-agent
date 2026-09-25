@@ -6,12 +6,12 @@ import gzip
 import os
 import shlex
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator, TextIO
+from typing import Any, TextIO
 
 from adaptive_routing import aggregate_screening, parse_kraken_report, screening_metrics
 from workflow_adapters import AdapterSettings
-
 
 SAMPLE_FRACTION = 0.05
 SAMPLE_SEED = 17
@@ -137,7 +137,11 @@ def _rrna_filter(
 
 
 def run_rapid_screen(
-    spec: dict[str, Any], run_dir: Path, *, threads: int = 4
+    spec: dict[str, Any],
+    run_dir: Path,
+    *,
+    threads: int = 4,
+    control_dir: Path | None = None,
 ) -> dict[str, Any]:
     settings = AdapterSettings.from_env()
     workflow1 = Path(
@@ -162,7 +166,8 @@ def run_rapid_screen(
         "/data/user/guojindan/Databases/Kraken/Viral_20260226",
     )
     output_root = run_dir / "results/screening"
-    log_path = run_dir / ".bioagent/screening.log"
+    log_path = (control_dir or run_dir / ".bioagent") / "screening.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     sample_buckets: dict[str, dict[str, Any]] = {}
     with log_path.open("w", encoding="utf-8") as log:
         input_type = (spec.get("policy") or {}).get("adaptive_input_type")

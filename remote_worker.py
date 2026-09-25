@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat as stat_module
 import subprocess
@@ -37,12 +38,17 @@ SCREEN_MEMORY_MB = 4 * 1024
 FULL_ANALYSIS_MINIMUM_THREADS = 8
 FULL_ANALYSIS_MINIMUM_MEMORY_MB = 24 * 1024
 RESOURCE_RETRY_SECONDS = 5
+RECOVERY_CONTRACT_VERSION = 1
 FASTQ_EXTENSION_RE = re.compile(r"(?i)(\.fastq|\.fq)(\.gz)?$")
 QUICK_RECORD_LIMIT = 1_000
 QUICK_BYTE_LIMIT = 8 * 1024 * 1024
 
 
 class WorkerError(ValueError):
+    pass
+
+
+class RecoveryCheckUnavailable(WorkerError):
     pass
 
 
@@ -108,6 +114,234 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     os.replace(temporary, path)
+
+
+def _json_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    try:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise WorkerError(f"恢复依赖不可用：{path}")
+        stat = resolved.stat()
+        digest = hashlib.sha256()
+        with resolved.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except RecoveryCheckUnavailable:
+        raise
+    except OSError as exc:
+        raise RecoveryCheckUnavailable(f"恢复依赖暂时无法验证：{path}") from exc
+    return {
+        "path": str(resolved),
+        "size": stat.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _tree_identity(path: Path) -> dict[str, Any]:
+    try:
+        root = path.resolve()
+        if not root.is_dir():
+            raise WorkerError(f"恢复依赖目录不可用：{path}")
+        digest = hashlib.sha256()
+        count = 0
+        total = 0
+        ignored = {".git", ".snakemake", "__pycache__", "logs", "results"}
+        for candidate in sorted(root.rglob("*")):
+            relative = candidate.relative_to(root)
+            if any(part in ignored for part in relative.parts):
+                continue
+            if candidate.is_symlink():
+                digest.update(str(relative).encode())
+                digest.update(b"\0link\0")
+                digest.update(str(candidate.resolve()).encode())
+                continue
+            if not candidate.is_file():
+                continue
+            identity = _file_identity(candidate)
+            digest.update(str(relative).encode())
+            digest.update(b"\0")
+            digest.update(identity["sha256"].encode())
+            count += 1
+            total += int(identity["size"])
+    except RecoveryCheckUnavailable:
+        raise
+    except OSError as exc:
+        raise RecoveryCheckUnavailable(f"恢复依赖暂时无法验证：{path}") from exc
+    return {
+        "path": str(root),
+        "file_count": count,
+        "bytes": total,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _recovery_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: plan.get(key)
+        for key in (
+            "plan_ref",
+            "goals",
+            "options",
+            "routing",
+            "execution_spec",
+            "steps",
+            "metadata_snapshot",
+        )
+    }
+
+
+def _fastp_path(workflow_root: Path) -> Path:
+    config_path = workflow_root / "config" / "config.yaml"
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise WorkerError("恢复依赖缺少 Workflow 1 配置") from exc
+    for line in lines:
+        match = re.match(r"^\s*fastp:\s*[\"']?(.+?)[\"']?\s*$", line)
+        if match:
+            return Path(match.group(1))
+    raise WorkerError("恢复依赖缺少 fastp 身份")
+
+
+def _dependency_identity(
+    state: dict[str, Any], settings: dict[str, Any]
+) -> tuple[bool, dict[str, Any], str | None]:
+    if state.get("diagnostic"):
+        return True, {"kind": "diagnostic"}, None
+    spec = state.get("execution_spec") or {}
+    stages = spec.get("stages") if isinstance(spec, dict) else None
+    if not isinstance(stages, list) or not stages:
+        return False, {}, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
+    stage_ids = {
+        str(stage.get("id"))
+        for stage in stages
+        if isinstance(stage, dict) and stage.get("id")
+    }
+    workflow_ids = {
+        str(stage.get("workflow_id"))
+        for stage in stages
+        if isinstance(stage, dict) and stage.get("workflow_id")
+    }
+    # The current catalog only publishes a complete executable dependency
+    # identity for Workflow 1 read_qc. Other stages remain deliberately
+    # ineligible until B1 publishes their tools and reference releases.
+    if workflow_ids != {"workflow1"} or not stage_ids <= {"read_qc"}:
+        return False, {}, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
+    environment = _runner_environment(settings)
+    required = (
+        "BIOAGENT_SNAKEMAKE",
+        "BIOAGENT_SEQKIT",
+        "BIOAGENT_WORKFLOW1_SOURCE",
+    )
+    if any(not environment.get(key) for key in required):
+        return False, {}, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
+    try:
+        workflow = Path(environment["BIOAGENT_WORKFLOW1_SOURCE"])
+        identity = {
+            "kind": "workflow1_read_qc",
+            "workflow": _tree_identity(workflow),
+            "snakemake": _file_identity(Path(environment["BIOAGENT_SNAKEMAKE"])),
+            "seqkit": _file_identity(Path(environment["BIOAGENT_SEQKIT"])),
+            "fastp": _file_identity(_fastp_path(workflow)),
+        }
+    except RecoveryCheckUnavailable:
+        return False, {}, "RECOVERY_CHECK_UNAVAILABLE"
+    except (OSError, WorkerError):
+        return False, {}, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
+    return True, identity, None
+
+
+def _attempt_dir(run_dir: Path, number: int) -> Path:
+    return run_dir / ".bioagent" / "attempts" / f"{number:04d}"
+
+
+def _append_attempt(
+    state: dict[str, Any], *, trigger: str, status: str
+) -> dict[str, Any]:
+    attempts = state.setdefault("attempts", [])
+    number = len(attempts) + 1
+    run_dir = Path(str(state["run_dir"]))
+    control_dir = _attempt_dir(run_dir, number)
+    control_dir.mkdir(parents=True, exist_ok=False)
+    attempt = {
+        "number": number,
+        "trigger": trigger,
+        "status": status,
+        "created_at": _now(),
+        "control_dir": str(control_dir),
+        "execution_log": str(control_dir / "execution.log"),
+        "runner_log": str(control_dir / "runner-process.log"),
+        "telemetry": str(control_dir / "telemetry.json"),
+    }
+    Path(attempt["execution_log"]).touch()
+    attempts.append(attempt)
+    state["current_attempt"] = number
+    return attempt
+
+
+def _current_attempt(state: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = state.get("attempts")
+    return attempts[-1] if isinstance(attempts, list) and attempts else None
+
+
+def _recovery_contract(
+    state: dict[str, Any], settings: dict[str, Any], worker_version: str
+) -> dict[str, Any]:
+    complete, dependencies, blocker = _dependency_identity(state, settings)
+    return {
+        "schema_version": RECOVERY_CONTRACT_VERSION,
+        "created_at": _now(),
+        "plan_sha256": _json_digest(_recovery_plan_payload(state.get("plan") or {})),
+        "dataset_sha256": _json_digest(state.get("dataset") or {}),
+        "capability_sha256": _json_digest(
+            (state.get("execution_spec") or {}).get("capability_contract") or {}
+        ),
+        "worker_version": worker_version,
+        "dependencies_complete": complete,
+        "dependencies": dependencies,
+        "dependency_sha256": _json_digest(dependencies) if complete else None,
+        "phase_checkpoints": {},
+        "last_check": {
+            "checked_at": _now(),
+            "blocker_code": blocker,
+        },
+    }
+
+
+def recovery_status(state: dict[str, Any]) -> dict[str, Any]:
+    contract = state.get("recovery_contract")
+    execution = state.get("execution") or {}
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), list) else []
+    blocker = None
+    checked_at = None
+    if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+        blocker = "RECOVERY_LEGACY_STATE"
+    else:
+        last_check = contract.get("last_check") or {}
+        blocker = last_check.get("blocker_code")
+        checked_at = last_check.get("checked_at")
+        if contract.get("dependencies_complete") is not True:
+            blocker = blocker or "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
+    return {
+        "available": bool(
+            execution.get("status") == "interrupted"
+            and isinstance(contract, dict)
+            and contract.get("schema_version") == 1
+            and contract.get("dependencies_complete") is True
+            and not blocker
+        ),
+        "attempt_count": len(attempts),
+        "current_attempt": state.get("current_attempt"),
+        "blocker_code": blocker,
+        "checked_at": checked_at,
+    }
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -593,6 +827,45 @@ def _validate_dataset(dataset: dict[str, Any], settings: dict[str, Any]) -> None
         raise WorkerError("analysis dataset has no executable files")
 
 
+def _recovery_fingerprint_status(
+    source: dict[str, Any], settings: dict[str, Any]
+) -> bool | None:
+    try:
+        current = resolve_source(
+            str(source["path"]),
+            settings,
+            expected_kind=str(source.get("kind") or "") or None,
+        )
+    except KeyError:
+        return False
+    except WorkerError as exc:
+        message = str(exc).lower()
+        if "unavailable" in message or "不可用" in message or "not readable" in message:
+            return None
+        return False
+    return current["fingerprint"] == source.get("fingerprint")
+
+
+def _recovery_dataset_status(
+    dataset: dict[str, Any], settings: dict[str, Any]
+) -> str:
+    if dataset.get("status") != "ready":
+        return "changed"
+    seen = 0
+    for artifact in dataset.get("artifacts") or []:
+        for record in artifact.get("records") or []:
+            for source in (record.get("files") or {}).values():
+                if not isinstance(source, dict):
+                    return "changed"
+                status = _recovery_fingerprint_status(source, settings)
+                if status is None:
+                    return "unavailable"
+                if status is False:
+                    return "changed"
+                seen += 1
+    return "ready" if seen else "changed"
+
+
 def _queue_context(request: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     raw = request.get("queue_context")
     if not isinstance(raw, dict):
@@ -801,7 +1074,6 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
     run_dir = state_path.parent.parent
     execution_spec = plan["execution_spec"]
     steps = plan.get("steps") or []
-    log_path = run_dir / ".bioagent" / "execution.log"
     state = {
         "version": 3,
         "run_id": run_id,
@@ -858,7 +1130,6 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
             "ok": None,
             "returncode": None,
             "current_step_id": None,
-            "log": str(log_path),
             "queued_at": _now(),
         },
         "technical_report": {
@@ -889,7 +1160,13 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         },
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.touch(exist_ok=True)
+    attempt = _append_attempt(state, trigger="initial", status="queued")
+    state["execution"]["log"] = attempt["execution_log"]
+    state["technical_report"]["telemetry"] = attempt["telemetry"]
+    state["reports"]["final"]["telemetry"] = attempt["telemetry"]
+    state["recovery_contract"] = _recovery_contract(
+        state, settings, str(request["worker_version"])
+    )
     (state_path.parent / "agent-trace.jsonl").touch(exist_ok=True)
     _write_json_atomic(state_path, state)
     _ensure_scheduler(settings, str(request["worker_version"]))
@@ -947,14 +1224,291 @@ def diagnostic_launch(request: dict[str, Any]) -> dict[str, Any]:
         },
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    (state_path.parent / "execution.log").touch(exist_ok=True)
+    attempt = _append_attempt(state, trigger="initial", status="queued")
+    state["execution"]["log"] = attempt["execution_log"]
+    state["recovery_contract"] = _recovery_contract(
+        state, settings, str(request["worker_version"])
+    )
     _write_json_atomic(state_path, state)
+    _ensure_scheduler(settings, str(request["worker_version"]))
+    return _run_item(run_id, settings, "queued")
+
+
+def _set_recovery_blocker(
+    state_path: Path, state: dict[str, Any], code: str | None
+) -> None:
+    contract = state.get("recovery_contract")
+    if isinstance(contract, dict):
+        contract["last_check"] = {
+            "checked_at": _now(),
+            "blocker_code": code,
+        }
+        _write_json_atomic(state_path, state)
+
+
+def _recovery_reject(
+    state_path: Path, state: dict[str, Any], code: str, message: str
+) -> None:
+    _set_recovery_blocker(state_path, state, code)
+    raise WorkerError(f"{code}: {message}")
+
+
+def _validate_phase_checkpoints(
+    state_path: Path, state: dict[str, Any], contract: dict[str, Any]
+) -> list[str]:
+    run_dir = state_path.parent.parent.resolve()
+    checkpoints = contract.get("phase_checkpoints")
+    if not isinstance(checkpoints, dict):
+        _recovery_reject(
+            state_path,
+            state,
+            "RECOVERY_ARTIFACT_CHANGED",
+            "恢复 checkpoint 格式无效",
+        )
+    completed: list[str] = []
+    for phase_id, expected in checkpoints.items():
+        if not isinstance(phase_id, str) or not isinstance(expected, dict):
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_ARTIFACT_CHANGED",
+                "恢复 checkpoint 格式无效",
+            )
+        results_dir = (run_dir / "results" / phase_id).resolve()
+        if run_dir not in results_dir.parents:
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_ARTIFACT_CHANGED",
+                "恢复产物路径越界",
+            )
+        try:
+            actual = _tree_identity(results_dir)
+        except RecoveryCheckUnavailable as exc:
+            raise WorkerError(
+                "RECOVERY_CHECK_UNAVAILABLE: 已完成阶段产物暂时无法验证"
+            ) from exc
+        except WorkerError:
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_ARTIFACT_CHANGED",
+                f"已完成阶段 {phase_id} 的产物不可用",
+            )
+        if {
+            key: actual.get(key) for key in ("file_count", "bytes", "sha256")
+        } != {key: expected.get(key) for key in ("file_count", "bytes", "sha256")}:
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_ARTIFACT_CHANGED",
+                f"已完成阶段 {phase_id} 的产物发生变化",
+            )
+        completed.append(phase_id)
+    return completed
+
+
+def resume(request: dict[str, Any]) -> dict[str, Any]:
+    settings = request["settings"]
+    run_id = str(request.get("run_id") or "")
+    state_path = _state_path(settings, run_id)
+    if not state_path.is_file():
+        raise WorkerError("RECOVERY_RUN_NOT_FOUND: 分析任务不存在")
+    lock_path = state_path.parent / "recovery.lock"
+    lock_path.touch(exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_json(state_path)
+        execution = state.get("execution") or {}
+        status = str(execution.get("status") or "")
+        latest = _current_attempt(state)
+        if (
+            status in QUEUE_STATUSES | {"running"}
+            and isinstance(latest, dict)
+            and latest.get("trigger") == "manual_resume"
+        ):
+            _ensure_scheduler(settings, str(request["worker_version"]))
+            return _run_item(run_id, settings, status)
+        if status != "interrupted":
+            raise WorkerError(
+                "RECOVERY_RUN_NOT_INTERRUPTED: 只有已中断任务可以恢复"
+            )
+        contract = state.get("recovery_contract")
+        if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+            raise WorkerError(
+                "RECOVERY_LEGACY_STATE: 旧任务缺少恢复契约，请建立新方案与运行"
+            )
+        if contract.get("dependencies_complete") is not True:
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE",
+                "当前能力缺少完整工具或参考资产身份，请建立新运行",
+            )
+        if state.get("openwebui_chat_id") != request.get("chat_id"):
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_CONTEXT_CHANGED",
+                "任务与当前会话不匹配",
+            )
+        plan = request.get("plan")
+        dataset = request.get("dataset")
+        if not isinstance(plan, dict) or not isinstance(dataset, dict):
+            if not state.get("diagnostic"):
+                raise WorkerError(
+                    "RECOVERY_CONTEXT_CHANGED: 恢复请求缺少权威方案或数据集"
+                )
+            plan = state.get("plan") or {}
+            dataset = state.get("dataset") or {}
+        if state.get("plan_ref") != plan.get("plan_ref"):
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_CONTEXT_CHANGED",
+                "方案 revision 已改变",
+            )
+        if contract.get("plan_sha256") != _json_digest(
+            _recovery_plan_payload(plan)
+        ) or contract.get("dataset_sha256") != _json_digest(dataset):
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_CONTEXT_CHANGED",
+                "冻结方案或数据集已改变",
+            )
+        if contract.get("worker_version") != str(request.get("worker_version")):
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_WORKER_CHANGED",
+                "worker 版本已改变",
+            )
+        if dataset:
+            dataset_status = _recovery_dataset_status(dataset, settings)
+            if dataset_status == "unavailable":
+                raise WorkerError(
+                    "RECOVERY_CHECK_UNAVAILABLE: 输入指纹暂时无法验证"
+                )
+            if dataset_status != "ready":
+                _recovery_reject(
+                    state_path,
+                    state,
+                    "RECOVERY_INPUT_CHANGED",
+                    "输入文件或指纹已改变",
+                )
+        complete, dependencies, blocker = _dependency_identity(state, settings)
+        if blocker == "RECOVERY_CHECK_UNAVAILABLE":
+            raise WorkerError("RECOVERY_CHECK_UNAVAILABLE: 恢复依赖暂时无法验证")
+        if (
+            not complete
+            or blocker
+            or contract.get("dependency_sha256") != _json_digest(dependencies)
+        ):
+            _recovery_reject(
+                state_path,
+                state,
+                blocker or "RECOVERY_DEPENDENCY_CHANGED",
+                "工具、workflow 或参考资产身份已改变",
+            )
+        supervisor_path = state_path.parent / "supervisor.json"
+        supervisor = _read_json(supervisor_path) if supervisor_path.is_file() else {}
+        if _runner_alive(supervisor.get("runner_pid"), state_path):
+            _recovery_reject(
+                state_path,
+                state,
+                "RECOVERY_RUNNER_ACTIVE",
+                "远端 runner 仍在运行",
+            )
+        completed_phases = _validate_phase_checkpoints(state_path, state, contract)
+        preliminary = (state.get("reports") or {}).get("preliminary") or {}
+        if preliminary.get("available") is not True:
+            # Screening outputs are reusable only after the immutable preliminary
+            # report has been published. A crash before publication must not make
+            # the next attempt trust partial screening files.
+            screening_root = state_path.parent.parent / "results" / "screening"
+            if screening_root.exists():
+                shutil.rmtree(screening_root)
+            (state_path.parent / "preliminary-telemetry.json").unlink(missing_ok=True)
+        workflow_root = state_path.parent.parent / "workflows"
+        if workflow_root.exists():
+            shutil.rmtree(workflow_root)
+        attempt = _append_attempt(state, trigger="manual_resume", status="queued")
+        now = _now()
+        state["resume_context"] = {
+            "attempt": attempt["number"],
+            "completed_phase_ids": completed_phases,
+            "requested_at": now,
+        }
+        for phase in state.get("phases") or []:
+            if isinstance(phase, dict) and phase.get("id") not in completed_phases:
+                phase["status"] = "pending"
+        for step in state.get("steps") or []:
+            if isinstance(step, dict) and step.get("status") != "completed":
+                step["status"] = "pending"
+        execution.update(
+            {
+                "status": "queued",
+                "ok": None,
+                "returncode": None,
+                "current_step_id": None,
+                "queued_at": now,
+                "log": attempt["execution_log"],
+            }
+        )
+        for key in ("error", "finished_at", "pid", "cancelled"):
+            execution.pop(key, None)
+        queue = _queue_record(state)
+        queue.update(
+            {
+                "enqueued_at": now,
+                "waiting_stage": (
+                    "full_analysis"
+                    if isinstance((state.get("reports") or {}).get("preliminary"), dict)
+                    and state["reports"]["preliminary"].get("available") is True
+                    else None
+                ),
+                "waiting_reason_codes": [],
+                "last_checked_at": None,
+            }
+        )
+        state.setdefault("technical_report", {}).update(
+            {
+                "status": "collecting",
+                "available": False,
+                "telemetry": attempt["telemetry"],
+            }
+        )
+        state.setdefault("reports", {}).setdefault("final", {}).update(
+            {
+                "status": "collecting",
+                "available": False,
+                "telemetry": attempt["telemetry"],
+            }
+        )
+        state["standard_delivery"] = {
+            "schema_version": 1,
+            "status": "pending",
+            "artifacts": {},
+        }
+        contract["last_check"] = {"checked_at": now, "blocker_code": None}
+        _write_json_atomic(state_path, state)
     _ensure_scheduler(settings, str(request["worker_version"]))
     return _run_item(run_id, settings, "queued")
 
 
 def _run_item(run_id: str, settings: dict[str, Any], status: str) -> dict[str, Any]:
     run_dir = Path(settings["run_root"]) / run_id
+    state_path = run_dir / ".bioagent" / "state.json"
+    log_path = run_dir / ".bioagent" / "execution.log"
+    if state_path.is_file():
+        try:
+            state = _read_json(state_path)
+            value = (state.get("execution") or {}).get("log")
+            if isinstance(value, str):
+                log_path = Path(value)
+        except WorkerError:
+            pass
     return {
         "type": "analysis_run",
         "id": f"analysis_run_{run_id}",
@@ -962,8 +1516,8 @@ def _run_item(run_id: str, settings: dict[str, Any], status: str) -> dict[str, A
         "run": {
             "run_id": run_id,
             "run_dir": str(run_dir),
-            "state_path": str(run_dir / ".bioagent" / "state.json"),
-            "log_path": str(run_dir / ".bioagent" / "execution.log"),
+            "state_path": str(state_path),
+            "log_path": str(log_path),
         },
     }
 
@@ -1046,7 +1600,11 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
             "same_boot": same_boot,
         },
         "queue": _queue_status(state, settings),
-        "log": _read_optional(state_path.parent / "execution.log", 8 * 1024 * 1024)
+        "recovery": recovery_status(state),
+        "log": _read_optional(
+            Path(str((state.get("execution") or {}).get("log") or state_path.parent / "execution.log")),
+            8 * 1024 * 1024,
+        )
         or "",
         "telemetry": telemetry,
         "agent_trace": trace,
@@ -1403,6 +1961,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
         return preflight(request)
     if operation == "launch":
         return launch(request)
+    if operation == "resume":
+        return resume(request)
     if operation == "diagnostic_launch":
         return diagnostic_launch(request)
     if operation == "snapshot":
@@ -1438,6 +1998,9 @@ def run_diagnostic(args: argparse.Namespace) -> int:
         }
     )
     state["technical_report"].update({"status": "ready", "available": True})
+    attempt = _current_attempt(state)
+    if isinstance(attempt, dict):
+        attempt.update({"status": "completed", "finished_at": _now()})
     _write_json_atomic(state_path, state)
     return 0
 
@@ -1454,6 +2017,9 @@ def _interrupt_missing_runner(state_path: Path, state: dict[str, Any]) -> None:
     state.setdefault("technical_report", {}).update(
         {"status": "ready", "available": True}
     )
+    attempt = _current_attempt(state)
+    if isinstance(attempt, dict):
+        attempt.update({"status": "interrupted", "finished_at": _now()})
     _write_json_atomic(state_path, state)
 
 
@@ -1519,8 +2085,16 @@ def _run_candidate(
     state["execution"].update(
         {"status": "running", "started_at": _now(), "ok": None}
     )
+    attempt = _current_attempt(state)
+    if isinstance(attempt, dict):
+        attempt.update({"status": "running", "started_at": _now()})
     _write_json_atomic(state_path, state)
-    runner_log = state_path.parent / "runner-process.log"
+    runner_log = (
+        Path(str(attempt["runner_log"]))
+        if isinstance(attempt, dict) and isinstance(attempt.get("runner_log"), str)
+        else state_path.parent / "runner-process.log"
+    )
+    runner_log.parent.mkdir(parents=True, exist_ok=True)
     with runner_log.open("ab") as output:
         process = subprocess.Popen(
             _runner_command(state_path, state),
@@ -1559,6 +2133,10 @@ def _run_candidate(
         )
         _write_json_atomic(state_path, final)
         status = str(final["execution"]["status"])
+    final_attempt = _current_attempt(final)
+    if isinstance(final_attempt, dict) and status in TERMINAL_STATUSES:
+        final_attempt.update({"status": status, "finished_at": _now()})
+        _write_json_atomic(state_path, final)
     _write_json_atomic(
         supervisor_path,
         {

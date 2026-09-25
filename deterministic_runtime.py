@@ -112,6 +112,11 @@ class DeterministicRuntime:
                 raise SessionStateError(f"分析任务启动失败：{exc}") from exc
             return self._analysis_run_item(plan, "running")
 
+    async def resume_deterministic_plan(
+        self, plan: dict[str, Any], chat_id: str
+    ) -> dict[str, Any]:
+        raise SessionStateError("本机执行模式尚不支持中断恢复。")
+
     def _write_initial_run_state(
         self, plan: dict[str, Any], chat_id: str
     ) -> dict[str, Any]:
@@ -358,4 +363,17 @@ class RemoteDeterministicRuntime:
             chat_id=normalized_chat_id,
             run_id=run.get("run_id"),
             queue_context=plan.get("queue_context"),
+        )
+
+    async def resume_deterministic_plan(
+        self, plan: dict[str, Any], chat_id: str
+    ) -> dict[str, Any]:
+        normalized_chat_id = DeterministicRuntime._validate_chat_id(chat_id)
+        run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
+        return await self.remote.invoke(
+            "resume",
+            plan=plan,
+            dataset=plan.get("dataset"),
+            chat_id=normalized_chat_id,
+            run_id=run.get("run_id"),
         )

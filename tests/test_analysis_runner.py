@@ -682,7 +682,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             script = (scripts / "table_summarize.py").read_text(encoding="utf-8")
             iterative = (scripts / "iterativehmmsearch.py").read_text(encoding="utf-8")
             namespace = {}
-            exec(
+            exec(  # noqa: S102 - execute the generated isolated test fixture
                 compile(iterative, str(scripts / "iterativehmmsearch.py"), "exec"),
                 namespace,
             )
@@ -1266,6 +1266,118 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
         self.assertEqual(
             [(phase["id"], phase["status"]) for phase in telemetry["phases"]],
             [("upstream", "completed"), ("classification", "failed")],
+        )
+
+    def test_resume_skips_checkpointed_phase_and_forces_interrupted_phase(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "run"
+            bioagent = run_dir / ".bioagent"
+            control_dir = bioagent / "attempts" / "0002"
+            control_dir.mkdir(parents=True)
+            input_path = root / "contigs.fa"
+            input_path.write_text(">contig\nACGT\n", encoding="utf-8")
+            skipped_marker = root / "checkpointed-phase-ran"
+            forced_arguments = root / "forced-arguments.txt"
+            state_path = bioagent / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "run_id": "analysis-resume-test",
+                        "run_dir": str(run_dir),
+                        "openwebui_chat_id": "chat-test",
+                        "execution_spec": self._contig_spec(input_path),
+                        "steps": [],
+                        "current_attempt": 2,
+                        "attempts": [
+                            {"number": 1, "status": "interrupted"},
+                            {
+                                "number": 2,
+                                "status": "queued",
+                                "control_dir": str(control_dir),
+                            },
+                        ],
+                        "resume_context": {
+                            "attempt": 2,
+                            "completed_phase_ids": ["upstream"],
+                        },
+                        "recovery_contract": {"phase_checkpoints": {}},
+                        "execution": {
+                            "status": "queued",
+                            "ok": None,
+                            "log": str(control_dir / "execution.log"),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workflows = []
+            for phase_id in ("upstream", "classification"):
+                workflow = run_dir / "workflows" / phase_id
+                (workflow / "rules").mkdir(parents=True)
+                (workflow / "data").mkdir()
+                (workflow / "rules" / "upstream.smk").write_text(
+                    'rule fastp:\n    shell:\n        "true"\n',
+                    encoding="utf-8",
+                )
+                workflows.append(workflow)
+            checkpointed = root / "checkpointed-phase"
+            checkpointed.write_text(
+                f"#!/bin/sh\ntouch {skipped_marker}\nexit 99\n",
+                encoding="utf-8",
+            )
+            checkpointed.chmod(0o755)
+            interrupted = root / "interrupted-phase"
+            interrupted.write_text(
+                f'#!/bin/sh\nprintf "%s\\n" "$@" > {forced_arguments}\nexit 7\n',
+                encoding="utf-8",
+            )
+            interrupted.chmod(0o755)
+            phases = (
+                PreparedPhase(
+                    id="upstream",
+                    workflow_id="workflow1",
+                    workflow_dir=workflows[0],
+                    results_dir=run_dir / "results" / "upstream",
+                    command=[str(checkpointed)],
+                    selected_rules=("fastp",),
+                ),
+                PreparedPhase(
+                    id="classification",
+                    workflow_id="workflow1",
+                    workflow_dir=workflows[1],
+                    results_dir=run_dir / "results" / "classification",
+                    command=[str(interrupted)],
+                    selected_rules=("fastp",),
+                ),
+            )
+            prepared = PreparedExecution(
+                workflow_id="analysis_pipeline",
+                phases=phases,
+                seqkit=str(self._write_seqkit(root)),
+                selected_rules=("fastp",),
+            )
+
+            with patch("analysis_runner.prepare_execution", return_value=prepared):
+                result = run(argparse.Namespace(state=str(state_path)))
+
+            telemetry = json.loads(
+                (control_dir / "telemetry.json").read_text(encoding="utf-8")
+            )
+            arguments = forced_arguments.read_text(encoding="utf-8").splitlines()
+            skipped_marker_exists = skipped_marker.exists()
+
+        self.assertEqual(result, 7)
+        self.assertFalse(skipped_marker_exists)
+        self.assertEqual(
+            [(phase["id"], phase["status"]) for phase in telemetry["phases"]],
+            [("upstream", "completed"), ("classification", "failed")],
+        )
+        self.assertTrue(telemetry["phases"][0]["reused"])
+        self.assertEqual(
+            arguments,
+            ["--rerun-incomplete", "--forcerun", "fastp"],
         )
 
     def test_sigterm_preserves_cancelled_partial_telemetry(self):

@@ -7,6 +7,7 @@ BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化
 - `/v1/models`、`/v1/chat/completions`：OpenAI-compatible 对话。
 - `/v1/analysis/plans/compile`：确定性编译分析方案。
 - `/v1/analysis/runs/start`：验证 dataset revision 后排队远端 run。
+- `/v1/analysis/runs/resume`：仅对具备冻结恢复契约的 `interrupted` run 重新校验并追加 attempt；旧 run 或依赖身份不完整时拒绝原地恢复。
 - `/v1/analysis/files`：列举 Cyclone data root 的 logical 文件树。
 - `/v1/analysis/datasets/resolve|preflight|fingerprints`：symlink-aware 解析、FASTQ quick/full check 与二次指纹验证。
 - `/v1/analysis/runs/snapshot`：state、队列/tmux、progress、telemetry、trace 与报告资料；传 `report_kind=preliminary|final` 选择对应 telemetry。
@@ -22,7 +23,9 @@ BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化
 - 对最小 worker 文件集计算 SHA-256，原子发布到 `BIOAGENT_REMOTE_WORKER_ROOT/releases/<sha256>`。
 - 使用指定的远端 Python；worker 和 RPC 仅依赖标准库，runner 依赖随发布同步的本项目模块。
 
-`remote_worker.py` 负责 data allowlist、双层指纹、FASTQ 检查、资源采集、tmux session 和 reconciliation。每个远端 supervisor 以 `fcntl.flock` 等待全局分析锁，并在独立 `supervisor.json` 写 heartbeat、PID、boot ID 与 worker version，避免与 runner 的 state 原子写互相覆盖。
+`remote_worker.py` 负责 data allowlist、双层指纹、FASTQ 检查、资源采集、单一持久 scheduler 和 reconciliation。scheduler 以 `fcntl.flock` 保证最终互斥，并在独立 `supervisor.json` 写 heartbeat、PID、boot ID 与 worker version，避免与 runner 的 state 原子写互相覆盖。
+
+新 run 在 state v3 中冻结 `recovery_contract`，并把每次小型控制日志、telemetry 与 checkpoint 登记在 `.bioagent/attempts/<序号>/`；大型计算结果继续共用 run root。恢复只跳过 checkpoint 已验证的完整 phase，中断 phase 使用 Snakemake `--rerun-incomplete` 并强制重跑受控 rules。当前只有 diagnostic 与 Workflow 1 `read_qc` 具备足够完整的工具／workflow 身份；其他 workflow 会明确返回不可恢复，不会猜测兼容旧 state。
 
 ## 配置
 

@@ -305,6 +305,242 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         persisted = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["execution"]["status"], "interrupted")
 
+    def _interrupted_diagnostic(self, run_id="analysis-resume"):
+        request = {
+            "settings": self.settings,
+            "run_id": run_id,
+            "worker_version": "abc",
+            "duration_seconds": 1,
+            "queue_context": {
+                "project_id": "project-one",
+                "project_priority": "high",
+            },
+        }
+        with patch("remote_worker._ensure_scheduler"):
+            remote_worker.diagnostic_launch(request)
+        state_path = self.runs / run_id / ".bioagent" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["execution"]["status"] = "interrupted"
+        state["attempts"][-1]["status"] = "interrupted"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return request, state_path
+
+    def test_interrupted_diagnostic_resume_is_atomic_and_idempotent(self):
+        request, state_path = self._interrupted_diagnostic()
+        with (
+            patch("remote_worker._runner_alive", return_value=False),
+            patch("remote_worker._ensure_scheduler") as scheduler,
+        ):
+            result = remote_worker.resume(request)
+            duplicate = remote_worker.resume(request)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(duplicate["status"], "queued")
+        self.assertEqual(state["execution"]["status"], "queued")
+        self.assertEqual(len(state["attempts"]), 2)
+        self.assertEqual(state["attempts"][-1]["trigger"], "manual_resume")
+        self.assertEqual(state["queue"]["project_priority"], "high")
+        self.assertEqual(scheduler.call_count, 2)
+
+    def test_legacy_interrupted_state_cannot_resume(self):
+        state_path = self._state("analysis-legacy-resume", "interrupted")
+        with self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_LEGACY_STATE"):
+            remote_worker.resume(
+                {
+                    "settings": self.settings,
+                    "run_id": "analysis-legacy-resume",
+                    "worker_version": "abc",
+                }
+            )
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))["execution"]["status"],
+            "interrupted",
+        )
+
+    def test_changed_worker_blocks_resume_without_new_attempt(self):
+        request, state_path = self._interrupted_diagnostic("analysis-worker-changed")
+        request["worker_version"] = "different"
+        with self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_WORKER_CHANGED"):
+            remote_worker.resume(request)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["attempts"]), 1)
+        self.assertEqual(
+            state["recovery_contract"]["last_check"]["blocker_code"],
+            "RECOVERY_WORKER_CHANGED",
+        )
+
+    def test_changed_plan_blocks_resume_without_new_attempt(self):
+        request, state_path = self._interrupted_diagnostic("analysis-plan-changed")
+        request.update({"plan": {"goals": ["changed"]}, "dataset": {}})
+
+        with self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_CONTEXT_CHANGED"):
+            remote_worker.resume(request)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["attempts"]), 1)
+
+    def test_input_validation_failure_blocks_resume(self):
+        request, state_path = self._interrupted_diagnostic("analysis-input-changed")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        dataset = {"id": "dataset", "revision": 1, "status": "ready"}
+        state["dataset"] = dataset
+        state["recovery_contract"]["dataset_sha256"] = remote_worker._json_digest(
+            dataset
+        )
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        request.update({"plan": {}, "dataset": dataset})
+
+        with (
+            patch(
+                "remote_worker._recovery_dataset_status",
+                return_value="changed",
+            ),
+            self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_INPUT_CHANGED"),
+        ):
+            remote_worker.resume(request)
+
+    def test_temporarily_unavailable_input_keeps_interrupted_state_retryable(self):
+        request, state_path = self._interrupted_diagnostic(
+            "analysis-input-unavailable"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        dataset = {"id": "dataset", "revision": 1, "status": "ready"}
+        state["dataset"] = dataset
+        state["recovery_contract"]["dataset_sha256"] = remote_worker._json_digest(
+            dataset
+        )
+        original_check = state["recovery_contract"]["last_check"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        request.update({"plan": {}, "dataset": dataset})
+
+        with (
+            patch(
+                "remote_worker._recovery_dataset_status",
+                return_value="unavailable",
+            ),
+            self.assertRaisesRegex(
+                remote_worker.WorkerError, "RECOVERY_CHECK_UNAVAILABLE"
+            ),
+        ):
+            remote_worker.resume(request)
+
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["execution"]["status"], "interrupted")
+        self.assertEqual(persisted["recovery_contract"]["last_check"], original_check)
+        self.assertEqual(len(persisted["attempts"]), 1)
+
+    def test_changed_dependency_blocks_resume(self):
+        request, state_path = self._interrupted_diagnostic(
+            "analysis-dependency-changed"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["recovery_contract"]["dependency_sha256"] = "changed"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            remote_worker.WorkerError, "RECOVERY_DEPENDENCY_CHANGED"
+        ):
+            remote_worker.resume(request)
+
+    def test_temporarily_unavailable_dependency_keeps_interrupted_state(self):
+        request, state_path = self._interrupted_diagnostic(
+            "analysis-dependency-unavailable"
+        )
+        before = json.loads(state_path.read_text(encoding="utf-8"))
+
+        with (
+            patch(
+                "remote_worker._dependency_identity",
+                return_value=(False, {}, "RECOVERY_CHECK_UNAVAILABLE"),
+            ),
+            self.assertRaisesRegex(
+                remote_worker.WorkerError, "RECOVERY_CHECK_UNAVAILABLE"
+            ),
+        ):
+            remote_worker.resume(request)
+
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["execution"]["status"], "interrupted")
+        self.assertEqual(
+            persisted["recovery_contract"]["last_check"],
+            before["recovery_contract"]["last_check"],
+        )
+        self.assertEqual(len(persisted["attempts"]), 1)
+
+    def test_changed_completed_phase_artifact_blocks_resume(self):
+        request, state_path = self._interrupted_diagnostic("analysis-output-changed")
+        results = state_path.parent.parent / "results" / "upstream"
+        results.mkdir(parents=True)
+        output = results / "result.txt"
+        output.write_text("original", encoding="utf-8")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["recovery_contract"]["phase_checkpoints"]["upstream"] = {
+            key: value
+            for key, value in remote_worker._tree_identity(results).items()
+            if key in {"file_count", "bytes", "sha256"}
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        output.write_text("changed", encoding="utf-8")
+
+        with self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_ARTIFACT_CHANGED"):
+            remote_worker.resume(request)
+
+    def test_live_runner_blocks_resume(self):
+        request, state_path = self._interrupted_diagnostic("analysis-runner-alive")
+        (state_path.parent / "supervisor.json").write_text(
+            json.dumps({"runner_pid": 123}), encoding="utf-8"
+        )
+        with (
+            patch("remote_worker._runner_alive", return_value=True),
+            self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_RUNNER_ACTIVE"),
+        ):
+            remote_worker.resume(request)
+
+    def test_resume_removes_only_unpublished_screening_outputs(self):
+        request, state_path = self._interrupted_diagnostic(
+            "analysis-unpublished-screening"
+        )
+        screening = state_path.parent.parent / "results" / "screening"
+        screening.mkdir(parents=True)
+        (screening / "partial.txt").write_text("partial", encoding="utf-8")
+        preliminary = state_path.parent / "preliminary-telemetry.json"
+        preliminary.write_text("{}", encoding="utf-8")
+
+        with (
+            patch("remote_worker._runner_alive", return_value=False),
+            patch("remote_worker._ensure_scheduler"),
+        ):
+            remote_worker.resume(request)
+
+        self.assertFalse(screening.exists())
+        self.assertFalse(preliminary.exists())
+
+    def test_resume_preserves_published_preliminary_screening(self):
+        request, state_path = self._interrupted_diagnostic(
+            "analysis-published-screening"
+        )
+        screening = state_path.parent.parent / "results" / "screening"
+        screening.mkdir(parents=True)
+        marker = screening / "published.txt"
+        marker.write_text("published", encoding="utf-8")
+        preliminary = state_path.parent / "preliminary-telemetry.json"
+        preliminary.write_text("{}", encoding="utf-8")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["reports"]["preliminary"] = {"available": True, "status": "ready"}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        with (
+            patch("remote_worker._runner_alive", return_value=False),
+            patch("remote_worker._ensure_scheduler"),
+        ):
+            remote_worker.resume(request)
+
+        resumed = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(marker.is_file())
+        self.assertTrue(preliminary.is_file())
+        self.assertEqual(resumed["queue"]["waiting_stage"], "full_analysis")
+
     def test_live_runner_is_reconciled_without_duplicate_start(self):
         run_id = "analysis-live"
         path = self._state(run_id, "running")

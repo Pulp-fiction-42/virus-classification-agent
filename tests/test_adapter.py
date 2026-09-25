@@ -9,8 +9,15 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 import adapter
-from adapter import ChatRequest, CompilePlanRequest, StartRunRequest, error_sse
+from adapter import (
+    ChatRequest,
+    CompilePlanRequest,
+    ResumeRunRequest,
+    StartRunRequest,
+    error_sse,
+)
 from deterministic_planner import PlannerError
+from remote_client import RemoteConnectionError, RemoteExecutionError
 from runtime import SessionStateError, TextDelta
 from runtime_errors import ConversationPublicError
 
@@ -86,10 +93,12 @@ class FakeSessions:
 
 
 class FakePlanner:
-    def __init__(self, *, fail: bool = False):
+    def __init__(self, *, fail: bool = False, resume_error: Exception | None = None):
         self.fail = fail
+        self.resume_error = resume_error
         self.compile_calls = []
         self.start_calls = []
+        self.resume_calls = []
 
     def compile(self, **kwargs):
         self.compile_calls.append(kwargs)
@@ -102,6 +111,14 @@ class FakePlanner:
         if self.fail:
             raise PlannerError("persisted plan mismatch")
         return {"type": "analysis_run", "status": "running"}
+
+    async def resume(self, **kwargs):
+        self.resume_calls.append(kwargs)
+        if self.resume_error:
+            raise self.resume_error
+        if self.fail:
+            raise PlannerError("persisted plan mismatch")
+        return {"type": "analysis_run", "status": "queued"}
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -199,6 +216,91 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                     "browser_priority": "high",
                 },
             )
+
+    async def test_resume_api_forwards_only_authoritative_run_context(self):
+        fake = FakePlanner()
+        adapter.planner = fake
+        result = await adapter.resume_analysis_run(
+            ResumeRunRequest(
+                plan={"goals": ["read_qc"]},
+                dataset={"id": "ds", "revision": 1, "status": "ready"},
+                chat_id="00000000-0000-0000-0000-000000000001",
+                plan_id="pl_test",
+                plan_revision=3,
+                run_id="analysis-fixed",
+            )
+        )
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(fake.resume_calls[0]["run_id"], "analysis-fixed")
+        self.assertNotIn("queue_context", fake.resume_calls[0])
+
+    async def test_resume_api_maps_temporary_verification_failure_to_retryable_503(self):
+        adapter.planner = FakePlanner(
+            resume_error=RemoteConnectionError("Cyclone unavailable")
+        )
+        request = ResumeRunRequest(
+            plan={},
+            dataset={},
+            chat_id="00000000-0000-0000-0000-000000000001",
+            plan_id="pl_test",
+            plan_revision=3,
+            run_id="analysis-fixed",
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await adapter.resume_analysis_run(request)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail["code"], "RECOVERY_CHECK_UNAVAILABLE"
+        )
+        self.assertTrue(raised.exception.detail["retryable"])
+
+    async def test_resume_api_preserves_stable_worker_rejection_code(self):
+        adapter.planner = FakePlanner(
+            resume_error=RemoteExecutionError(
+                "RECOVERY_WORKER_CHANGED: worker version changed"
+            )
+        )
+        request = ResumeRunRequest(
+            plan={},
+            dataset={},
+            chat_id="00000000-0000-0000-0000-000000000001",
+            plan_id="pl_test",
+            plan_revision=3,
+            run_id="analysis-fixed",
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await adapter.resume_analysis_run(request)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["code"], "RECOVERY_WORKER_CHANGED")
+        self.assertFalse(raised.exception.detail["retryable"])
+
+    async def test_resume_api_maps_worker_verification_unavailable_to_503(self):
+        adapter.planner = FakePlanner(
+            resume_error=RemoteExecutionError(
+                "RECOVERY_CHECK_UNAVAILABLE: fingerprint temporarily unavailable"
+            )
+        )
+        request = ResumeRunRequest(
+            plan={},
+            dataset={},
+            chat_id="00000000-0000-0000-0000-000000000001",
+            plan_id="pl_test",
+            plan_revision=3,
+            run_id="analysis-fixed",
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await adapter.resume_analysis_run(request)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail["code"], "RECOVERY_CHECK_UNAVAILABLE"
+        )
+        self.assertTrue(raised.exception.detail["retryable"])
 
     async def test_metadata_task_uses_ephemeral_session(self):
         fake = FakeSessions()

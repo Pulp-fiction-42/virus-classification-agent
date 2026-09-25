@@ -107,6 +107,15 @@ class StartRunRequest(BaseModel):
     queue_context: QueueContext
 
 
+class ResumeRunRequest(BaseModel):
+    plan: dict[str, Any]
+    dataset: dict[str, Any]
+    chat_id: str
+    plan_id: str
+    plan_revision: int
+    run_id: str
+
+
 class RemoteSourcesRequest(BaseModel):
     paths: list[str]
 
@@ -434,6 +443,49 @@ async def start_analysis_run(req: StartRunRequest):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SessionStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/analysis/runs/resume")
+async def resume_analysis_run(req: ResumeRunRequest):
+    try:
+        return await planner.resume(
+            persisted_plan=req.plan,
+            dataset=req.dataset,
+            chat_id=req.chat_id,
+            plan_id=req.plan_id,
+            plan_revision=req.plan_revision,
+            run_id=req.run_id,
+        )
+    except RemoteConnectionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "RECOVERY_CHECK_UNAVAILABLE",
+                "message": str(exc),
+                "retryable": True,
+            },
+        ) from exc
+    except RemoteExecutionError as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(":")
+        unavailable = separator and code == "RECOVERY_CHECK_UNAVAILABLE"
+        raise HTTPException(
+            status_code=503 if unavailable else 409,
+            detail={
+                "code": code if separator and code.startswith("RECOVERY_") else "RECOVERY_REJECTED",
+                "message": message.strip() if separator else raw,
+                "retryable": bool(unavailable),
+            },
+        ) from exc
+    except (PlannerError, SessionStateError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "RECOVERY_CONTEXT_CHANGED",
+                "message": str(exc),
+                "retryable": False,
+            },
+        ) from exc
 
 
 @app.post("/v1/chat/completions")

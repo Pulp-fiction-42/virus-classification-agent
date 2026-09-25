@@ -278,3 +278,57 @@ class DeterministicPlanner:
         return await self.session_manager.launch_deterministic_plan(
             runtime_plan, chat_id
         )
+
+    async def resume(
+        self,
+        *,
+        persisted_plan: dict[str, Any],
+        dataset: dict[str, Any],
+        chat_id: str,
+        plan_id: str,
+        plan_revision: int,
+        run_id: str,
+    ) -> dict[str, Any]:
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise PlannerError("invalid analysis run ID")
+        if dataset.get("status") != "ready":
+            raise PlannerError("analysis dataset is not ready")
+        compiled = self.compile(
+            dataset=dataset,
+            goals=persisted_plan.get("goals"),
+            options=persisted_plan.get("options"),
+            routing={
+                "mode": (persisted_plan.get("routing") or {}).get(
+                    "requested_mode"
+                ),
+            },
+        )
+        try:
+            persisted_spec = normalize_execution_spec(
+                persisted_plan.get("execution_spec")
+            )
+            validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
+        except ExecutionSpecError as exc:
+            raise PlannerError(f"persisted analysis plan is invalid: {exc}") from exc
+        if (
+            persisted_spec != compiled["execution_spec"]
+            or persisted_plan.get("steps") != compiled["steps"]
+        ):
+            raise PlannerError(
+                "persisted analysis plan does not match the authoritative dataset"
+            )
+        run_dir = self.session_manager.analysis_run_root / run_id
+        runtime_plan = {
+            **persisted_plan,
+            "dataset": dataset,
+            "execution_spec": persisted_spec,
+            "plan_ref": {"id": plan_id, "revision": plan_revision},
+            "run": {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "state_path": str(run_dir / ".bioagent" / "state.json"),
+            },
+        }
+        return await self.session_manager.resume_deterministic_plan(
+            runtime_plan, chat_id
+        )
