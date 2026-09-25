@@ -328,7 +328,6 @@ rule merge:
             routing = json.loads(
                 (state_path.parent / "routing.json").read_text(encoding="utf-8")
             )
-
         self.assertEqual(returncode, 0)
         self.assertEqual(state["execution"]["status"], "completed")
         self.assertEqual(routing["decision"]["selected_route"], "A")
@@ -489,7 +488,7 @@ rule merge:
                 (state_path.parent / "preliminary-telemetry.json").is_file()
             )
 
-    def test_route_b_resource_failure_is_blocked_without_queueing(self):
+    def test_route_b_resource_failure_waits_and_keeps_preliminary_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = self._write_adaptive_state(Path(temp_dir) / "run", mode="auto")
             screening = {
@@ -513,15 +512,17 @@ rule merge:
                 returncode = run(argparse.Namespace(state=str(state_path)))
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            telemetry = json.loads(
-                (state_path.parent / "telemetry.json").read_text(encoding="utf-8")
-            )
             routing = json.loads(
                 (state_path.parent / "routing.json").read_text(encoding="utf-8")
             )
+            preliminary_exists = (
+                state_path.parent / "preliminary-telemetry.json"
+            ).is_file()
+            telemetry_exists = (state_path.parent / "telemetry.json").exists()
 
-        self.assertEqual(returncode, 2)
-        self.assertEqual(state["execution"]["status"], "blocked")
+        self.assertEqual(returncode, 75)
+        self.assertEqual(state["execution"]["status"], "waiting_resources")
+        self.assertEqual(state["queue"]["waiting_stage"], "full_analysis")
         self.assertEqual(routing["decision"]["selected_route"], "B")
         self.assertEqual(routing["decision"]["report_kind"], "preliminary_screen")
         self.assertIn("MEMORY_INSUFFICIENT", routing["decision"]["reason_codes"])
@@ -529,11 +530,9 @@ rule merge:
             routing["resources"]["full_analysis"]["requirement_source"], "minimum"
         )
         self.assertTrue(state["reports"]["preliminary"]["available"])
-        self.assertFalse(state["reports"]["final"]["available"])
-        self.assertEqual(telemetry["delivery_report"]["kind"], "analysis_pipeline")
-        self.assertEqual(
-            telemetry["delivery_report"]["report_kind"], "preliminary_screen"
-        )
+        self.assertFalse((state["reports"].get("final") or {}).get("available", False))
+        self.assertTrue(preliminary_exists)
+        self.assertFalse(telemetry_exists)
 
     def test_calibrated_requirement_still_blocks_when_reserve_is_unavailable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -572,7 +571,7 @@ rule merge:
                 (state_path.parent / "routing.json").read_text(encoding="utf-8")
             )
 
-        self.assertEqual(returncode, 2)
+        self.assertEqual(returncode, 75)
         self.assertEqual(snapshot.call_args_list[1].kwargs["required_threads"], 16)
         self.assertEqual(
             snapshot.call_args_list[1].kwargs["required_memory_mb"],
@@ -582,6 +581,26 @@ rule merge:
             routing["resources"]["full_analysis"]["requirement_source"],
             "calibrated",
         )
+
+    def test_waiting_full_analysis_checkpoint_does_not_repeat_screening(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = self._write_adaptive_state(Path(temp_dir) / "run", mode="auto")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["queue"] = {"waiting_stage": "full_analysis"}
+            state["selected_execution_spec"] = {
+                **state["execution_spec"],
+                "policy": {"mode": "standard"},
+            }
+            state["routing"] = {"phase": "waiting_resources"}
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with (
+                patch("analysis_runner._continue_adaptive_full", return_value=0) as resume,
+                patch("analysis_runner.run_rapid_screen") as screen,
+            ):
+                returncode = run(argparse.Namespace(state=str(state_path)))
+        self.assertEqual(returncode, 0)
+        resume.assert_called_once()
+        screen.assert_not_called()
 
     def test_workflow1_instrumentation_adds_extended_stats_and_benchmarks(self):
         with tempfile.TemporaryDirectory() as temp_dir:

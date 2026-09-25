@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 import config
 from conversation_events import (
@@ -90,6 +90,13 @@ class CompilePlanRequest(BaseModel):
     routing: dict[str, Any] | None = None
 
 
+class QueueContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    project_priority: Literal["low", "normal", "high"]
+
+
 class StartRunRequest(BaseModel):
     plan: dict[str, Any]
     dataset: dict[str, Any]
@@ -97,6 +104,7 @@ class StartRunRequest(BaseModel):
     plan_id: str
     plan_revision: int
     run_id: str
+    queue_context: QueueContext
 
 
 class RemoteSourcesRequest(BaseModel):
@@ -409,6 +417,7 @@ async def start_analysis_run(req: StartRunRequest):
             plan_id=req.plan_id,
             plan_revision=req.plan_revision,
             run_id=req.run_id,
+            queue_context=req.queue_context.model_dump(),
         )
     except RemoteConnectionError as exc:
         raise HTTPException(

@@ -357,4 +357,5 @@ class RemoteDeterministicRuntime:
             dataset=plan.get("dataset"),
             chat_id=normalized_chat_id,
             run_id=run.get("run_id"),
+            queue_context=plan.get("queue_context"),
         )

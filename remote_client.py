@@ -64,6 +64,7 @@ class RemoteWorkerClient:
         self.worker_root = PurePosixPath(config.REMOTE_WORKER_ROOT)
         self.data_root = str(config.ANALYSIS_DATA_ROOT)
         self.run_root = str(config.ANALYSIS_RUN_ROOT)
+        self.queue_aging_hours = config.QUEUE_AGING_HOURS
         self.allowed_roots = list(config.REMOTE_DATA_ALLOWED_ROOTS)
         self.project_root = config.PROJECT_ROOT
         self.runner_environment = {
@@ -458,6 +459,7 @@ class RemoteWorkerClient:
                 "tmux_socket": "bioagent-worker",
                 "data_root": self.data_root,
                 "run_root": self.run_root,
+                "queue_aging_hours": self.queue_aging_hours,
                 "allowed_roots": self.allowed_roots,
                 "runner_environment": self.runner_environment,
             },

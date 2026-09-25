@@ -41,6 +41,7 @@ from workflow_adapters import (
 
 FULL_ANALYSIS_MINIMUM_MEMORY_MB = 24 * 1024
 FULL_ANALYSIS_MINIMUM_THREADS = 8
+WAITING_RESOURCES_EXIT_CODE = 75
 
 
 RULE_START_RE = re.compile(r"^(?:local)?rule\s+([A-Za-z0-9_]+):$")
@@ -2347,11 +2348,121 @@ def _publish_preliminary_report(
     return preliminary
 
 
+def _wait_for_resources(
+    state_path: Path,
+    state: dict[str, Any],
+    routing_path: Path,
+    routing: dict[str, Any],
+    resources: dict[str, Any],
+    *,
+    stage: str,
+) -> int:
+    checked_at = _now()
+    queue = state.setdefault("queue", {})
+    queue.update(
+        {
+            "waiting_stage": stage,
+            "waiting_reason_codes": list(resources.get("reason_codes") or []),
+            "last_checked_at": checked_at,
+        }
+    )
+    routing.update(
+        {
+            "phase": "waiting_resources",
+            "decision": {
+                **(
+                    routing.get("decision")
+                    if isinstance(routing.get("decision"), dict)
+                    else {}
+                ),
+                "phase": "waiting_resources",
+                "reason_codes": list(resources.get("reason_codes") or []),
+            },
+        }
+    )
+    state["routing"] = routing
+    state["execution"].update(
+        {
+            "status": "waiting_resources",
+            "ok": None,
+            "returncode": None,
+            "current_step_id": None,
+        }
+    )
+    _write_json_atomic(routing_path, routing)
+    _write_json_atomic(state_path, state)
+    return WAITING_RESOURCES_EXIT_CODE
+
+
+def _continue_adaptive_full(
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    routing_record: dict[str, Any],
+) -> int:
+    state_path = Path(args.state).resolve()
+    run_dir = Path(state["run_dir"]).resolve()
+    bioagent_dir = run_dir / ".bioagent"
+    routing_path = bioagent_dir / "routing.json"
+    full_spec = state["selected_execution_spec"]
+    state["execution_spec"] = full_spec
+    full_rules = set(selected_rules(full_spec))
+    state["steps"] = [
+        step
+        for step in state.get("steps", [])
+        if full_rules.intersection(step.get("rules") or [])
+    ]
+    state.setdefault("queue", {}).update(
+        {"waiting_stage": None, "waiting_reason_codes": [], "last_checked_at": _now()}
+    )
+    routing_record["phase"] = "full_analysis"
+    state["routing"] = routing_record
+    _write_json_atomic(routing_path, routing_record)
+    _write_json_atomic(state_path, state)
+    result = run(args)
+    final_state = _read_state(state_path)
+    telemetry_path = bioagent_dir / "telemetry.json"
+    final_telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    _finish_routing_record(
+        routing_record,
+        phase="completed" if result == 0 else "failed",
+        success=result == 0,
+    )
+    final_state["routing"] = routing_record
+    final_telemetry["routing"] = routing_record
+    if isinstance(final_telemetry.get("delivery_report"), dict):
+        report_data = {
+            key: value
+            for key, value in final_telemetry["delivery_report"].items()
+            if key not in {"evidence", "conclusions"}
+        }
+        report_data["routing"] = routing_record
+        final_telemetry["delivery_report"] = _attach_report_evidence(
+            report_data,
+            final_state,
+            run_dir,
+            final_telemetry,
+        )
+    _write_json_atomic(routing_path, routing_record)
+    _write_json_atomic(state_path, final_state)
+    _write_json_atomic(telemetry_path, final_telemetry)
+    return result
+
+
 def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     state_path = Path(args.state).resolve()
     run_dir = Path(state["run_dir"]).resolve()
     bioagent_dir = run_dir / ".bioagent"
     routing_path = bioagent_dir / "routing.json"
+    queue = state.get("queue") if isinstance(state.get("queue"), dict) else {}
+    if queue.get("waiting_stage") == "full_analysis" and isinstance(
+        state.get("selected_execution_spec"), dict
+    ):
+        routing_record = (
+            json.loads(routing_path.read_text(encoding="utf-8"))
+            if routing_path.is_file()
+            else dict(state.get("routing") or {})
+        )
+        return _continue_adaptive_full(args, state, routing_record)
     log_path = Path(state["execution"]["log"]).resolve()
     spec = state["execution_spec"]
     policy = spec["policy"]
@@ -2414,26 +2525,14 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     )
     routing_record["resources"]["screening"] = screen_resources
     if not screen_resources["admission_ok"]:
-        routing_record.update(
-            {
-                "phase": "blocked",
-                "decision": {
-                    "phase": "blocked",
-                    "selected_route": None,
-                    "reason_codes": screen_resources["reason_codes"],
-                },
-            }
-        )
-        _finish_routing_record(routing_record, phase="blocked", success=False)
-        _set_step_status(state, "adaptive_screen", "failed")
-        _write_json_atomic(routing_path, routing_record)
-        return _terminal_adaptive_state(
+        _set_step_status(state, "adaptive_screen", "pending")
+        return _wait_for_resources(
             state_path,
             state,
-            telemetry,
-            status="blocked",
-            returncode=2,
-            error="快速初筛资源不足",
+            routing_path,
+            routing_record,
+            screen_resources,
+            stage="screening",
         )
 
     try:
@@ -2503,23 +2602,15 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
     _write_json_atomic(state_path, state)
 
     if decision["phase"] == "blocked":
-        for step in state.get("steps", []):
-            if step.get("status") == "pending":
-                step["status"] = "skipped"
-        _finish_routing_record(routing_record, phase="blocked", success=False)
-        state["routing"] = routing_record
-        telemetry["routing"] = routing_record
-        telemetry["delivery_report"] = json.loads(
-            (bioagent_dir / "preliminary-telemetry.json").read_text(encoding="utf-8")
-        )["delivery_report"]
-        _write_json_atomic(routing_path, routing_record)
-        return _terminal_adaptive_state(
+        state["adaptive_execution_spec"] = spec
+        state["selected_execution_spec"] = full_spec
+        return _wait_for_resources(
             state_path,
             state,
-            telemetry,
-            status="blocked",
-            returncode=2,
-            error="完整分析资源不足",
+            routing_path,
+            routing_record,
+            full_resources,
+            stage="full_analysis",
         )
 
     if policy["completion_behavior"] == "screen_only":
@@ -2548,45 +2639,7 @@ def _run_adaptive(args: argparse.Namespace, state: dict[str, Any]) -> int:
 
     state["adaptive_execution_spec"] = spec
     state["selected_execution_spec"] = full_spec
-    state["execution_spec"] = full_spec
-    full_rules = set(selected_rules(full_spec))
-    state["steps"] = [
-        step
-        for step in state.get("steps", [])
-        if full_rules.intersection(step.get("rules") or [])
-    ]
-    routing_record["phase"] = "full_analysis"
-    state["routing"] = routing_record
-    _write_json_atomic(routing_path, routing_record)
-    _write_json_atomic(state_path, state)
-    result = run(args)
-    final_state = _read_state(state_path)
-    telemetry_path = bioagent_dir / "telemetry.json"
-    final_telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
-    _finish_routing_record(
-        routing_record,
-        phase="completed" if result == 0 else "failed",
-        success=result == 0,
-    )
-    final_state["routing"] = routing_record
-    final_telemetry["routing"] = routing_record
-    if isinstance(final_telemetry.get("delivery_report"), dict):
-        report_data = {
-            key: value
-            for key, value in final_telemetry["delivery_report"].items()
-            if key not in {"evidence", "conclusions"}
-        }
-        report_data["routing"] = routing_record
-        final_telemetry["delivery_report"] = _attach_report_evidence(
-            report_data,
-            final_state,
-            run_dir,
-            final_telemetry,
-        )
-    _write_json_atomic(routing_path, routing_record)
-    _write_json_atomic(state_path, final_state)
-    _write_json_atomic(telemetry_path, final_telemetry)
-    return result
+    return _continue_adaptive_full(args, state, routing_record)
 
 
 def run(args: argparse.Namespace) -> int:

@@ -292,12 +292,14 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             plan_id="pl_test",
             plan_revision=2,
             run_id="analysis-test-run",
+            queue_context={"project_id": "project-test", "project_priority": "high"},
         )
         launched, chat_id = self.manager.launched
         self.assertEqual(result["status"], "running")
         self.assertEqual(chat_id, "00000000-0000-0000-0000-000000000001")
         self.assertEqual(launched["run"]["run_dir"], "/data/runs/analysis-test-run")
         self.assertEqual(launched["plan_ref"], {"id": "pl_test", "revision": 2})
+        self.assertEqual(launched["queue_context"]["project_priority"], "high")
 
     async def test_start_rejects_tampered_execution_spec(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])
@@ -310,6 +312,7 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
                 plan_id="pl_test",
                 plan_revision=2,
                 run_id="analysis-test-run",
+                queue_context={"project_id": "project-test", "project_priority": "normal"},
             )
         self.assertIsNone(self.manager.launched)
 
@@ -323,6 +326,7 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
                 plan_id="pl_test",
                 plan_revision=2,
                 run_id="../../outside",
+                queue_context={"project_id": "project-test", "project_priority": "normal"},
             )
         self.assertIsNone(self.manager.launched)
 

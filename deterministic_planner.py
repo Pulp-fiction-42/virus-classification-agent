@@ -232,6 +232,7 @@ class DeterministicPlanner:
         plan_id: str,
         plan_revision: int,
         run_id: str,
+        queue_context: dict[str, Any],
     ) -> dict[str, Any]:
         if not RUN_ID_RE.fullmatch(run_id):
             raise PlannerError("invalid analysis run ID")
@@ -272,6 +273,7 @@ class DeterministicPlanner:
                 "state_path": str(run_dir / ".bioagent" / "state.json"),
                 "log_path": str(run_dir / ".bioagent" / "execution.log"),
             },
+            "queue_context": queue_context,
         }
         return await self.session_manager.launch_deterministic_plan(
             runtime_plan, chat_id

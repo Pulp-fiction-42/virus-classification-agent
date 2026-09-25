@@ -33,6 +33,9 @@ REMOTE_TMUX = os.getenv("BIOAGENT_REMOTE_TMUX", "/data/user/liufangzhou/bin/tmux
 REMOTE_WORKER_ROOT = os.getenv(
     "BIOAGENT_REMOTE_WORKER_ROOT", "/data/user/liufangzhou/.bioagent/worker"
 )
+QUEUE_AGING_HOURS = float(os.getenv("BIOAGENT_QUEUE_AGING_HOURS", "24"))
+if QUEUE_AGING_HOURS <= 0:
+    raise ValueError("BIOAGENT_QUEUE_AGING_HOURS must be positive")
 REPORT_PYTHON = os.getenv(
     "BIOAGENT_REPORT_PYTHON", "/home/liufangzhou/.pixi/bin/bioagent-report-python"
 )

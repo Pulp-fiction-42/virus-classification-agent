@@ -161,6 +161,98 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         )
         return path
 
+    @staticmethod
+    def _queued_state(run_id, priority, routing, enqueued_at):
+        return {
+            "run_id": run_id,
+            "execution": {"status": "queued", "queued_at": enqueued_at},
+            "queue": {
+                "schema_version": 1,
+                "policy_version": 1,
+                "project_id": f"project-{run_id}",
+                "project_priority": priority,
+                "routing_priority": routing,
+                "enqueued_at": enqueued_at,
+                "waiting_stage": None,
+                "waiting_reason_codes": [],
+                "last_checked_at": None,
+            },
+        }
+
+    def test_queue_order_uses_aging_then_project_and_emergency_priority(self):
+        now = 2_000_000_000.0
+        old = self._queued_state(
+            "analysis-old", "low", "normal", "2020-01-01T00:00:00+00:00"
+        )
+        high = self._queued_state(
+            "analysis-high", "high", "normal", "2033-05-18T03:33:00+00:00"
+        )
+        urgent = self._queued_state(
+            "analysis-urgent", "high", "emergency", "2033-05-18T03:34:00+00:00"
+        )
+        values = sorted(
+            [high, old, urgent],
+            key=lambda state: remote_worker._queue_sort_key(
+                state, now=now, aging_seconds=24 * 3600
+            ),
+        )
+        self.assertEqual(
+            [value["run_id"] for value in values],
+            ["analysis-old", "analysis-urgent", "analysis-high"],
+        )
+
+    def test_legacy_queue_uses_normal_priority_and_original_queued_time(self):
+        state = {
+            "run_id": "analysis-legacy",
+            "execution": {
+                "status": "queued",
+                "queued_at": "2026-09-24T10:00:00+08:00",
+            },
+        }
+        queue = remote_worker._queue_record(state)
+        self.assertEqual(queue["project_priority"], "normal")
+        self.assertEqual(queue["enqueued_at"], "2026-09-24T10:00:00+08:00")
+
+    def test_diagnostic_admission_waits_then_becomes_ready(self):
+        state = self._queued_state(
+            "analysis-wait", "normal", "normal", "2033-05-18T03:33:00+00:00"
+        )
+        state["diagnostic"] = {"admission_blocks_remaining": 1}
+        first = remote_worker._admission_snapshot(state, self.runs)
+        second = remote_worker._admission_snapshot(state, self.runs)
+        self.assertFalse(first["admission_ok"])
+        self.assertEqual(first["reason_codes"], ["DIAGNOSTIC_RESOURCE_WAIT"])
+        self.assertEqual(first["stage"], "full_analysis")
+        self.assertTrue(second["admission_ok"])
+
+    def test_duplicate_diagnostic_launch_keeps_original_queue_record(self):
+        request = {
+            "settings": self.settings,
+            "run_id": "analysis-idempotent",
+            "worker_version": "abc",
+            "duration_seconds": 1,
+            "queue_context": {
+                "project_id": "project-one",
+                "project_priority": "high",
+            },
+        }
+        with patch("remote_worker._ensure_scheduler") as scheduler:
+            remote_worker.diagnostic_launch(request)
+            state_path = self.runs / "analysis-idempotent/.bioagent/state.json"
+            first = json.loads(state_path.read_text(encoding="utf-8"))["queue"]
+            remote_worker.diagnostic_launch(
+                {
+                    **request,
+                    "queue_context": {
+                        "project_id": "project-other",
+                        "project_priority": "low",
+                    },
+                }
+            )
+        second = json.loads(state_path.read_text(encoding="utf-8"))["queue"]
+        self.assertEqual(first, second)
+        self.assertEqual(scheduler.call_count, 2)
+
     def test_launch_revalidates_execution_spec_before_queueing(self):
         with self.assertRaisesRegex(
             remote_worker.WorkerError, "execution spec is invalid"
@@ -196,8 +288,8 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         run_id = "analysis-queued"
         self._state(run_id, "queued")
         with (
-            patch("remote_worker._session_exists", return_value=False),
-            patch("remote_worker._start_session") as start,
+            patch("remote_worker._scheduler_session_exists", return_value=False),
+            patch("remote_worker._ensure_scheduler") as start,
         ):
             result = remote_worker.snapshot(
                 {"settings": self.settings, "run_id": run_id, "worker_version": "abc"}
@@ -208,16 +300,113 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
     def test_missing_running_process_is_interrupted_without_rerun(self):
         run_id = "analysis-running"
         path = self._state(run_id, "running")
-        with (
-            patch("remote_worker._session_exists", return_value=False),
-            patch("remote_worker._pid_alive", return_value=False),
-        ):
-            result = remote_worker.snapshot(
-                {"settings": self.settings, "run_id": run_id, "worker_version": "abc"}
-            )
-        self.assertEqual(result["state"]["execution"]["status"], "interrupted")
+        with patch("remote_worker._runner_alive", return_value=False):
+            self.assertIsNone(remote_worker._running_process(self.runs))
         persisted = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["execution"]["status"], "interrupted")
+
+    def test_live_runner_is_reconciled_without_duplicate_start(self):
+        run_id = "analysis-live"
+        path = self._state(run_id, "running")
+        supervisor = {
+            "run_id": run_id,
+            "status": "running",
+            "runner_pid": 321,
+            "boot_id": remote_worker._boot_id(),
+        }
+        (path.parent / "supervisor.json").write_text(
+            json.dumps(supervisor), encoding="utf-8"
+        )
+        with (
+            patch("remote_worker._runner_alive", return_value=True),
+            patch("remote_worker._run_candidate") as start,
+        ):
+            running = remote_worker._running_process(self.runs)
+        self.assertEqual(running, (path, json.loads(path.read_text()), supervisor))
+        start.assert_not_called()
+
+    def test_scheduler_skips_resource_wait_and_runs_next_candidate(self):
+        first_path = self._state("analysis-waiting", "queued")
+        second_path = self._state("analysis-ready", "queued")
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        second = json.loads(second_path.read_text(encoding="utf-8"))
+        args = type(
+            "Args",
+            (),
+            {
+                "run_root": str(self.runs),
+                "aging_hours": 24,
+                "tmux": "/tmux",
+                "tmux_socket": "bioagent-worker",
+                "version": "abc",
+            },
+        )()
+        with (
+            patch("remote_worker._running_process", return_value=None),
+            patch(
+                "remote_worker._queued_states",
+                side_effect=[[(first_path, first), (second_path, second)], []],
+            ),
+            patch("remote_worker._legacy_session_exists", return_value=False),
+            patch(
+                "remote_worker._admission_snapshot",
+                side_effect=[
+                    {
+                        "admission_ok": False,
+                        "reason_codes": ["MEMORY_RESERVE_LOW"],
+                        "stage": "full_analysis",
+                    },
+                    {"admission_ok": True, "reason_codes": [], "stage": "full_analysis"},
+                ],
+            ),
+            patch("remote_worker._run_candidate", return_value=0) as run_candidate,
+        ):
+            remote_worker.schedule(args)
+
+        waiting = json.loads(first_path.read_text(encoding="utf-8"))
+        self.assertEqual(waiting["execution"]["status"], "waiting_resources")
+        self.assertEqual(waiting["queue"]["waiting_reason_codes"], ["MEMORY_RESERVE_LOW"])
+        run_candidate.assert_called_once_with(second_path, second, version="abc")
+
+    def test_scheduler_stops_and_adopts_legacy_queued_session(self):
+        state_path = self._state("analysis-legacy-session", "queued")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        args = type(
+            "Args",
+            (),
+            {
+                "run_root": str(self.runs),
+                "aging_hours": 24,
+                "tmux": "/tmux",
+                "tmux_socket": "bioagent-worker",
+                "version": "abc",
+            },
+        )()
+        with (
+            patch("remote_worker._running_process", return_value=None),
+            patch(
+                "remote_worker._queued_states",
+                side_effect=[[(state_path, state)], []],
+            ),
+            patch("remote_worker._legacy_session_exists", return_value=True),
+            patch("remote_worker._stop_legacy_session", return_value=True) as stop,
+            patch(
+                "remote_worker._admission_snapshot",
+                return_value={
+                    "admission_ok": True,
+                    "reason_codes": [],
+                    "stage": "full_analysis",
+                },
+            ),
+            patch("remote_worker._run_candidate", return_value=0) as run_candidate,
+        ):
+            remote_worker.schedule(args)
+
+        stop.assert_called_once_with(
+            {"tmux": "/tmux", "tmux_socket": "bioagent-worker"},
+            "analysis-legacy-session",
+        )
+        run_candidate.assert_called_once()
 
     def test_snapshot_selects_preliminary_telemetry(self):
         run_id = "analysis-reports"
@@ -237,7 +426,7 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         }
         path.write_text(json.dumps(state), encoding="utf-8")
 
-        with patch("remote_worker._session_exists", return_value=False):
+        with patch("remote_worker._scheduler_session_exists", return_value=False):
             result = remote_worker.snapshot(
                 {
                     "settings": self.settings,
@@ -330,34 +519,27 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
                 {"settings": self.settings, "run_dir": str(run_dir), "format": "html"}
             )
 
-    def test_private_tmux_session_receives_runner_environment(self):
-        run_id = "analysis-command"
-        state_path = self._state(run_id, "queued")
+    def test_private_scheduler_session_receives_runner_environment(self):
         self.settings["runner_environment"] = {"BIOAGENT_SNAKEMAKE": "/tools/snakemake"}
         completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
         with (
-            patch("remote_worker._session_exists", return_value=False),
+            patch("remote_worker._scheduler_session_exists", return_value=False),
             patch("remote_worker.subprocess.run", return_value=completed) as run,
         ):
-            remote_worker._start_session(self.settings, state_path, "abc")
+            remote_worker._ensure_scheduler(self.settings, "abc")
         command = run.call_args.args[0]
         self.assertEqual(command[:4], ["/tmux", "-L", "bioagent-worker", "new-session"])
-        self.assertIn("bioagent-analysis-command", command)
+        self.assertIn("bioagent-scheduler-", command[6])
         self.assertIn("BIOAGENT_SNAKEMAKE=/tools/snakemake", command[-1])
 
-    def test_diagnostic_run_uses_same_private_tmux_queue_supervisor(self):
-        run_id = "analysis-diagnostic"
-        state_path = self._state(run_id, "queued")
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["diagnostic"] = {"duration_seconds": 5}
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+    def test_diagnostic_run_uses_single_private_scheduler(self):
         completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
         with (
-            patch("remote_worker._session_exists", return_value=False),
+            patch("remote_worker._scheduler_session_exists", return_value=False),
             patch("remote_worker.subprocess.run", return_value=completed) as run,
         ):
-            remote_worker._start_session(self.settings, state_path, "abc")
-        self.assertIn(" diagnose ", f" {run.call_args.args[0][-1]} ")
+            remote_worker._ensure_scheduler(self.settings, "abc")
+        self.assertIn(" schedule ", f" {run.call_args.args[0][-1]} ")
 
     def test_toolchain_reports_each_unavailable_tool_without_hiding_workflows(self):
         runner_environment = {

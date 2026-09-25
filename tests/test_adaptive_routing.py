@@ -114,6 +114,23 @@ class AdaptiveRoutingTests(unittest.TestCase):
         self.assertTrue(snapshot["admission_ok"])
         self.assertEqual(snapshot["reason_codes"], [])
 
+    def test_admission_reports_low_run_root_storage(self):
+        with (
+            patch("adaptive_routing.os.cpu_count", return_value=64),
+            patch("adaptive_routing._cpu_percent", return_value=20.0),
+            patch("adaptive_routing._memory_available_mb", return_value=108 * 1024),
+            patch("adaptive_routing._storage_available_mb", return_value=512),
+            patch("adaptive_routing.count_allocated_threads", return_value=0),
+        ):
+            snapshot = collect_resource_snapshot(
+                Path("/tmp/runs"),
+                required_threads=8,
+                required_memory_mb=24 * 1024,
+            )
+
+        self.assertFalse(snapshot["admission_ok"])
+        self.assertEqual(snapshot["reason_codes"], ["STORAGE_INSUFFICIENT"])
+
     def test_contract_has_three_modes_and_no_deadline(self):
         self.assertEqual(
             normalize_routing_request({"mode": "emergency"}), {"mode": "emergency"}

@@ -20,6 +20,7 @@ CONFIDENCE_THRESHOLDS = {
 MAX_CPU_PERCENT = 85.0
 SCREEN_THREADS = 4
 SCREEN_MEMORY_MB = 4 * 1024
+MINIMUM_STORAGE_MB = 1024
 
 
 def normalize_routing_request(raw: Any) -> dict[str, Any]:
@@ -162,6 +163,14 @@ def _memory_available_mb() -> float | None:
     return None
 
 
+def _storage_available_mb(run_root: Path) -> float | None:
+    try:
+        values = os.statvfs(run_root)
+    except OSError:
+        return None
+    return values.f_frsize * values.f_bavail / (1024 * 1024)
+
+
 def count_allocated_threads(
     run_root: Path, *, exclude_run_id: str | None = None
 ) -> int:
@@ -187,11 +196,13 @@ def collect_resource_snapshot(
     run_id: str | None = None,
     required_threads: int,
     required_memory_mb: float,
+    required_storage_mb: float = MINIMUM_STORAGE_MB,
 ) -> dict[str, Any]:
     total_cores = os.cpu_count() or 1
     allocated = count_allocated_threads(run_root, exclude_run_id=run_id)
     cpu_percent = _cpu_percent()
     available_memory = _memory_available_mb()
+    available_storage = _storage_available_mb(run_root)
     available_threads = max(0, total_cores - allocated)
     reason_codes = []
     if cpu_percent is not None and cpu_percent >= MAX_CPU_PERCENT:
@@ -200,14 +211,18 @@ def collect_resource_snapshot(
         reason_codes.append("THREADS_INSUFFICIENT")
     if available_memory is not None and available_memory < required_memory_mb:
         reason_codes.append("MEMORY_INSUFFICIENT")
+    if available_storage is not None and available_storage < required_storage_mb:
+        reason_codes.append("STORAGE_INSUFFICIENT")
     return {
         "cpu_total": total_cores,
         "cpu_percent": cpu_percent,
         "memory_available_mb": available_memory,
+        "storage_available_mb": available_storage,
         "allocated_threads": allocated,
         "available_threads": available_threads,
         "required_threads": required_threads,
         "required_memory_mb": round(required_memory_mb, 2),
+        "required_storage_mb": round(required_storage_mb, 2),
         "admission_ok": not reason_codes,
         "reason_codes": reason_codes,
     }

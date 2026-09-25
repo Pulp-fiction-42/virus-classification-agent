@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 from starlette.requests import Request
 
 import adapter
@@ -176,10 +177,28 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 plan_id="pl_test",
                 plan_revision=3,
                 run_id="analysis-fixed",
+                queue_context={"project_id": "project-test", "project_priority": "high"},
             )
         )
         self.assertEqual(result["status"], "running")
         self.assertEqual(fake.start_calls[0]["run_id"], "analysis-fixed")
+        self.assertEqual(fake.start_calls[0]["queue_context"]["project_priority"], "high")
+
+    def test_start_api_rejects_extra_queue_context_fields(self):
+        with self.assertRaises(ValidationError):
+            StartRunRequest(
+                plan={"goals": ["virus_summary"]},
+                dataset={"id": "ds", "revision": 1, "status": "ready"},
+                chat_id="00000000-0000-0000-0000-000000000001",
+                plan_id="pl_test",
+                plan_revision=3,
+                run_id="analysis-fixed",
+                queue_context={
+                    "project_id": "project-test",
+                    "project_priority": "high",
+                    "browser_priority": "high",
+                },
+            )
 
     async def test_metadata_task_uses_ephemeral_session(self):
         fake = FakeSessions()
