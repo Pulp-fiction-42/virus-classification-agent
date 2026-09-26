@@ -34,7 +34,7 @@ def artifact_input(artifact_type: str, root: Path, *, sample_id: str = "sample1"
 
 def pipeline(inputs, deliverables, *, mode="standard", viral_type="RNA+DNA"):
     return {
-        "version": 3,
+        "version": 4,
         "adapter": "analysis_pipeline",
         "inputs": inputs,
         "deliverables": deliverables,

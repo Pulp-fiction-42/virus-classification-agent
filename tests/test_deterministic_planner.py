@@ -110,6 +110,27 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
                     stages,
                 )
 
+    def test_workflow1_contract_freezes_each_selected_stage_manifest(self):
+        plan = self.compile(dataset(RAW), ["contig_filter"])
+
+        self.assertEqual(plan["planner_version"], 4)
+        self.assertEqual(plan["execution_spec"]["version"], 4)
+        self.assertEqual(
+            [
+                item["capability_id"]
+                for item in plan["execution_spec"]["capability_contract"][
+                    "manifests"
+                ]
+            ],
+            [
+                "workflow1.read_qc.fastp",
+                "workflow1.rrna_filter.bowtie2",
+                "workflow1.sample_merge.seqkit",
+                "workflow1.assembly.megahit",
+                "workflow1.contig_filter.seqkit",
+            ],
+        )
+
     def test_excluded_stage_conflict_is_structured(self):
         with self.assertRaises(PlannerError) as raised:
             self.compile(

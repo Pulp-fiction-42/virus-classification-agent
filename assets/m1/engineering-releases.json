@@ -5,9 +5,9 @@
     {
       "release_id": "engineering-knowledge-v1",
       "scope": "engineering_contract",
-      "catalog_sha256": "2f9edabaf6fa57c92faecacdc367f55e708a962722ec671f34aa8038716437b1",
+      "catalog_sha256": "2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170",
       "file": "engineering-knowledge-v1.json",
-      "sha256": "45e70f06d04cd6bf1d748a991a959378acb64c6031f7fd08b576548ee097176e",
+      "sha256": "400699873d502bd9c95f044fe9a9cd061af3e7d6b92eae155833427f7d9e5920",
       "review_status": "approved",
       "review_record": "derived from capability catalog schema v1; engineering contract only",
       "license": "same as BioAgent source"

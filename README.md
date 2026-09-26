@@ -25,7 +25,7 @@ BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化
 
 `remote_worker.py` 负责 data allowlist、双层指纹、FASTQ 检查、资源采集、单一持久 scheduler 和 reconciliation。scheduler 以 `fcntl.flock` 保证最终互斥，并在独立 `supervisor.json` 写 heartbeat、PID、boot ID 与 worker version，避免与 runner 的 state 原子写互相覆盖。
 
-新 run 在 state v3 中冻结 `recovery_contract`，并把每次小型控制日志、telemetry 与 checkpoint 登记在 `.bioagent/attempts/<序号>/`；大型计算结果继续共用 run root。恢复只跳过 checkpoint 已验证的完整 phase，中断 phase 使用 Snakemake `--rerun-incomplete` 并强制重跑受控 rules。当前只有 diagnostic 与 Workflow 1 `read_qc` 具备足够完整的工具／workflow 身份；其他 workflow 会明确返回不可恢复，不会猜测兼容旧 state。
+新 run 在 state v3 中冻结 recovery contract v2，并把每次小型控制日志、telemetry 与 checkpoint 登记在 `.bioagent/attempts/<序号>/`；大型计算结果继续共用 run root。恢复只跳过 checkpoint 已验证的完整 phase，中断 phase 使用 Snakemake `--rerun-incomplete` 并强制重跑受控 rules。新建的 Workflow 1 run 会按所选阶段冻结 workflow 源码闭包、软件及 rRNA 索引身份；旧恢复契约与 Workflow 2–6 会明确返回不可恢复，不会原地补写身份。当前只完成全阶段 dry-run，尚未完成真实 Workflow 1 中断恢复验收。
 
 ## 配置
 

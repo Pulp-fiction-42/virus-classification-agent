@@ -68,6 +68,10 @@ class CapabilityManifest:
     validation_status: str
     adapter_version: int
     impact: str
+    software_dependencies: tuple[str, ...]
+    reference_dependencies: tuple[str, ...]
+    parser: str
+    resources: tuple[tuple[str, int], ...]
     parameters: tuple[ParameterSpec, ...]
     presets: tuple[tuple[str, tuple[tuple[str, int | bool], ...]], ...]
 
@@ -200,10 +204,87 @@ FASTP_MANIFEST = CapabilityManifest(
     validation_status="validated",
     adapter_version=WORKFLOW_ADAPTER_VERSION,
     impact="参数变化可能改变保留 reads 的数量和后续分析输入；不会修改原始 FASTQ。",
+    software_dependencies=("snakemake", "fastp"),
+    reference_dependencies=(),
+    parser="analysis_runner.fastp",
+    resources=(("threads", 8),),
     parameters=FASTP_PARAMETERS,
     presets=(("workflow_default", ()),),
 )
-CAPABILITY_MANIFESTS = {FASTP_MANIFEST.id: FASTP_MANIFEST}
+RRNA_FILTER_MANIFEST = CapabilityManifest(
+    id="workflow1.rrna_filter.bowtie2",
+    version=1,
+    stage_id="rrna_filter",
+    tool_id="bowtie2",
+    label="Bowtie2 去除 rRNA",
+    validation_status="dry_run_validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="去除与已登记 rRNA 索引比对的 reads；不等同于宿主序列去除或宿主识别。",
+    software_dependencies=("snakemake", "bowtie2", "samtools"),
+    reference_dependencies=("workflow1.rrna_bowtie2",),
+    parser="analysis_runner.rrna_filter",
+    resources=(("threads", 8),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+SAMPLE_MERGE_MANIFEST = CapabilityManifest(
+    id="workflow1.sample_merge.seqkit",
+    version=1,
+    stage_id="sample_merge",
+    tool_id="seqkit",
+    label="SeqKit 技术重复合并",
+    validation_status="code_exists",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="按已确认的 run 到 sample 映射合并技术重复，不改变原始 FASTQ。",
+    software_dependencies=("snakemake", "seqkit"),
+    reference_dependencies=(),
+    parser="analysis_runner.sample_merge",
+    resources=(("threads", 1),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+ASSEMBLY_MANIFEST = CapabilityManifest(
+    id="workflow1.assembly.megahit",
+    version=1,
+    stage_id="assembly",
+    tool_id="megahit",
+    label="MEGAHIT 序列组装",
+    validation_status="code_exists",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="从合并后的 clean reads 生成组装 contigs。",
+    software_dependencies=("snakemake", "megahit"),
+    reference_dependencies=(),
+    parser="analysis_runner.assembly",
+    resources=(("threads", 12), ("memory_mb", 20000)),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+CONTIG_FILTER_MANIFEST = CapabilityManifest(
+    id="workflow1.contig_filter.seqkit",
+    version=1,
+    stage_id="contig_filter",
+    tool_id="seqkit",
+    label="SeqKit Contig 重命名与过滤",
+    validation_status="code_exists",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="重命名并过滤组装 contigs，生成下游分析使用的固定 artifact。",
+    software_dependencies=("snakemake", "seqkit"),
+    reference_dependencies=(),
+    parser="analysis_runner.contig_filter",
+    resources=(("threads", 1),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+CAPABILITY_MANIFESTS = {
+    manifest.id: manifest
+    for manifest in (
+        FASTP_MANIFEST,
+        RRNA_FILTER_MANIFEST,
+        SAMPLE_MERGE_MANIFEST,
+        ASSEMBLY_MANIFEST,
+        CONTIG_FILTER_MANIFEST,
+    )
+}
 
 
 def _virus_prep_rules(
@@ -651,6 +732,10 @@ def capability_catalog() -> dict[str, Any]:
                 "validation_status": manifest.validation_status,
                 "adapter_version": manifest.adapter_version,
                 "impact": manifest.impact,
+                "software_dependencies": list(manifest.software_dependencies),
+                "reference_dependencies": list(manifest.reference_dependencies),
+                "parser": manifest.parser,
+                "resources": dict(manifest.resources),
                 "input_artifacts": [
                     artifact
                     for alternatives in STAGE_BY_ID[manifest.stage_id].requirements

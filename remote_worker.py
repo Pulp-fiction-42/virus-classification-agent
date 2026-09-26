@@ -27,6 +27,7 @@ from pipeline_spec import (
     normalize_execution_spec,
     validate_plan_rules,
 )
+from workflow_catalog import CAPABILITY_MANIFESTS
 
 RUN_ID_RE = re.compile(r"^analysis-[A-Za-z0-9_.-]+$")
 TERMINAL_STATUSES = {"completed", "failed", "blocked", "interrupted"}
@@ -38,7 +39,7 @@ SCREEN_MEMORY_MB = 4 * 1024
 FULL_ANALYSIS_MINIMUM_THREADS = 8
 FULL_ANALYSIS_MINIMUM_MEMORY_MB = 24 * 1024
 RESOURCE_RETRY_SECONDS = 5
-RECOVERY_CONTRACT_VERSION = 1
+RECOVERY_CONTRACT_VERSION = 2
 FASTQ_EXTENSION_RE = re.compile(r"(?i)(\.fastq|\.fq)(\.gz)?$")
 QUICK_RECORD_LIMIT = 1_000
 QUICK_BYTE_LIMIT = 8 * 1024 * 1024
@@ -125,10 +126,15 @@ def _json_digest(value: Any) -> str:
 
 def _file_identity(path: Path) -> dict[str, Any]:
     try:
-        resolved = path.resolve()
-        if not resolved.is_file():
-            raise WorkerError(f"恢复依赖不可用：{path}")
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise WorkerError(f"恢复依赖不可用：{path}") from exc
+    except OSError as exc:
+        raise RecoveryCheckUnavailable(f"恢复依赖暂时无法验证：{path}") from exc
+    try:
         stat = resolved.stat()
+        if not stat_module.S_ISREG(stat.st_mode):
+            raise WorkerError(f"恢复依赖不可用：{path}")
         digest = hashlib.sha256()
         with resolved.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
@@ -146,13 +152,26 @@ def _file_identity(path: Path) -> dict[str, Any]:
 
 def _tree_identity(path: Path) -> dict[str, Any]:
     try:
-        root = path.resolve()
-        if not root.is_dir():
+        root = path.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise WorkerError(f"恢复依赖目录不可用：{path}") from exc
+    except OSError as exc:
+        raise RecoveryCheckUnavailable(f"恢复依赖暂时无法验证：{path}") from exc
+    try:
+        if not stat_module.S_ISDIR(root.stat().st_mode):
             raise WorkerError(f"恢复依赖目录不可用：{path}")
         digest = hashlib.sha256()
         count = 0
         total = 0
-        ignored = {".git", ".snakemake", "__pycache__", "logs", "results"}
+        ignored = {
+            ".cache",
+            ".git",
+            ".snakemake",
+            "__pycache__",
+            "cache",
+            "logs",
+            "results",
+        }
         for candidate in sorted(root.rglob("*")):
             relative = candidate.relative_to(root)
             if any(part in ignored for part in relative.parts):
@@ -197,17 +216,110 @@ def _recovery_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fastp_path(workflow_root: Path) -> Path:
+def _workflow1_config(workflow_root: Path) -> dict[str, dict[str, str]]:
     config_path = workflow_root / "config" / "config.yaml"
     try:
         lines = config_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+    except (FileNotFoundError, NotADirectoryError) as exc:
         raise WorkerError("恢复依赖缺少 Workflow 1 配置") from exc
+    except OSError as exc:
+        raise RecoveryCheckUnavailable(
+            "恢复依赖暂时无法验证：Workflow 1 配置"
+        ) from exc
+    values: dict[str, dict[str, str]] = {}
+    section: str | None = None
     for line in lines:
-        match = re.match(r"^\s*fastp:\s*[\"']?(.+?)[\"']?\s*$", line)
-        if match:
-            return Path(match.group(1))
-    raise WorkerError("恢复依赖缺少 fastp 身份")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        heading = re.match(r"^([A-Za-z0-9_]+):\s*$", line)
+        if heading:
+            section = heading.group(1)
+            values.setdefault(section, {})
+            continue
+        item = re.match(
+            r"^\s{2}([A-Za-z0-9_]+):\s*[\"']?(.+?)[\"']?\s*$", line
+        )
+        if section and item:
+            values[section][item.group(1)] = item.group(2)
+    return values
+
+
+def _required_config_path(
+    config: dict[str, dict[str, str]], section: str, key: str
+) -> Path:
+    value = config.get(section, {}).get(key)
+    if not value:
+        raise WorkerError(f"恢复依赖缺少 Workflow 1 {section}.{key} 身份")
+    return Path(value)
+
+
+def _software_identity(
+    path: Path,
+    *,
+    required_companions: tuple[str, ...] = (),
+    optional_companions: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    files = [{"role": "entrypoint", **_file_identity(path)}]
+    for name in required_companions:
+        files.append({"role": name, **_file_identity(path.with_name(name))})
+    optional = []
+    for name in optional_companions:
+        candidate = path.with_name(name)
+        if _dependency_file_exists(candidate):
+            optional.append({"role": name, **_file_identity(candidate)})
+    if optional_companions and not optional:
+        raise WorkerError(f"恢复依赖缺少 {path.name} runtime 身份")
+    files.extend(optional)
+    return {"files": files, "sha256": _json_digest(files)}
+
+
+def _dependency_file_exists(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        return stat_module.S_ISREG(resolved.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise RecoveryCheckUnavailable(
+            f"恢复依赖暂时无法验证：{path}"
+        ) from exc
+
+
+def _bowtie2_index_identity(prefix: Path) -> dict[str, Any]:
+    layouts = (
+        (".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"),
+        (
+            ".1.bt2l",
+            ".2.bt2l",
+            ".3.bt2l",
+            ".4.bt2l",
+            ".rev.1.bt2l",
+            ".rev.2.bt2l",
+        ),
+    )
+    selected = next(
+        (
+            suffixes
+            for suffixes in layouts
+            if all(
+                _dependency_file_exists(Path(f"{prefix}{suffix}"))
+                for suffix in suffixes
+            )
+        ),
+        None,
+    )
+    if selected is None:
+        raise WorkerError("恢复依赖缺少完整 Workflow 1 rRNA Bowtie2 索引")
+    files = [
+        {"suffix": suffix, **_file_identity(Path(f"{prefix}{suffix}"))}
+        for suffix in selected
+    ]
+    return {
+        "asset_id": "workflow1.rrna_bowtie2",
+        "format": "bowtie2_large" if selected[0].endswith("bt2l") else "bowtie2",
+        "files": files,
+        "sha256": _json_digest(files),
+    }
 
 
 def _dependency_identity(
@@ -229,27 +341,71 @@ def _dependency_identity(
         for stage in stages
         if isinstance(stage, dict) and stage.get("workflow_id")
     }
-    # The current catalog only publishes a complete executable dependency
-    # identity for Workflow 1 read_qc. Other stages remain deliberately
-    # ineligible until B1 publishes their tools and reference releases.
-    if workflow_ids != {"workflow1"} or not stage_ids <= {"read_qc"}:
+    workflow1_stages = {
+        "read_qc",
+        "rrna_filter",
+        "sample_merge",
+        "assembly",
+        "contig_filter",
+    }
+    if workflow_ids != {"workflow1"} or not stage_ids <= workflow1_stages:
         return False, {}, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
     environment = _runner_environment(settings)
-    required = (
-        "BIOAGENT_SNAKEMAKE",
-        "BIOAGENT_SEQKIT",
-        "BIOAGENT_WORKFLOW1_SOURCE",
-    )
+    required = ("BIOAGENT_SNAKEMAKE", "BIOAGENT_WORKFLOW1_SOURCE")
+    if stage_ids & {"sample_merge", "contig_filter"}:
+        required = (*required, "BIOAGENT_SEQKIT")
     if any(not environment.get(key) for key in required):
         return False, {}, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE"
     try:
         workflow = Path(environment["BIOAGENT_WORKFLOW1_SOURCE"])
+        config = _workflow1_config(workflow)
+        software = {
+            "snakemake": _software_identity(
+                Path(environment["BIOAGENT_SNAKEMAKE"])
+            )
+        }
+        if "read_qc" in stage_ids:
+            software["fastp"] = _software_identity(
+                _required_config_path(config, "software", "fastp")
+            )
+        if "rrna_filter" in stage_ids:
+            software["bowtie2"] = _software_identity(
+                _required_config_path(config, "software", "bowtie2"),
+                required_companions=("bowtie2-align-s", "bowtie2-align-l"),
+            )
+            software["samtools"] = _software_identity(
+                _required_config_path(config, "software", "samtools")
+            )
+        if stage_ids & {"sample_merge", "contig_filter"}:
+            software["seqkit"] = _software_identity(
+                Path(environment["BIOAGENT_SEQKIT"])
+            )
+        if "assembly" in stage_ids:
+            software["megahit"] = _software_identity(
+                _required_config_path(config, "software", "megahit"),
+                optional_companions=(
+                    "megahit_core",
+                    "megahit_core_no_hw_accel",
+                    "megahit_core_popcnt",
+                ),
+            )
+        references = {}
+        if "rrna_filter" in stage_ids:
+            references["workflow1.rrna_bowtie2"] = _bowtie2_index_identity(
+                _required_config_path(config, "database", "rrna_bowtie2")
+            )
+        manifest_ids = sorted(
+            manifest.id
+            for manifest in CAPABILITY_MANIFESTS.values()
+            if manifest.stage_id in stage_ids
+        )
         identity = {
-            "kind": "workflow1_read_qc",
+            "kind": "workflow1",
+            "stage_ids": sorted(stage_ids),
+            "capability_ids": manifest_ids,
             "workflow": _tree_identity(workflow),
-            "snakemake": _file_identity(Path(environment["BIOAGENT_SNAKEMAKE"])),
-            "seqkit": _file_identity(Path(environment["BIOAGENT_SEQKIT"])),
-            "fastp": _file_identity(_fastp_path(workflow)),
+            "software": software,
+            "references": references,
         }
     except RecoveryCheckUnavailable:
         return False, {}, "RECOVERY_CHECK_UNAVAILABLE"
@@ -321,7 +477,10 @@ def recovery_status(state: dict[str, Any]) -> dict[str, Any]:
     attempts = state.get("attempts") if isinstance(state.get("attempts"), list) else []
     blocker = None
     checked_at = None
-    if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+    if (
+        not isinstance(contract, dict)
+        or contract.get("schema_version") != RECOVERY_CONTRACT_VERSION
+    ):
         blocker = "RECOVERY_LEGACY_STATE"
     else:
         last_check = contract.get("last_check") or {}
@@ -333,7 +492,7 @@ def recovery_status(state: dict[str, Any]) -> dict[str, Any]:
         "available": bool(
             execution.get("status") == "interrupted"
             and isinstance(contract, dict)
-            and contract.get("schema_version") == 1
+            and contract.get("schema_version") == RECOVERY_CONTRACT_VERSION
             and contract.get("dependencies_complete") is True
             and not blocker
         ),
@@ -1159,14 +1318,15 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
             "artifacts": {},
         },
     }
+    recovery_contract = _recovery_contract(
+        state, settings, str(request["worker_version"])
+    )
     state_path.parent.mkdir(parents=True, exist_ok=True)
     attempt = _append_attempt(state, trigger="initial", status="queued")
     state["execution"]["log"] = attempt["execution_log"]
     state["technical_report"]["telemetry"] = attempt["telemetry"]
     state["reports"]["final"]["telemetry"] = attempt["telemetry"]
-    state["recovery_contract"] = _recovery_contract(
-        state, settings, str(request["worker_version"])
-    )
+    state["recovery_contract"] = recovery_contract
     (state_path.parent / "agent-trace.jsonl").touch(exist_ok=True)
     _write_json_atomic(state_path, state)
     _ensure_scheduler(settings, str(request["worker_version"]))
@@ -1334,7 +1494,10 @@ def resume(request: dict[str, Any]) -> dict[str, Any]:
                 "RECOVERY_RUN_NOT_INTERRUPTED: 只有已中断任务可以恢复"
             )
         contract = state.get("recovery_contract")
-        if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+        if (
+            not isinstance(contract, dict)
+            or contract.get("schema_version") != RECOVERY_CONTRACT_VERSION
+        ):
             raise WorkerError(
                 "RECOVERY_LEGACY_STATE: 旧任务缺少恢复契约，请建立新方案与运行"
             )
@@ -1874,6 +2037,9 @@ def dry_run(request: dict[str, Any]) -> dict[str, Any]:
         adapter_settings,
         execution_spec=execution_spec,
     )
+    dependencies_complete, dependencies, dependency_blocker = _dependency_identity(
+        {"execution_spec": execution_spec}, settings
+    )
     phase_results = []
     for phase in prepared.phases:
         command = [*phase.command, "--dry-run"]
@@ -1919,6 +2085,15 @@ def dry_run(request: dict[str, Any]) -> dict[str, Any]:
         "run_dir": str(run_dir),
         "ok": all(item["ok"] for item in phase_results),
         "phases": phase_results,
+        "dependency_identity": {
+            "schema_version": RECOVERY_CONTRACT_VERSION,
+            "complete": dependencies_complete,
+            "blocker_code": dependency_blocker,
+            "sha256": (
+                _json_digest(dependencies) if dependencies_complete else None
+            ),
+            "dependencies": dependencies,
+        },
     }
     _write_json_atomic(run_dir / ".bioagent" / "dry-run.json", result)
     return result

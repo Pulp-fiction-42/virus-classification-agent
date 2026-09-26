@@ -161,6 +161,136 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         )
         return path
 
+    def _workflow1_identity_fixture(self, stage_ids: list[str]):
+        workflow = self.root / "workflow1"
+        config = workflow / "config"
+        config.mkdir(parents=True)
+        (workflow / "Snakefile").write_text("rule all:\n    input: []\n")
+        tools = self.root / "tools"
+        tools.mkdir()
+        for name in (
+            "snakemake",
+            "seqkit",
+            "fastp",
+            "bowtie2",
+            "bowtie2-align-s",
+            "bowtie2-align-l",
+            "samtools",
+            "megahit",
+            "megahit_core",
+            "megahit_core_no_hw_accel",
+            "megahit_core_popcnt",
+        ):
+            (tools / name).write_text(name, encoding="utf-8")
+        rrna = self.root / "reference" / "rrna"
+        rrna.parent.mkdir()
+        for suffix in (
+            ".1.bt2",
+            ".2.bt2",
+            ".3.bt2",
+            ".4.bt2",
+            ".rev.1.bt2",
+            ".rev.2.bt2",
+        ):
+            Path(f"{rrna}{suffix}").write_text(suffix, encoding="utf-8")
+        (config / "config.yaml").write_text(
+            "\n".join(
+                (
+                    "software:",
+                    f'  fastp: "{tools / "fastp"}"',
+                    f'  bowtie2: "{tools / "bowtie2"}"',
+                    f'  samtools: "{tools / "samtools"}"',
+                    f'  megahit: "{tools / "megahit"}"',
+                    "database:",
+                    f'  rrna_bowtie2: "{rrna}"',
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        settings = {
+            **self.settings,
+            "runner_environment": {
+                "BIOAGENT_SNAKEMAKE": str(tools / "snakemake"),
+                "BIOAGENT_SEQKIT": str(tools / "seqkit"),
+                "BIOAGENT_WORKFLOW1_SOURCE": str(workflow),
+            },
+        }
+        state = {
+            "execution_spec": {
+                "stages": [
+                    {"id": stage_id, "workflow_id": "workflow1"}
+                    for stage_id in stage_ids
+                ]
+            }
+        }
+        return state, settings, rrna
+
+    def test_workflow1_dependency_identity_is_stage_minimal(self):
+        state, settings, _rrna = self._workflow1_identity_fixture(["read_qc"])
+
+        complete, identity, blocker = remote_worker._dependency_identity(
+            state, settings
+        )
+
+        self.assertTrue(complete)
+        self.assertIsNone(blocker)
+        self.assertEqual(identity["stage_ids"], ["read_qc"])
+        self.assertEqual(set(identity["software"]), {"snakemake", "fastp"})
+        self.assertEqual(identity["references"], {})
+        self.assertEqual(
+            identity["capability_ids"], ["workflow1.read_qc.fastp"]
+        )
+
+    def test_full_workflow1_identity_hashes_exact_registered_dependencies(self):
+        stages = [
+            "read_qc",
+            "rrna_filter",
+            "sample_merge",
+            "assembly",
+            "contig_filter",
+        ]
+        state, settings, rrna = self._workflow1_identity_fixture(stages)
+
+        complete, identity, blocker = remote_worker._dependency_identity(
+            state, settings
+        )
+
+        self.assertTrue(complete)
+        self.assertIsNone(blocker)
+        self.assertEqual(
+            set(identity["software"]),
+            {"snakemake", "fastp", "bowtie2", "samtools", "seqkit", "megahit"},
+        )
+        reference = identity["references"]["workflow1.rrna_bowtie2"]
+        self.assertEqual(len(reference["files"]), 6)
+        before = reference["sha256"]
+        Path(f"{rrna}.3.bt2").write_text("changed", encoding="utf-8")
+        changed = remote_worker._dependency_identity(state, settings)[1]
+        self.assertNotEqual(
+            before,
+            changed["references"]["workflow1.rrna_bowtie2"]["sha256"],
+        )
+
+    def test_incomplete_or_unavailable_workflow1_identity_fails_closed(self):
+        state, settings, rrna = self._workflow1_identity_fixture(["rrna_filter"])
+        Path(f"{rrna}.4.bt2").unlink()
+        complete, _identity, blocker = remote_worker._dependency_identity(
+            state, settings
+        )
+        self.assertFalse(complete)
+        self.assertEqual(blocker, "RECOVERY_DEPENDENCY_IDENTITY_INCOMPLETE")
+
+        with patch(
+            "remote_worker._workflow1_config",
+            side_effect=remote_worker.RecoveryCheckUnavailable("temporary"),
+        ):
+            complete, _identity, blocker = remote_worker._dependency_identity(
+                state, settings
+            )
+        self.assertFalse(complete)
+        self.assertEqual(blocker, "RECOVERY_CHECK_UNAVAILABLE")
+
     @staticmethod
     def _queued_state(run_id, priority, routing, enqueued_at):
         return {
@@ -266,7 +396,7 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
                     "dataset": {"status": "ready", "artifacts": []},
                     "plan": {
                         "execution_spec": {
-                            "version": 3,
+                            "version": 4,
                             "adapter": "analysis_pipeline",
                             "options": {
                                 "capability_parameters": [
@@ -357,6 +487,19 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
             json.loads(state_path.read_text(encoding="utf-8"))["execution"]["status"],
             "interrupted",
         )
+
+    def test_v1_recovery_contract_is_not_upgraded_in_place(self):
+        request, state_path = self._interrupted_diagnostic("analysis-v1-contract")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["recovery_contract"]["schema_version"] = 1
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        with self.assertRaisesRegex(remote_worker.WorkerError, "RECOVERY_LEGACY_STATE"):
+            remote_worker.resume(request)
+
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["execution"]["status"], "interrupted")
+        self.assertEqual(persisted["recovery_contract"]["schema_version"], 1)
 
     def test_changed_worker_blocks_resume_without_new_attempt(self):
         request, state_path = self._interrupted_diagnostic("analysis-worker-changed")

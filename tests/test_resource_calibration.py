@@ -61,7 +61,7 @@ class ResourceCalibrationTests(unittest.TestCase):
     def workflow1_spec(self) -> dict:
         return normalize_execution_spec(
             {
-                "version": 3,
+                "version": 4,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -86,6 +86,7 @@ class ResourceCalibrationTests(unittest.TestCase):
 
     def classification_spec(self) -> dict:
         raw = self.workflow1_spec()
+        raw.pop("capability_contract")
         return normalize_execution_spec(
             {
                 **raw,
