@@ -374,6 +374,89 @@ VIRUS_SUMMARY_MANIFEST = CapabilityManifest(
     parameters=(),
     presets=(("workflow_default", ()),),
 )
+HOST_MAPPING_MANIFEST = CapabilityManifest(
+    id="workflow3.host_mapping.bowtie2",
+    version=1,
+    stage_id="host_mapping",
+    tool_id="bowtie2",
+    label="Bowtie2 宿主标记序列比对",
+    validation_status="dry_run_validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="将 clean reads 比对到已登记 EukaMarker 索引；宿主识别不等同于宿主序列去除。",
+    software_dependencies=("snakemake", "bowtie2", "samtools", "perl"),
+    reference_dependencies=("workflow3.eukamarker_bowtie2",),
+    parser="analysis_runner.host_mapping",
+    resources=(("threads", 12),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+HOST_COVERAGE_MANIFEST = CapabilityManifest(
+    id="workflow3.host_coverage.samtools",
+    version=1,
+    stage_id="host_coverage",
+    tool_id="samtools",
+    label="Samtools 宿主标记覆盖度",
+    validation_status="dry_run_validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="从宿主标记比对结果计算覆盖度，不单独形成宿主判定。",
+    software_dependencies=("snakemake", "samtools", "awk", "sed"),
+    reference_dependencies=(),
+    parser="analysis_runner.host_coverage",
+    resources=(("threads", 1),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+HOST_BLAST_MANIFEST = CapabilityManifest(
+    id="workflow3.host_blast.blastn",
+    version=1,
+    stage_id="host_blast",
+    tool_id="blastn",
+    label="BLASTn 宿主标记搜索",
+    validation_status="dry_run_validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="将组装 contig 与已登记 EukaMarker BLAST 数据库比对，作为宿主证据的一部分。",
+    software_dependencies=("snakemake", "blastn", "sed"),
+    reference_dependencies=("workflow3.eukamarker_blastdb",),
+    parser="analysis_runner.host_blast",
+    resources=(("threads", 6),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+HOST_INTEGRATE_MANIFEST = CapabilityManifest(
+    id="workflow3.host_integrate.posix",
+    version=1,
+    stage_id="host_integrate",
+    tool_id="posix_text_tools",
+    label="宿主标记证据整合",
+    validation_status="dry_run_validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="按 Workflow 3 固定过滤条件整合覆盖度与 BLAST 结果；工程汇总不等同于专家审核。",
+    software_dependencies=("snakemake", "grep", "awk"),
+    reference_dependencies=(),
+    parser="analysis_runner.host_integrate",
+    resources=(("threads", 1),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
+HOST_SUMMARY_MANIFEST = CapabilityManifest(
+    id="workflow3.host_summary.python",
+    version=1,
+    stage_id="host_summary",
+    tool_id="python",
+    label="宿主识别结果汇总",
+    validation_status="dry_run_validated",
+    adapter_version=WORKFLOW_ADAPTER_VERSION,
+    impact="使用已登记 taxonomy 资料生成宿主识别汇总；当前只完成 DAG dry-run。",
+    software_dependencies=("snakemake", "python", "result_summarize_V3.py"),
+    reference_dependencies=(
+        "workflow3.eukamarker_taxonomy",
+        "workflow3.eukamarker_taxonomy_chinese",
+    ),
+    parser="analysis_runner.host_summary",
+    resources=(("threads", 1),),
+    parameters=(),
+    presets=(("workflow_default", ()),),
+)
 CAPABILITY_MANIFESTS = {
     manifest.id: manifest
     for manifest in (
@@ -387,6 +470,11 @@ CAPABILITY_MANIFESTS = {
         VIRUS_CANDIDATE_EXTRACT_MANIFEST,
         VIRUS_EVIDENCE_MANIFEST,
         VIRUS_SUMMARY_MANIFEST,
+        HOST_MAPPING_MANIFEST,
+        HOST_COVERAGE_MANIFEST,
+        HOST_BLAST_MANIFEST,
+        HOST_INTEGRATE_MANIFEST,
+        HOST_SUMMARY_MANIFEST,
     )
 }
 

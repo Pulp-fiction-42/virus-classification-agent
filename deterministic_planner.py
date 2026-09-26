@@ -15,7 +15,7 @@ from pipeline_spec import (
 )
 from workflow_catalog import PUBLIC_DELIVERABLES
 
-PLANNER_VERSION = 5
+PLANNER_VERSION = 6
 GOAL_LABELS = {
     goal_id: metadata["label"] for goal_id, metadata in PUBLIC_DELIVERABLES.items()
 }
@@ -252,7 +252,9 @@ class DeterministicPlanner:
             )
             validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
         except ExecutionSpecError as exc:
-            raise PlannerError(f"persisted analysis plan is invalid: {exc}") from exc
+            raise PlannerError(
+                f"persisted analysis plan is invalid: {exc}", code=exc.code
+            ) from exc
         if (
             persisted_spec != compiled["execution_spec"]
             or persisted_plan.get("steps") != compiled["steps"]
@@ -309,7 +311,9 @@ class DeterministicPlanner:
             )
             validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
         except ExecutionSpecError as exc:
-            raise PlannerError(f"persisted analysis plan is invalid: {exc}") from exc
+            raise PlannerError(
+                f"persisted analysis plan is invalid: {exc}", code=exc.code
+            ) from exc
         if (
             persisted_spec != compiled["execution_spec"]
             or persisted_plan.get("steps") != compiled["steps"]

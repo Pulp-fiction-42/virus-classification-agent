@@ -162,7 +162,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["knowledge"]["status"], "ready")
         self.assertEqual(result["knowledge"]["provider"], "sqlite_fts5")
-        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v2")
+        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v3")
         self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
 
     async def test_health_rejects_unpinned_sdk(self):
@@ -181,6 +181,46 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         fastp = result["capabilities"][0]
         self.assertEqual(fastp["id"], "workflow1.read_qc.fastp")
         self.assertEqual(fastp["version"], 1)
+        workflow3 = [
+            item
+            for item in result["capabilities"]
+            if item["id"].startswith("workflow3.")
+        ]
+        self.assertEqual(
+            [item["id"] for item in workflow3],
+            [
+                "workflow3.host_mapping.bowtie2",
+                "workflow3.host_coverage.samtools",
+                "workflow3.host_blast.blastn",
+                "workflow3.host_integrate.posix",
+                "workflow3.host_summary.python",
+            ],
+        )
+        self.assertEqual(
+            [item["output_artifact"] for item in workflow3],
+            [
+                "host_alignment_bundle",
+                "host_coverage_bundle",
+                "host_blast_bundle",
+                "host_evidence_bundle",
+                "host_summary_bundle",
+            ],
+        )
+        self.assertEqual(workflow3[0]["resources"], {"threads": 12})
+        self.assertEqual(
+            workflow3[0]["reference_dependencies"],
+            ["workflow3.eukamarker_bowtie2"],
+        )
+        self.assertEqual(
+            workflow3[-1]["reference_dependencies"],
+            [
+                "workflow3.eukamarker_taxonomy",
+                "workflow3.eukamarker_taxonomy_chinese",
+            ],
+        )
+        self.assertTrue(
+            all(item["validation_status"] == "dry_run_validated" for item in workflow3)
+        )
         self.assertNotIn("path", json.dumps(result).lower())
 
     async def test_start_api_forwards_backend_owned_run_reference(self):

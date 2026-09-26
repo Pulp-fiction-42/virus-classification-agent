@@ -114,8 +114,8 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
     def test_workflow1_contract_freezes_each_selected_stage_manifest(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])
 
-        self.assertEqual(plan["planner_version"], 5)
-        self.assertEqual(plan["execution_spec"]["version"], 5)
+        self.assertEqual(plan["planner_version"], 6)
+        self.assertEqual(plan["execution_spec"]["version"], 6)
         self.assertEqual(
             [
                 item["capability_id"]
@@ -159,12 +159,32 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_version_4_plan_remains_visible_but_cannot_start(self):
+    def test_workflow3_contract_freezes_each_selected_stage_manifest(self):
+        plan = self.compile(dataset(RAW, CONTIGS), ["host_summary"])
+
+        self.assertEqual(
+            [
+                item["capability_id"]
+                for item in plan["execution_spec"]["capability_contract"][
+                    "manifests"
+                ]
+                if item["capability_id"].startswith("workflow3.")
+            ],
+            [
+                "workflow3.host_mapping.bowtie2",
+                "workflow3.host_coverage.samtools",
+                "workflow3.host_blast.blastn",
+                "workflow3.host_integrate.posix",
+                "workflow3.host_summary.python",
+            ],
+        )
+
+    async def test_version_5_plan_remains_visible_but_cannot_start(self):
         plan = self.compile(dataset(CONTIGS), ["virus_summary"])
         old_plan = copy.deepcopy(plan)
-        old_plan["execution_spec"]["version"] = 4
+        old_plan["execution_spec"]["version"] = 5
 
-        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 5"):
+        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 6"):
             await self.planner.start(
                 persisted_plan=old_plan,
                 dataset=dataset(CONTIGS),
@@ -379,6 +399,24 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
                 run_id="analysis-test-run",
                 queue_context={"project_id": "project-test", "project_priority": "normal"},
             )
+        self.assertIsNone(self.manager.launched)
+
+    async def test_start_rejects_tampered_manifest_version(self):
+        plan = self.compile(dataset(RAW, CONTIGS), ["host_summary"])
+        plan["execution_spec"]["capability_contract"]["manifests"][-1][
+            "manifest_version"
+        ] = 99
+        with self.assertRaises(PlannerError) as raised:
+            await self.planner.start(
+                persisted_plan=plan,
+                dataset=dataset(RAW, CONTIGS),
+                chat_id="00000000-0000-0000-0000-000000000001",
+                plan_id="pl_test",
+                plan_revision=2,
+                run_id="analysis-test-run",
+                queue_context={"project_id": "project-test"},
+            )
+        self.assertEqual(raised.exception.code, "CAPABILITY_VERSION_UNAVAILABLE")
         self.assertIsNone(self.manager.launched)
 
     async def test_start_rejects_caller_controlled_run_path(self):

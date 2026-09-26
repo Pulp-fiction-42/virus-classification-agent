@@ -12,6 +12,7 @@ from knowledge import (
     ENGINEERING_RELEASES,
     MAX_ONLINE_PASSAGE_CHARS,
     MAX_ONLINE_PASSAGES,
+    KnowledgeStore,
     engineering_knowledge_intent,
     load_engineering_store,
     online_citation,
@@ -56,6 +57,14 @@ class EngineeringKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertIn("ENG-K11", {item.citation_id for item in workflow2.passages})
+        workflow3 = await self.store.retrieve(
+            RetrievalRequest(
+                query="Workflow 3 宿主识别使用哪些工具和数据库",
+                corpora=ENGINEERING_CORPORA,
+                limit=MAX_ONLINE_PASSAGES,
+            )
+        )
+        self.assertIn("ENG-K12", {item.citation_id for item in workflow3.passages})
         self.assertTrue(all(item.locator.startswith("$") for item in chinese.passages))
         self.assertTrue(
             all(
@@ -103,3 +112,13 @@ class EngineeringKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             target.write_text(json.dumps(registry), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "catalog identity mismatch"):
                 load_engineering_store(target)
+
+    def test_previous_release_files_remain_hash_verifiable(self):
+        registry = json.loads(ENGINEERING_RELEASES.read_text(encoding="utf-8"))
+        for release in registry["releases"]:
+            with self.subTest(release=release["release_id"]):
+                store = KnowledgeStore(
+                    ENGINEERING_RELEASES.parent / release["file"], release["sha256"]
+                )
+                self.assertEqual(store.release_id, release["release_id"])
+                store.close()

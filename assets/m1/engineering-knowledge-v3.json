@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "release_id": "engineering-knowledge-v3",
+  "release_scope": "engineering_contract",
+  "catalog_sha256": "3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b",
+  "sources": [
+    {
+      "id": "ENGINEERING-CATALOG-V3",
+      "origin": "bioagent://capability-catalog",
+      "version": "schema-v1@3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b",
+      "locator": "$",
+      "sha256": "1aa7c387c0bf70e34887c09edea814dbbf64ea2c855addf769e85187b543de8f",
+      "content": "工程知识发布仅描述 capability catalog 中已注册的能力、交付目标、artifact、参数与版本；不代表生物学审核、正式参考库发布或真实分析验收。\nWorkflow 1 五阶段分别登记 fastp、Bowtie2／samtools／rRNA 索引、SeqKit、MEGAHIT 与 SeqKit；只有 read_qc 为 validated，rrna_filter 为 dry_run_validated，其余保持 code_exists。\nfastp 可控参数为 length_required、qualified_quality_phred、unqualified_percent_limit、n_base_limit、average_qual 与 detect_adapter_for_pe；方案只接受 manifest 白名单字段并须重新编译。\nWorkflow 2 五阶段登记序列准备、HMM 候选搜索、候选提取、证据工具链与结果汇总；当前只完成全 DAG dry-run，状态为 dry_run_validated，NT、NR、CheckV、病毒宿主库与 HMM 仍不是具备许可及完整哈希的正式 release。\nWorkflow 3 五阶段登记 Bowtie2 宿主标记比对、Samtools 覆盖度、BLASTn 搜索、固定文本整合与 Python 汇总；当前只完成全 DAG dry-run，EukaMarker 索引与 taxonomy 仍不是具备许可及完整哈希的正式 release，也不支持受控恢复。"
+    }
+  ],
+  "entities": [],
+  "relations": [],
+  "passages": [
+    {
+      "id": "ENG-K00",
+      "source_id": "ENGINEERING-CATALOG-V3",
+      "lines": [1, 1],
+      "locator": "$.schema_version",
+      "corpus": "faq_policy",
+      "terms": "工程知识 能力目录 capability catalog 验证状态 生物学审核 正式发布",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b"
+    },
+    {
+      "id": "ENG-K07",
+      "source_id": "ENGINEERING-CATALOG-V3",
+      "lines": [2, 2],
+      "locator": "$.capabilities[?(@.id=~'workflow1.*')]",
+      "corpus": "tools_databases",
+      "terms": "workflow1 read_qc rrna_filter sample_merge assembly contig_filter fastp bowtie2 samtools seqkit megahit rRNA manifest validated dry_run_validated code_exists",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b"
+    },
+    {
+      "id": "ENG-K08",
+      "source_id": "ENGINEERING-CATALOG-V3",
+      "lines": [3, 3],
+      "locator": "$.capabilities[?(@.id=='workflow1.read_qc.fastp')].parameters",
+      "corpus": "tools_databases",
+      "terms": "workflow1.read_qc.fastp fastp 参数 length_required qualified_quality_phred unqualified_percent_limit n_base_limit average_qual detect_adapter_for_pe 参数白名单 重新编译",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b"
+    },
+    {
+      "id": "ENG-K11",
+      "source_id": "ENGINEERING-CATALOG-V3",
+      "lines": [4, 4],
+      "locator": "$.capabilities[?(@.id=~'workflow2.*')]",
+      "corpus": "workflow_capabilities",
+      "terms": "workflow2 virus_sequence_prep virus_candidate_search virus_candidate_extract virus_evidence virus_summary HMM NT NR CheckV 病毒宿主库 候选搜索 候选证据 结果汇总 dry_run_validated reference release 许可 哈希",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b"
+    },
+    {
+      "id": "ENG-K12",
+      "source_id": "ENGINEERING-CATALOG-V3",
+      "lines": [5, 5],
+      "locator": "$.capabilities[?(@.id=~'workflow3.*')]",
+      "corpus": "workflow_capabilities",
+      "terms": "workflow3 host_mapping host_coverage host_blast host_integrate host_summary Bowtie2 Samtools BLASTn Python EukaMarker taxonomy 宿主识别 dry_run_validated reference release 许可 哈希 恢复",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:3e63a1d25592a30a0bed776f7b41cd93be537106bf81dece5be63d446e4ebd2b"
+    }
+  ]
+}
