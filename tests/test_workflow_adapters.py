@@ -8,6 +8,7 @@ from workflow_adapters import (
     AdapterSettings,
     _prepare_workflow1_inputs,
     _rewrite_workflow1_config,
+    _workflow2_targets,
     prepare_execution,
 )
 from workflow_catalog import ARTIFACTS, STAGES
@@ -34,7 +35,7 @@ def artifact_input(artifact_type: str, root: Path, *, sample_id: str = "sample1"
 
 def pipeline(inputs, deliverables, *, mode="standard", viral_type="RNA+DNA"):
     return {
-        "version": 4,
+        "version": 5,
         "adapter": "analysis_pipeline",
         "inputs": inputs,
         "deliverables": deliverables,
@@ -98,6 +99,16 @@ class PipelineSpecTests(unittest.TestCase):
             ],
         )
         self.assertEqual(normalized["stages"][1]["rules"], ["rna_virusidentification"])
+
+    def test_workflow2_summary_targets_only_real_source_outputs(self):
+        targets = _workflow2_targets(
+            "virus_summary", Path("/run/results/virus-identification"), "RNA+DNA"
+        )
+
+        self.assertEqual(
+            [target.name for target in targets],
+            ["rep_vert_viruses.fna", "vert_viruses.fna"],
+        )
 
     def test_annotation_requires_taxonomy_as_an_independent_input(self):
         with self.assertRaisesRegex(ExecutionSpecError, "virus_taxonomy"):

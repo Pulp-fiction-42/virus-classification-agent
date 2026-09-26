@@ -911,7 +911,6 @@ def _workflow2_targets(stage_id: str, results: Path, viral_type: str) -> list[Pa
     return [
         results / "summary/sequences/rep_vert_viruses.fna",
         results / "summary/sequences/vert_viruses.fna",
-        results / "summary/tables/taxonomy.tsv",
     ]
 
 

@@ -47,6 +47,15 @@ class EngineeringKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(item.review_status == "approved" for item in chinese.passages)
         )
+
+        workflow2 = await self.store.retrieve(
+            RetrievalRequest(
+                query="Workflow 2 候选证据使用哪些数据库",
+                corpora=ENGINEERING_CORPORA,
+                limit=MAX_ONLINE_PASSAGES,
+            )
+        )
+        self.assertIn("ENG-K11", {item.citation_id for item in workflow2.passages})
         self.assertTrue(all(item.locator.startswith("$") for item in chinese.passages))
         self.assertTrue(
             all(
@@ -78,15 +87,18 @@ class EngineeringKnowledgeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_release_hash_and_catalog_identity_fail_closed(self):
         registry = json.loads(ENGINEERING_RELEASES.read_text(encoding="utf-8"))
-        package = ENGINEERING_RELEASES.parent / registry["releases"][0]["file"]
+        active = next(
+            release
+            for release in registry["releases"]
+            if release["release_id"] == registry["active_release"]
+        )
+        package = ENGINEERING_RELEASES.parent / active["file"]
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             copied = root / package.name
             copied.write_bytes(package.read_bytes() + b"\n")
-            registry["releases"][0]["sha256"] = hashlib.sha256(
-                copied.read_bytes()
-            ).hexdigest()
-            registry["releases"][0]["catalog_sha256"] = "0" * 64
+            active["sha256"] = hashlib.sha256(copied.read_bytes()).hexdigest()
+            active["catalog_sha256"] = "0" * 64
             target = root / "engineering-releases.json"
             target.write_text(json.dumps(registry), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "catalog identity mismatch"):

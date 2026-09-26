@@ -61,7 +61,7 @@ class ResourceCalibrationTests(unittest.TestCase):
     def workflow1_spec(self) -> dict:
         return normalize_execution_spec(
             {
-                "version": 4,
+                "version": 5,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {

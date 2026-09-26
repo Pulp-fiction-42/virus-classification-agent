@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 from pathlib import Path
 
@@ -113,8 +114,8 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
     def test_workflow1_contract_freezes_each_selected_stage_manifest(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])
 
-        self.assertEqual(plan["planner_version"], 4)
-        self.assertEqual(plan["execution_spec"]["version"], 4)
+        self.assertEqual(plan["planner_version"], 5)
+        self.assertEqual(plan["execution_spec"]["version"], 5)
         self.assertEqual(
             [
                 item["capability_id"]
@@ -130,6 +131,49 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
                 "workflow1.contig_filter.seqkit",
             ],
         )
+
+    def test_workflow2_contract_freezes_each_selected_stage_manifest(self):
+        plan = self.compile(dataset(CONTIGS), ["virus_summary"])
+
+        self.assertEqual(
+            [
+                item["capability_id"]
+                for item in plan["execution_spec"]["capability_contract"][
+                    "manifests"
+                ]
+            ],
+            [
+                "workflow2.virus_sequence_prep.toolchain",
+                "workflow2.virus_candidate_search.hmmsearch",
+                "workflow2.virus_candidate_extract.seqkit",
+                "workflow2.virus_evidence.toolchain",
+                "workflow2.virus_summary.python",
+            ],
+        )
+        self.assertTrue(
+            all(
+                item["manifest_version"] == 1
+                for item in plan["execution_spec"]["capability_contract"][
+                    "manifests"
+                ]
+            )
+        )
+
+    async def test_version_4_plan_remains_visible_but_cannot_start(self):
+        plan = self.compile(dataset(CONTIGS), ["virus_summary"])
+        old_plan = copy.deepcopy(plan)
+        old_plan["execution_spec"]["version"] = 4
+
+        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 5"):
+            await self.planner.start(
+                persisted_plan=old_plan,
+                dataset=dataset(CONTIGS),
+                chat_id="chat-1",
+                plan_id="plan-1",
+                plan_revision=1,
+                run_id="analysis-old-plan",
+                queue_context={"project_id": "project-1"},
+            )
 
     def test_excluded_stage_conflict_is_structured(self):
         with self.assertRaises(PlannerError) as raised:

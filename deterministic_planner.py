@@ -15,7 +15,7 @@ from pipeline_spec import (
 )
 from workflow_catalog import PUBLIC_DELIVERABLES
 
-PLANNER_VERSION = 4
+PLANNER_VERSION = 5
 GOAL_LABELS = {
     goal_id: metadata["label"] for goal_id, metadata in PUBLIC_DELIVERABLES.items()
 }

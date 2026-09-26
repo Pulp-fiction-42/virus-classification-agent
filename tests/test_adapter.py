@@ -162,7 +162,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["knowledge"]["status"], "ready")
         self.assertEqual(result["knowledge"]["provider"], "sqlite_fts5")
-        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v1")
+        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v2")
         self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
 
     async def test_health_rejects_unpinned_sdk(self):

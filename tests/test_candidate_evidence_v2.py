@@ -174,3 +174,27 @@ def test_v2_can_express_conflict_missing_and_limitation_issues() -> None:
         "missing",
         "limitation",
     }
+
+
+def test_v2_accepts_source_percent_with_explicit_denominator_description() -> None:
+    payload = _fixture()
+    observation = _observation(payload, "E-SAMPLED-READS")
+    observation["unit"] = "percent"
+    observation["value"] = 42.5
+    observation["denominator_description"] = "sampled read pairs"
+
+    parsed = CandidateEvidenceV2.model_validate(payload)
+
+    assert parsed.observations[0].denominator_description == "sampled read pairs"
+
+
+@pytest.mark.parametrize(("unit", "value"), [("ratio", 1.01), ("percent", 100.1)])
+def test_v2_rejects_out_of_range_fractional_values(unit: str, value: float) -> None:
+    payload = _fixture()
+    observation = _observation(payload, "E-SAMPLED-READS")
+    observation["unit"] = unit
+    observation["value"] = value
+    observation["denominator_description"] = "sampled read pairs"
+
+    with pytest.raises(ValidationError, match="values must be between"):
+        CandidateEvidenceV2.model_validate(payload)

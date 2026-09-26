@@ -111,6 +111,9 @@ class ObservationV2(Contract):
     population: str
     source_group: str
     denominator_evidence_id: str | None = None
+    denominator_description: str | None = Field(
+        default=None, min_length=1, max_length=240
+    )
     source: EvidenceSourceV2 | None = None
     derivation: EvidenceDerivationV2 | None = None
     missing_reason: str | None = None
@@ -125,18 +128,33 @@ class ObservationV2(Contract):
             raise ValueError("present values cannot have missing_reason")
 
         ratio_unit = self.unit in {"ratio", "percent"}
-        if ratio_unit != (self.denominator_evidence_id is not None):
-            raise ValueError("ratio and percent values require denominator_evidence_id only")
-        if ratio_unit and (
-            self.derivation is None or self.derivation.operation != "ratio"
+        if not ratio_unit and (
+            self.denominator_evidence_id is not None
+            or self.denominator_description is not None
         ):
-            raise ValueError("ratio and percent values require a ratio derivation")
-        if (
-            ratio_unit
-            and self.derivation is not None
-            and self.denominator_evidence_id != self.derivation.input_evidence_ids[1]
+            raise ValueError("only ratio and percent values may declare a denominator")
+        if ratio_unit and self.source is not None and (
+            self.denominator_evidence_id is not None
+            or self.denominator_description is None
         ):
-            raise ValueError("denominator must be the second ratio input")
+            raise ValueError(
+                "source ratio and percent values require denominator_description only"
+            )
+        if ratio_unit and self.derivation is not None:
+            if (
+                self.denominator_evidence_id is None
+                or self.denominator_description is not None
+                or self.derivation.operation != "ratio"
+            ):
+                raise ValueError(
+                    "derived ratio and percent values require a ratio denominator evidence"
+                )
+            if self.denominator_evidence_id != self.derivation.input_evidence_ids[1]:
+                raise ValueError("denominator must be the second ratio input")
+        if self.value is not None and self.unit == "ratio" and not 0 <= self.value <= 1:
+            raise ValueError("ratio values must be between 0 and 1")
+        if self.value is not None and self.unit == "percent" and not 0 <= self.value <= 100:
+            raise ValueError("percent values must be between 0 and 100")
         return self
 
 

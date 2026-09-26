@@ -131,7 +131,7 @@ rule merge:
         }[exit_rule]
         execution_spec = normalize_execution_spec(
             {
-                "version": 4,
+                "version": 5,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -207,7 +207,7 @@ rule merge:
     def _contig_spec(path: Path, viral_type: str = "RNA+DNA") -> dict:
         return normalize_execution_spec(
             {
-                "version": 4,
+                "version": 5,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -237,7 +237,7 @@ rule merge:
         read2.write_text("@read/2\nTG\n+\nII\n", encoding="utf-8")
         execution_spec = normalize_execution_spec(
             {
-                "version": 4,
+                "version": 5,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -1443,7 +1443,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             ]
             execution_spec = normalize_execution_spec(
                 {
-                    "version": 4,
+                    "version": 5,
                     "adapter": "analysis_pipeline",
                     "inputs": [
                         {
@@ -1614,7 +1614,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     }
                 execution_spec = normalize_execution_spec(
                     {
-                        "version": 4,
+                        "version": 5,
                         "adapter": "analysis_pipeline",
                         "inputs": [
                             {
@@ -1671,7 +1671,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             state = {
                 "execution_spec": normalize_execution_spec(
                     {
-                        "version": 4,
+                        "version": 5,
                         "adapter": "analysis_pipeline",
                         "inputs": [
                             {

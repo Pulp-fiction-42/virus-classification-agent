@@ -396,7 +396,7 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
                     "dataset": {"status": "ready", "artifacts": []},
                     "plan": {
                         "execution_spec": {
-                            "version": 4,
+                            "version": 5,
                             "adapter": "analysis_pipeline",
                             "options": {
                                 "capability_parameters": [

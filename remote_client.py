@@ -36,6 +36,8 @@ WORKER_FILES = (
     "resource_calibration.py",
     "workflow_adapters.py",
     "workflow_catalog.py",
+    "candidate_evidence.py",
+    "evidence_contract.py",
 )
 DEPLOY_PYTHON = "/usr/bin/python3"
 
