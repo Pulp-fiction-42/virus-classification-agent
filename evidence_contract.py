@@ -26,6 +26,47 @@ class ReleaseSet(Contract):
     schema_version: Literal[1] = 1
     releases: list[AssetRelease]
 
+    @model_validator(mode="after")
+    def validate_unique_releases(self) -> ReleaseSet:
+        asset_ids = [release.asset_id for release in self.releases]
+        if len(set(asset_ids)) != len(asset_ids):
+            raise ValueError("release set must select exactly one version per asset")
+        return self
+
+
+class ReleaseResolution(Contract):
+    """Release and dependency identity status for a bounded assessment."""
+
+    schema_version: Literal[1] = 1
+    status: Literal["complete", "incomplete", "unavailable"]
+    release_set: ReleaseSet
+    capability_ids: list[str]
+    software_dependency_ids: list[str]
+    reference_dependency_ids: list[str]
+    missing_dependency_ids: list[str] = Field(default_factory=list)
+    observed_checksum_ids: list[str] = Field(default_factory=list)
+    limitation_codes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> ReleaseResolution:
+        for values in (
+            self.capability_ids,
+            self.software_dependency_ids,
+            self.reference_dependency_ids,
+            self.missing_dependency_ids,
+            self.observed_checksum_ids,
+            self.limitation_codes,
+        ):
+            if values != sorted(set(values)):
+                raise ValueError("release resolution lists must be sorted and unique")
+        if self.status == "complete" and (
+            self.missing_dependency_ids or self.limitation_codes
+        ):
+            raise ValueError("complete release resolution cannot contain limitations")
+        if self.status == "unavailable" and "DEPENDENCY_IDENTITY_UNAVAILABLE" not in self.limitation_codes:
+            raise ValueError("unavailable release resolution requires an unavailable limitation")
+        return self
+
 
 class CapabilityManifest(Contract):
     capability_id: str

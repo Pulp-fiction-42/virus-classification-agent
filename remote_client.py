@@ -37,6 +37,7 @@ WORKER_FILES = (
     "workflow_adapters.py",
     "workflow_catalog.py",
     "candidate_evidence.py",
+    "candidate_assessment.py",
     "evidence_contract.py",
 )
 DEPLOY_PYTHON = "/usr/bin/python3"
@@ -114,6 +115,14 @@ class RemoteWorkerClient:
 
     def _source_files(self) -> list[tuple[Path, str]]:
         files = [(self.project_root / name, name) for name in WORKER_FILES]
+        files.extend(
+            (self.project_root / "assets" / "m2" / name, f"assets/m2/{name}")
+            for name in (
+                "candidate-evidence-v2.json",
+                "engineering-rules-v1.json",
+                "releases.json",
+            )
+        )
         files.append((self.project_root / "extract_io.py", "scripts/extract_io.py"))
         evidence = (
             self.project_root.parent

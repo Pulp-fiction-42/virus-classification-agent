@@ -1,0 +1,22 @@
+{
+  "release_id": "candidate-evidence-v2",
+  "scope": "engineering_contract",
+  "review_status": "approved",
+  "review_record": "bounded Workflow 2 evidence parsing and deterministic assessment contract",
+  "schema_version": 2,
+  "implementation_sha256": {
+    "candidate_assessment.py": "273ea895f06f24d69ffeb5cf6120cf5ec5690fb11b20d61d6f10963ae2522c62",
+    "candidate_evidence.py": "3dfb677ce901a5df727161d04561b7032b5d823d42c7175adc440af013d39f11",
+    "evidence_contract.py": "f95fd8ebc5961fdbf3835462d7d79593dc01e6bb2180351de453ad3ed935d5a6"
+  },
+  "source_artifacts": [
+    "workflow2.virus_candidates",
+    "workflow2.coverage",
+    "workflow2.checkv_quality_summary",
+    "workflow2.nr_result"
+  ],
+  "limitations": [
+    "Engineering contract only; it does not contain domain thresholds or biological conclusions.",
+    "A source checksum observation does not prove the installed reference database content identity."
+  ]
+}

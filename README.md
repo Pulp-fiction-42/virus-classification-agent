@@ -52,6 +52,16 @@ Workflow 1 在 run root 建立副本时会把 run-local `config.yaml` 的 `softw
 
 完整复现与限制见 [M0 实施记录](../docs/m0-implementation-record.md)。本次没有本地模型生成、专家审核或生物学性能验收。
 
+## M2 工程研判检查
+
+`candidate_assessment.py` 只读解析已完成的 Workflow 2 run，并用 `assets/m2` 中逐档校验的 capability／工程规则 release 生成聚合检查：
+
+```bash
+python candidate_assessment.py --state <run>/.bioagent/state.json --summary
+```
+
+命令不接受输出路径，也不写回 run。当前没有核准的领域规则、知识或正式 reference release，因此每个候选都保持 `Assessment(status="not_generated")`；输出只有来源哈希与候选、观测、finding、assessment 聚合计数，不包含候选 ID 或序列。NT／NR 的来源 checksum 清单只能登记为观察，不能证明已安装数据库的完整内容身份，也不会提升 Workflow 2–6 的恢复资格。
+
 ## 测试
 
 ```bash
