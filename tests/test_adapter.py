@@ -162,7 +162,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["knowledge"]["status"], "ready")
         self.assertEqual(result["knowledge"]["provider"], "sqlite_fts5")
-        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v3")
+        self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v4")
         self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
 
     async def test_health_rejects_unpinned_sdk(self):
@@ -220,6 +220,42 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(
             all(item["validation_status"] == "dry_run_validated" for item in workflow3)
+        )
+        workflow4_to_6 = [
+            item
+            for item in result["capabilities"]
+            if item["id"].startswith(("workflow4.", "workflow5.", "workflow6."))
+        ]
+        self.assertEqual(len(workflow4_to_6), 11)
+        self.assertEqual(
+            next(
+                item
+                for item in workflow4_to_6
+                if item["id"] == "workflow4.microbe_classify.kraken2"
+            )["reference_dependencies"],
+            ["workflow4.kraken2_standard_20240112"],
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in workflow4_to_6
+                if item["id"] == "workflow5.virus_read_mapping.bowtie2"
+            )["reference_dependencies"],
+            [],
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in workflow4_to_6
+                if item["id"] == "workflow6.functional_annotation.dramv"
+            )["reference_dependencies"],
+            ["workflow6.dramv_data", "workflow6.dram_config"],
+        )
+        self.assertTrue(
+            all(
+                item["validation_status"] == "dry_run_validated"
+                for item in workflow4_to_6
+            )
         )
         self.assertNotIn("path", json.dumps(result).lower())
 

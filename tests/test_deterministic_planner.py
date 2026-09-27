@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from deterministic_planner import GOAL_ORDER, DeterministicPlanner, PlannerError
+from workflow_catalog import CAPABILITY_MANIFESTS, STAGES
 
 
 def artifact(
@@ -114,8 +115,8 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
     def test_workflow1_contract_freezes_each_selected_stage_manifest(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])
 
-        self.assertEqual(plan["planner_version"], 6)
-        self.assertEqual(plan["execution_spec"]["version"], 6)
+        self.assertEqual(plan["planner_version"], 7)
+        self.assertEqual(plan["execution_spec"]["version"], 7)
         self.assertEqual(
             [
                 item["capability_id"]
@@ -179,12 +180,74 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_version_5_plan_remains_visible_but_cannot_start(self):
+    def test_every_stage_has_exactly_one_capability_manifest(self):
+        manifest_stage_ids = [
+            manifest.stage_id for manifest in CAPABILITY_MANIFESTS.values()
+        ]
+        self.assertEqual(len(manifest_stage_ids), len(set(manifest_stage_ids)))
+        self.assertEqual(set(manifest_stage_ids), {stage.id for stage in STAGES})
+
+    def test_workflow4_to_6_contracts_freeze_each_selected_stage_manifest(self):
+        scenarios = (
+            (
+                "workflow4.",
+                self.compile(dataset(RAW), ["microbe_summary"]),
+                [
+                    "workflow4.microbe_classify.kraken2",
+                    "workflow4.microbe_abundance.bracken",
+                    "workflow4.microbe_summary.bracken",
+                ],
+            ),
+            (
+                "workflow5.",
+                self.compile(dataset(RAW, REFERENCE), ["virus_rpm"]),
+                [
+                    "workflow5.virus_read_mapping.bowtie2",
+                    "workflow5.virus_coverage.posix",
+                    "workflow5.virus_rpm.posix",
+                ],
+            ),
+            (
+                "workflow6.",
+                self.compile(
+                    dataset(REFERENCE, TAXONOMY), ["annotation_delivery"]
+                ),
+                [
+                    "workflow6.virus_quality.checkv",
+                    "workflow6.annotation_strategy.python",
+                    "workflow6.structure_annotation.toolchain",
+                    "workflow6.functional_annotation.dramv",
+                    "workflow6.annotation_delivery.python",
+                ],
+            ),
+        )
+        for prefix, plan, expected in scenarios:
+            with self.subTest(prefix=prefix):
+                manifests = plan["execution_spec"]["capability_contract"][
+                    "manifests"
+                ]
+                self.assertEqual(
+                    [
+                        item["capability_id"]
+                        for item in manifests
+                        if item["capability_id"].startswith(prefix)
+                    ],
+                    expected,
+                )
+                self.assertTrue(
+                    all(
+                        item["manifest_version"] == 1
+                        for item in manifests
+                        if item["capability_id"].startswith(prefix)
+                    )
+                )
+
+    async def test_version_6_plan_remains_visible_but_cannot_start(self):
         plan = self.compile(dataset(CONTIGS), ["virus_summary"])
         old_plan = copy.deepcopy(plan)
-        old_plan["execution_spec"]["version"] = 5
+        old_plan["execution_spec"]["version"] = 6
 
-        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 6"):
+        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 7"):
             await self.planner.start(
                 persisted_plan=old_plan,
                 dataset=dataset(CONTIGS),

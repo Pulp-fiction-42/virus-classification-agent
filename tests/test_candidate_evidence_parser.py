@@ -52,6 +52,60 @@ def _run(
         )
         writer.writeheader()
         writer.writerows(rows)
+    source_rows = {
+        "downstream/sequences/coverage.csv": (
+            ",",
+            ["qseqid", "Profile_cov"],
+            [
+                {"qseqid": row["qseqid"], "Profile_cov": row["Profile_cov"]}
+                for row in rows
+            ],
+        ),
+        "downstream/sequences/checkv/quality_summary.tsv": (
+            "\t",
+            [
+                "contig_id",
+                "completeness",
+                "contamination",
+                "gene_count",
+                "viral_genes",
+                "host_genes",
+            ],
+            [
+                {
+                    "contig_id": row["qseqid"],
+                    "completeness": row["completeness"],
+                    "contamination": row["contamination"],
+                    "gene_count": row["gene_count"],
+                    "viral_genes": row["viral_genes"],
+                    "host_genes": row["host_genes"],
+                }
+                for row in rows
+            ],
+        ),
+        "downstream/blast/nr/nr_result.csv": (
+            ",",
+            ["qseqid", "qlen", "nr_pident", "approval_rate"],
+            [
+                {
+                    "qseqid": row["qseqid"],
+                    "qlen": row["qlen"],
+                    "nr_pident": row["nr_pident"],
+                    "approval_rate": row["approval_rate"],
+                }
+                for row in rows
+            ],
+        ),
+    }
+    for relative_path, (delimiter, fieldnames, source_data) in source_rows.items():
+        source = results / relative_path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=fieldnames, delimiter=delimiter
+            )
+            writer.writeheader()
+            writer.writerows(source_data)
     records = (
         {"data": {"runs": [{"sample_id": "sample-a"}]}}
         if legacy
@@ -78,8 +132,9 @@ def _run(
 def test_parser_builds_provenanced_workflow2_candidate(tmp_path: Path) -> None:
     result = parse_workflow2_candidate_evidence(_run(tmp_path, [_row()]))
 
-    assert result.source_rows == 1
-    assert len(result.source_sha256) == 64
+    assert len(result.sources) == 4
+    assert result.sources[0].rows == 1
+    assert all(len(source.sha256) == 64 for source in result.sources)
     candidate = result.candidates[0]
     assert candidate.sample_id == "sample-a"
     assert candidate.candidate_kind == "virus_contig"
@@ -91,8 +146,16 @@ def test_parser_builds_provenanced_workflow2_candidate(tmp_path: Path) -> None:
     assert profile.value == 0.75
     assert profile.denominator_description == "HMM profile length"
     assert profile.source is not None
-    assert profile.source.artifact_path.endswith("virus_candidates.csv")
+    assert profile.source.artifact_path.endswith("coverage.csv")
     assert profile.source.locator == "row:2;column:Profile_cov;key:qseqid"
+    contig_length = next(
+        item for item in candidate.observations if item.metric == "contig_length"
+    )
+    assert contig_length.source is not None
+    assert contig_length.source.artifact_path.endswith("nr_result.csv")
+    assert contig_length.source.tool_id == "blastx"
+    assert contig_length.source.reference_id == "workflow2.nr"
+    assert contig_length.source.reference_version == "unknown"
     assert {issue.kind for issue in candidate.issues} == {"limitation"}
 
 
@@ -159,6 +222,168 @@ def test_parser_rejects_missing_schema_columns(tmp_path: Path) -> None:
     assert raised.value.code == "EVIDENCE_SCHEMA_INVALID"
 
 
+def test_parser_rejects_missing_upstream_candidate(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    nr = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/blast/nr/nr_result.csv"
+    )
+    nr.write_text("qseqid,qlen,nr_pident,approval_rate\n", encoding="utf-8")
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_PROVENANCE_MISSING"
+
+
+def test_parser_rejects_missing_upstream_file(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    nr = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/blast/nr/nr_result.csv"
+    )
+    nr.unlink()
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_SOURCE_UNAVAILABLE"
+
+
+def test_parser_allows_unselected_upstream_rows(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    coverage = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/sequences/coverage.csv"
+    )
+    with coverage.open("a", encoding="utf-8") as stream:
+        stream.write("unselected-contig,0.25\n")
+
+    result = parse_workflow2_candidate_evidence(state_path)
+
+    assert len(result.candidates) == 1
+    coverage_artifact = next(
+        source
+        for source in result.sources
+        if source.artifact_type == "workflow2_marker_coverage"
+    )
+    assert coverage_artifact.rows == 2
+
+
+def test_parser_rejects_upstream_value_mismatch(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    coverage = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/sequences/coverage.csv"
+    )
+    coverage.write_text(
+        "qseqid,Profile_cov\nsample-a-contig-1,0.5\n", encoding="utf-8"
+    )
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_PROVENANCE_MISMATCH"
+
+
+def test_parser_accepts_only_tiny_coverage_serialization_difference(
+    tmp_path: Path,
+) -> None:
+    row = _row()
+    row["Profile_cov"] = "0.9928057553956836"
+    state_path = _run(tmp_path, [row])
+    coverage = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/sequences/coverage.csv"
+    )
+    coverage.write_text(
+        "qseqid,Profile_cov\nsample-a-contig-1,0.9928057553956835\n",
+        encoding="utf-8",
+    )
+
+    result = parse_workflow2_candidate_evidence(state_path)
+
+    profile = next(
+        observation
+        for observation in result.candidates[0].observations
+        if observation.metric == "hmm_profile_coverage"
+    )
+    assert profile.value == 0.9928057553956835
+
+
+def test_parser_rejects_tiny_noncoverage_difference(tmp_path: Path) -> None:
+    row = _row()
+    row["nr_pident"] = "91.20000000000001"
+    state_path = _run(tmp_path, [row])
+    nr = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/blast/nr/nr_result.csv"
+    )
+    nr.write_text(
+        "qseqid,qlen,nr_pident,approval_rate\n"
+        "sample-a-contig-1,1234,91.2,0.8\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_PROVENANCE_MISMATCH"
+
+
+def test_parser_rejects_duplicate_upstream_candidate(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    coverage = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/sequences/coverage.csv"
+    )
+    coverage.write_text(
+        "qseqid,Profile_cov\n"
+        "sample-a-contig-1,0.75\n"
+        "sample-a-contig-1,0.75\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_PROVENANCE_DUPLICATE"
+
+
+def test_parser_rejects_symlinked_upstream_source(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    coverage = (
+        state_path.parent.parent
+        / "results/virus-identification/downstream/sequences/coverage.csv"
+    )
+    target = coverage.with_name("coverage-real.csv")
+    coverage.rename(target)
+    coverage.symlink_to(target)
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_SOURCE_INVALID"
+
+
+def test_parser_rejects_upstream_source_resolving_outside_run(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    sequences = (
+        state_path.parent.parent / "results/virus-identification/downstream/sequences"
+    )
+    coverage = sequences / "coverage.csv"
+    outside = tmp_path / "outside-coverage"
+    outside.mkdir()
+    coverage.rename(outside / "coverage.csv")
+    sequences.rename(sequences.with_name("sequences-original"))
+    sequences.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(CandidateEvidenceParseError) as raised:
+        parse_workflow2_candidate_evidence(state_path)
+
+    assert raised.value.code == "EVIDENCE_PATH_OUTSIDE_RUN"
+
+
 def test_parser_rejects_results_outside_run(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     state_path = _run(tmp_path, [_row()], results_dir=outside)
@@ -203,5 +428,7 @@ def test_cli_prints_aggregate_only(tmp_path: Path, capsys) -> None:
     assert main(["--state", str(state_path), "--summary"]) == 0
     output = json.loads(capsys.readouterr().out)
 
+    assert output["schema_version"] == 2
+    assert len(output["sources"]) == 4
     assert output["candidate_count"] == 1
     assert "sample-a-contig-1" not in json.dumps(output)

@@ -65,6 +65,22 @@ class EngineeringKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertIn("ENG-K12", {item.citation_id for item in workflow3.passages})
+        for workflow, citation_id in (
+            ("Workflow 4 Kraken2 Bracken 微生物丰度", "ENG-K13"),
+            ("Workflow 5 Bowtie2 Samtools 病毒 RPM", "ENG-K14"),
+            ("Workflow 6 CheckV VIGOR DRAM-v 病毒注释", "ENG-K15"),
+        ):
+            with self.subTest(workflow=workflow):
+                result = await self.store.retrieve(
+                    RetrievalRequest(
+                        query=workflow,
+                        corpora=ENGINEERING_CORPORA,
+                        limit=MAX_ONLINE_PASSAGES,
+                    )
+                )
+                self.assertIn(
+                    citation_id, {item.citation_id for item in result.passages}
+                )
         self.assertTrue(all(item.locator.startswith("$") for item in chinese.passages))
         self.assertTrue(
             all(

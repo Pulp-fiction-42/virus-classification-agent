@@ -20,7 +20,7 @@ from workflow_catalog import (
 )
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-EXECUTION_SPEC_VERSION = 6
+EXECUTION_SPEC_VERSION = 7
 
 
 class ExecutionSpecError(ValueError):
