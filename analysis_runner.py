@@ -31,6 +31,7 @@ from resource_calibration import (
     ResourceCalibrator,
     build_run_resource_profile,
 )
+from tool_library import build_tool_results
 from workflow_adapters import (
     WORKFLOW1_RULES,
     AdapterSettings,
@@ -1151,6 +1152,7 @@ CLASSIFICATION_FIELDS = (
     "nr_pident",
     "nr_vote_vfamily",
     "approval_rate",
+    "Profile_cov",
     "vhdb_svorder",
     "vhdb_svfamily",
     "vhdb_svname",
@@ -1344,6 +1346,35 @@ def _workflow6_input_is_empty(workflow_dir: Path) -> bool:
         return False
     match = re.search(r'^input_fasta:\s*["\']?([^"\'\n]+)', config, re.MULTILINE)
     return bool(match) and _fasta_count(Path(match.group(1).strip())) == 0
+
+
+def _configured_software_directories(phases: tuple[PreparedPhase, ...]) -> list[str]:
+    """Return executable directories declared by run-local workflow configs."""
+
+    directories: list[str] = []
+    for phase in phases:
+        try:
+            lines = (phase.workflow_dir / "config/config.yaml").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        except OSError:
+            continue
+        in_software = False
+        for line in lines:
+            if line and not line[0].isspace():
+                in_software = line.strip() == "software:"
+                continue
+            if not in_software or not line.strip() or ":" not in line:
+                continue
+            value = line.split(":", 1)[1].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            path = Path(value)
+            if path.is_absolute():
+                directory = str(path.parent)
+                if directory not in directories:
+                    directories.append(directory)
+    return directories
 
 
 def _xlsx_row_count(path: Path) -> int:
@@ -2842,9 +2873,12 @@ def run(args: argparse.Namespace) -> int:
         # Keep the spelling supplied by the environment. On macOS /var is a
         # symlink to /private/var; realpath would make otherwise identical tool
         # paths disagree with workflow configs and test wrappers.
-        tool_dir = str(Path(prepared.seqkit).absolute().parent)
+        tool_dirs = [
+            str(Path(prepared.seqkit).absolute().parent),
+            *_configured_software_directories(prepared.phases),
+        ]
         phase_environment["PATH"] = os.pathsep.join(
-            [tool_dir, phase_environment.get("PATH", "")]
+            [*dict.fromkeys(tool_dirs), phase_environment.get("PATH", "")]
         )
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3208,6 +3242,7 @@ def run(args: argparse.Namespace) -> int:
             settings,
             str(resource_usage["load_bucket"]),
         )
+        state["tool_results"] = build_tool_results(state, telemetry)
         _write_json_atomic(telemetry_path, telemetry)
         _write_json_atomic(state_path, state)
         history_path = state.get("resource_history_db")

@@ -89,7 +89,7 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         spec = normalize_execution_spec(
             {
-                "version": 7,
+                "version": 8,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {

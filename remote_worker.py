@@ -27,6 +27,8 @@ from pipeline_spec import (
     normalize_execution_spec,
     validate_plan_rules,
 )
+from priority_reports import generate_priority_reports, report_artifact
+from tool_library import ToolLibraryError, observe_tool_versions, validate_tool_contract
 from workflow_catalog import CAPABILITY_MANIFESTS
 
 RUN_ID_RE = re.compile(r"^analysis-[A-Za-z0-9_.-]+$")
@@ -1215,11 +1217,34 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         raise WorkerError(
             "analysis execution spec is invalid: capability contract is missing"
         )
+    raw_stage_ids = {
+        stage.get("id")
+        for stage in raw_execution_spec.get("stages") or []
+        if isinstance(stage, dict)
+    }
+    if not isinstance(raw_execution_spec.get("tool_contract"), dict) or (
+        "read_qc" in raw_stage_ids
+        and not isinstance(raw_execution_spec.get("workflow_skill"), dict)
+    ):
+        raise WorkerError(
+            "analysis execution spec is invalid: tool or workflow skill contract is missing"
+        )
     try:
         execution_spec = normalize_execution_spec(raw_execution_spec)
         validate_plan_rules(execution_spec, plan.get("steps") or [])
     except ExecutionSpecError as exc:
         raise WorkerError(f"analysis execution spec is invalid: {exc}") from exc
+    try:
+        validate_tool_contract(
+            execution_spec.get("tool_contract"),
+            include_fastp=any(
+                stage.get("id") == "read_qc"
+                for stage in execution_spec.get("stages") or []
+            ),
+        )
+        tool_observations = observe_tool_versions(execution_spec["tool_contract"])
+    except ToolLibraryError as exc:
+        raise WorkerError(f"{exc.code}: {exc}") from exc
     plan = {**plan, "execution_spec": execution_spec}
     _validate_dataset(dataset, settings)
     if state_path.exists():
@@ -1252,6 +1277,9 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         "plan": {**plan, "dataset": dataset},
         "metadata_snapshot": plan.get("metadata_snapshot"),
         "execution_spec": execution_spec,
+        "tool_observations": tool_observations,
+        "tool_results": [],
+        "artifact_reports": {},
         "steps": [
             {
                 **{
@@ -1739,6 +1767,12 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
                 candidate, state_path.parent.parent
             ):
                 telemetry_path = candidate
+    elif isinstance((state.get("technical_report") or {}).get("telemetry"), str):
+        candidate = Path(state["technical_report"]["telemetry"])
+        if candidate.is_absolute() and _lexical_under(
+            candidate, state_path.parent.parent
+        ):
+            telemetry_path = candidate
     telemetry_text = _read_optional(telemetry_path)
     try:
         telemetry = json.loads(telemetry_text) if telemetry_text else None
@@ -1917,6 +1951,74 @@ def delivery_artifact(request: dict[str, Any]) -> dict[str, Any]:
         "format": format_name,
         "media_type": artifact.get("media_type"),
         "sha256": artifact.get("sha256"),
+        "content_base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def generate_artifact_reports(request: dict[str, Any]) -> dict[str, Any]:
+    run_dir = Path(str(request.get("run_dir") or ""))
+    root = Path(request["settings"]["run_root"])
+    if not run_dir.is_absolute() or not _lexical_under(run_dir, root):
+        raise WorkerError("Run directory is outside the analysis run root")
+    resolved_root = root.resolve()
+    resolved_run = run_dir.resolve()
+    if resolved_root not in resolved_run.parents:
+        raise WorkerError("Run directory is outside the analysis run root")
+    baseline_state_path = None
+    baseline_run_dir = request.get("baseline_run_dir")
+    if baseline_run_dir:
+        baseline = Path(str(baseline_run_dir))
+        if not baseline.is_absolute() or not _lexical_under(baseline, root):
+            raise WorkerError(
+                "Baseline run directory is outside the analysis run root"
+            )
+        resolved_baseline = baseline.resolve()
+        if resolved_root not in resolved_baseline.parents:
+            raise WorkerError(
+                "Baseline run directory is outside the analysis run root"
+            )
+        baseline_state_path = resolved_baseline / ".bioagent" / "state.json"
+        if not baseline_state_path.is_file():
+            raise WorkerError("Baseline run state is unavailable")
+    try:
+        reports = generate_priority_reports(
+            resolved_run / ".bioagent" / "state.json",
+            reasoning_plan=request.get("reasoning_plan"),
+            baseline_state_path=baseline_state_path,
+            weasyprint=(request["settings"].get("runner_environment") or {}).get(
+                "BIOAGENT_WEASYPRINT",
+                "/home/liufangzhou/.pixi/bin/bioagent-weasyprint",
+            ),
+        )
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WorkerError(str(exc)) from exc
+    return {"artifact_reports": reports}
+
+
+def artifact_report(request: dict[str, Any]) -> dict[str, Any]:
+    run_dir = Path(str(request.get("run_dir") or ""))
+    root = Path(request["settings"]["run_root"])
+    if not run_dir.is_absolute() or not _lexical_under(run_dir, root):
+        raise WorkerError("Run directory is outside the analysis run root")
+    resolved_root = root.resolve()
+    resolved_run = run_dir.resolve()
+    if resolved_root not in resolved_run.parents:
+        raise WorkerError("Run directory is outside the analysis run root")
+    state = _read_json(resolved_run / ".bioagent" / "state.json")
+    try:
+        metadata, data = report_artifact(
+            state,
+            resolved_run,
+            kind=str(request.get("kind") or ""),
+            format_name=str(request.get("format") or ""),
+        )
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
+    if len(data) > 32 * 1024 * 1024:
+        raise WorkerError("Priority report artifact exceeds the transfer limit")
+    return {
+        "media_type": metadata.get("media_type"),
+        "sha256": metadata.get("sha256"),
         "content_base64": base64.b64encode(data).decode("ascii"),
     }
 
@@ -2150,6 +2252,10 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
         return verify_evidence(request)
     if operation == "delivery_artifact":
         return delivery_artifact(request)
+    if operation == "generate_artifact_reports":
+        return generate_artifact_reports(request)
+    if operation == "artifact_report":
+        return artifact_report(request)
     if operation == "dry_run":
         return dry_run(request)
     raise WorkerError(f"unsupported worker operation: {operation}")

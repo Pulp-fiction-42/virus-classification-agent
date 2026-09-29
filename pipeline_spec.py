@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from adaptive_routing import normalize_routing_request
+from tool_library import (
+    ToolLibraryError,
+    build_tool_contract,
+    validate_tool_contract,
+)
 from workflow_catalog import (
     ARTIFACTS,
     CAPABILITY_MANIFESTS,
@@ -18,9 +23,10 @@ from workflow_catalog import (
     normalize_capability_parameters,
     stage_rules,
 )
+from workflow_skills import WorkflowSkillError, build_skill_invocation
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-EXECUTION_SPEC_VERSION = 7
+EXECUTION_SPEC_VERSION = 8
 
 
 class ExecutionSpecError(ValueError):
@@ -332,6 +338,40 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
     options = _normalize_options(raw.get("options"))
     stages, used_types = _compile(inputs, deliverables, options)
     selected_stage_ids = {stage["id"] for stage in stages}
+    raw_skill = raw.get("workflow_skill")
+    if isinstance(raw_skill, dict) and "schema_version" in raw_skill:
+        requested_skill = {
+            "skill_id": raw_skill.get("skill_id"),
+            "skill_version": raw_skill.get("skill_version"),
+            "preset_id": raw_skill.get("preset_id"),
+        }
+    else:
+        requested_skill = raw_skill
+    try:
+        workflow_skill = build_skill_invocation(
+            selected_stage_ids=selected_stage_ids,
+            requested=requested_skill,
+            capability_parameters=options["capability_parameters"],
+        )
+    except WorkflowSkillError as exc:
+        raise ExecutionSpecError(str(exc), code=exc.code) from exc
+    if (
+        not allow_unused_inputs
+        and raw.get("workflow_skill") is not None
+        and raw.get("workflow_skill") != workflow_skill
+    ):
+        raise ExecutionSpecError(
+            "execution spec workflow skill is unavailable",
+            code="SKILL_VERSION_UNAVAILABLE",
+        )
+    tool_contract = build_tool_contract(include_fastp="read_qc" in selected_stage_ids)
+    if raw.get("tool_contract") is not None:
+        try:
+            validate_tool_contract(
+                raw.get("tool_contract"), include_fastp="read_qc" in selected_stage_ids
+            )
+        except ToolLibraryError as exc:
+            raise ExecutionSpecError(str(exc), code=exc.code) from exc
     capability_contract = {
         "adapter_version": WORKFLOW_ADAPTER_VERSION,
         "manifests": [
@@ -423,6 +463,8 @@ def _normalize_spec(raw: Any, *, allow_unused_inputs: bool) -> dict[str, Any]:
         "inputs": inputs,
         "deliverables": deliverables,
         "options": options,
+        "workflow_skill": workflow_skill,
+        "tool_contract": tool_contract,
         "capability_contract": capability_contract,
         "policy": policy,
         "stages": stages,

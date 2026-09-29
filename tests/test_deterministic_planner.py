@@ -115,8 +115,8 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
     def test_workflow1_contract_freezes_each_selected_stage_manifest(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])
 
-        self.assertEqual(plan["planner_version"], 7)
-        self.assertEqual(plan["execution_spec"]["version"], 7)
+        self.assertEqual(plan["planner_version"], 8)
+        self.assertEqual(plan["execution_spec"]["version"], 8)
         self.assertEqual(
             [
                 item["capability_id"]
@@ -247,7 +247,7 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
         old_plan = copy.deepcopy(plan)
         old_plan["execution_spec"]["version"] = 6
 
-        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 7"):
+        with self.assertRaisesRegex(PlannerError, "analysis_pipeline version 8"):
             await self.planner.start(
                 persisted_plan=old_plan,
                 dataset=dataset(CONTIGS),

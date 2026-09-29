@@ -30,6 +30,9 @@ WORKER_FILES = (
     "remote_worker.py",
     "analysis_runner.py",
     "standard_report.py",
+    "priority_reports.py",
+    "tool_library.py",
+    "workflow_skills.py",
     "adaptive_routing.py",
     "adaptive_screening.py",
     "pipeline_spec.py",
@@ -124,6 +127,19 @@ class RemoteWorkerClient:
             )
         )
         files.append((self.project_root / "extract_io.py", "scripts/extract_io.py"))
+        files.append(
+            (
+                self.project_root / "assets" / "scientific-report-literature-v1.json",
+                "assets/scientific-report-literature-v1.json",
+            )
+        )
+        for name in ("SKILL.md", "manifest.json"):
+            files.append(
+                (
+                    self.project_root / "skills" / "bioagent-w1-read-qc" / name,
+                    f"skills/bioagent-w1-read-qc/{name}",
+                )
+            )
         evidence = (
             self.project_root.parent
             / "open-webui"

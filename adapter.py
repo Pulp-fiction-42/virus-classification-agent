@@ -23,7 +23,18 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
-from provider import claude_agent_sdk_ready, claude_agent_sdk_version
+from priority_reports import (
+    build_fact_packet,
+    build_reasoning_plan,
+    load_literature,
+    reasoning_request,
+)
+from provider import (
+    MiniMaxProvider,
+    ProviderRequest,
+    claude_agent_sdk_ready,
+    claude_agent_sdk_version,
+)
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -133,6 +144,13 @@ class RemoteFingerprintRequest(BaseModel):
 class RemoteEvidenceRequest(BaseModel):
     run_dir: str
     telemetry: dict[str, Any]
+
+
+class PriorityReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_dir: str
+    baseline_run_dir: str | None = None
 
 
 def completion_id() -> str:
@@ -382,6 +400,99 @@ async def remote_analysis_delivery_report(run_dir: str, format: Literal["html", 
             result.get("media_type")
             or ("application/pdf" if format == "pdf" else "text/html; charset=utf-8")
         ),
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/v1/analysis/runs/priority-reports")
+@app.post("/analysis/runs/priority-reports")
+async def generate_priority_report_artifacts(req: PriorityReportRequest):
+    snapshot = await _remote_call(
+        "snapshot", run_dir=req.run_dir, report_kind="final"
+    )
+    state = snapshot.get("state")
+    telemetry = snapshot.get("telemetry")
+    if not isinstance(state, dict) or not isinstance(telemetry, dict):
+        raise HTTPException(status_code=404, detail="Analysis run is unavailable")
+    if (state.get("execution") or {}).get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Analysis run is not completed")
+    stage_ids = {
+        stage.get("id")
+        for stage in (state.get("execution_spec") or {}).get("stages") or []
+        if isinstance(stage, dict)
+    }
+    existing = state.get("artifact_reports") or {}
+    needs_scientific = "virus_summary" in stage_ids and (
+        (existing.get("scientific") or {}).get("status") != "ready"
+    )
+    reasoning_plan = None
+    if needs_scientific:
+        packet = build_fact_packet(state, telemetry)
+        literature = load_literature()
+        context, schema, instructions = reasoning_request(packet, literature)
+        provider = MiniMaxProvider(
+            allow_cloud=config.MODEL_POLICY == "minimax_explicit"
+        )
+        generated = await provider.generate(
+            ProviderRequest(
+                task_kind="evidence_explanation",
+                output_schema=schema,
+                context=context,
+                instructions=instructions,
+                timeout_seconds=config.CONVERSATION_TIMEOUT_SECONDS,
+            )
+        )
+        if generated.output is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": generated.error_code or "MODEL_UNAVAILABLE",
+                    "message": "Scientific reasoning generation is unavailable",
+                    "retryable": True,
+                },
+            )
+        reasoning_plan = build_reasoning_plan(
+            packet,
+            literature,
+            list(generated.output.get("claim_ids") or []),
+            provider=generated.provider,
+            model=generated.model,
+            backend_version=generated.backend_version,
+        )
+    return await _remote_call(
+        "generate_artifact_reports",
+        run_dir=req.run_dir,
+        baseline_run_dir=req.baseline_run_dir,
+        reasoning_plan=reasoning_plan,
+    )
+
+
+@app.get("/v1/analysis/runs/artifact-report")
+@app.get("/analysis/runs/artifact-report")
+async def remote_analysis_artifact_report(
+    run_dir: str,
+    kind: Literal["scientific", "tool_demo", "skill_demo"],
+    format: Literal[
+        "html",
+        "pdf",
+        "json",
+        "facts_json",
+        "literature_json",
+        "reasoning_json",
+    ],
+):
+    result = await _remote_call(
+        "artifact_report", run_dir=run_dir, kind=kind, format=format
+    )
+    try:
+        content = base64.b64decode(result["content_base64"], validate=True)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502, detail="Cyclone returned an invalid report artifact"
+        ) from exc
+    return Response(
+        content=content,
+        media_type=str(result.get("media_type") or "application/octet-stream"),
         headers={"X-Content-Type-Options": "nosniff"},
     )
 

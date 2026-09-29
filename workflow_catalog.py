@@ -11,6 +11,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from tool_library import public_tool_catalog
+from workflow_skills import public_workflow_skill_catalog
+
 PAIRED_READ_TYPES = {
     "raw_paired_reads",
     "qc_paired_reads",
@@ -1149,7 +1152,7 @@ def capability_catalog() -> dict[str, Any]:
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "deliverables": [
             {
                 "id": deliverable_id,
@@ -1169,6 +1172,8 @@ def capability_catalog() -> dict[str, Any]:
             for deliverable_id, metadata in PUBLIC_DELIVERABLES.items()
         ],
         "capabilities": manifests,
+        "tools": public_tool_catalog(),
+        "workflow_skills": public_workflow_skill_catalog(),
     }
 
 

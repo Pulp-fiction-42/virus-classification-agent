@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "release_id": "scientific-report-literature-v1",
+  "created_for": "BioAgent leadership-priority scientific report demo",
+  "entries": [
+    {
+      "id": "L-METHOD-FASTP",
+      "category": "method",
+      "title": "fastp: an ultra-fast all-in-one FASTQ preprocessor",
+      "source": "Bioinformatics 34(17), i884-i890 (2018)",
+      "source_version": "Published 2018-09-01; DOI 10.1093/bioinformatics/bty560",
+      "url": "https://doi.org/10.1093/bioinformatics/bty560",
+      "locator": "Abstract, Results",
+      "summary": "fastp performs FASTQ quality control, adapter trimming and quality filtering in a single multithreaded preprocessing pass."
+    },
+    {
+      "id": "L-METHOD-RDRP",
+      "category": "method",
+      "title": "RdRp-scan: A bioinformatic resource to identify and annotate divergent RNA viruses in metagenomic sequence data",
+      "source": "Virus Evolution 8(2), veac082 (2022)",
+      "source_version": "Published 2022; PMCID PMC9752661",
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC9752661/",
+      "locator": "Methods, RdRp HMM profile construction",
+      "summary": "RdRp-scan uses curated RNA-dependent RNA polymerase HMM profiles to identify and annotate divergent RNA-virus sequences."
+    },
+    {
+      "id": "L-METHOD-CHECKV",
+      "category": "method",
+      "title": "CheckV assesses the quality and completeness of metagenome-assembled viral genomes",
+      "source": "Nature Biotechnology 39, 578-585 (2021)",
+      "source_version": "Published 2021; DOI 10.1038/s41587-020-00774-7",
+      "url": "https://doi.org/10.1038/s41587-020-00774-7",
+      "locator": "Abstract; Methods, AAI-based completeness estimation",
+      "summary": "CheckV estimates completeness of single-contig viral genomes and identifies host contamination using reference comparisons and viral gene content."
+    },
+    {
+      "id": "L-TAXON-MSL41",
+      "category": "taxon",
+      "title": "ICTV Master Species List 2025 MSL41.v1",
+      "source": "International Committee on Taxonomy of Viruses",
+      "source_version": "2025 MSL41.v1, released 2026-03-20",
+      "url": "https://ictv.global/msl",
+      "locator": "ICTV_Master_Species_List_2025_MSL41.v1.xlsx, MSL worksheet",
+      "summary": "MSL41.v1 is the official ICTV 2025 taxonomy release and is the authoritative release used to interpret current virus taxon names."
+    },
+    {
+      "id": "L-TAXON-ORTHOMYXOVIRIDAE",
+      "category": "taxon",
+      "title": "ICTV Virus Properties: Orthomyxoviridae",
+      "source": "International Committee on Taxonomy of Viruses, 2025 release",
+      "source_version": "ICTV 2025 release",
+      "url": "https://ictv.global/report/information/virus-properties",
+      "locator": "Family Orthomyxoviridae row",
+      "summary": "Orthomyxoviridae are enveloped negative-sense single-stranded RNA viruses with segmented genomes and vertebrate or invertebrate hosts."
+    },
+    {
+      "id": "L-TAXON-NCBI-11320",
+      "category": "taxon",
+      "title": "NCBI Taxonomy: Influenza A virus",
+      "source": "NCBI Taxonomy, taxid 11320",
+      "source_version": "Accessed 2026-09-30",
+      "url": "https://www.ncbi.nlm.nih.gov/Taxonomy/Browser/wwwtax.cgi?id=11320&mode=Info",
+      "locator": "Current name and Lineage(full)",
+      "summary": "NCBI taxid 11320 is Influenza A virus and its displayed lineage includes Orthomyxoviridae and Alphainfluenzavirus."
+    },
+    {
+      "id": "L-THRESHOLD-MIUVIG",
+      "category": "threshold",
+      "title": "Minimum Information about an Uncultivated Virus Genome (MIUViG)",
+      "source": "Nature Biotechnology 37, 29-37 (2019)",
+      "source_version": "Published 2019; PMCID PMC6871006",
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC6871006/",
+      "locator": "Table 2, Summary of required characteristics for each category",
+      "summary": "MIUViG defines high-quality draft genomes as greater than 90 percent complete with less than 5 percent contamination, while distinguishing genome fragments and finished genomes and requiring the supporting quality evidence to be reported."
+    },
+    {
+      "id": "L-THRESHOLD-PROFILE-COV",
+      "category": "threshold",
+      "title": "Workflow 2 RdRp profile coverage rule",
+      "source": "BioAgent Workflow 2 implementation",
+      "source_version": "Workflow 2 checkout observed 2026-09-30",
+      "url": "bioagent://workflow2/scripts/parse_iterhmmresult.py",
+      "locator": "scripts/parse_iterhmmresult.py:37",
+      "summary": "Workflow 2 marks an RdRp HMM profile match valid when Profile_cov is at least 0.50."
+    },
+    {
+      "id": "L-THRESHOLD-NR-VOTE",
+      "category": "threshold",
+      "title": "Workflow 2 NR family voting rule",
+      "source": "BioAgent Workflow 2 implementation",
+      "source_version": "Workflow 2 checkout observed 2026-09-30",
+      "url": "bioagent://workflow2/scripts/parse_blastresult.py",
+      "locator": "scripts/parse_blastresult.py:138-144",
+      "summary": "Workflow 2 performs family voting among classified NR hits whose bit score is greater than 75 percent of the best classified bit score."
+    }
+  ]
+}

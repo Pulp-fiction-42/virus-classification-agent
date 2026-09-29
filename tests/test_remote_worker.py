@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import remote_worker
+from pipeline_spec import canonical_steps, compile_execution_spec
+from tool_library import ToolLibraryError
 
 
 class RemoteWorkerPathTests(unittest.TestCase):
@@ -396,7 +398,7 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
                     "dataset": {"status": "ready", "artifacts": []},
                     "plan": {
                         "execution_spec": {
-                            "version": 7,
+                            "version": 8,
                             "adapter": "analysis_pipeline",
                             "options": {
                                 "capability_parameters": [
@@ -413,6 +415,54 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
                     },
                 }
             )
+
+    def test_launch_rejects_tool_version_before_creating_remote_state(self):
+        execution_spec = compile_execution_spec(
+            {
+                "version": 8,
+                "adapter": "analysis_pipeline",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "raw_paired_reads",
+                        "records": [
+                            {
+                                "sample_id": "sample-a",
+                                "run_id": "run-a",
+                                "files": {
+                                    "read1": "/data/sample-a_1.fastq.gz",
+                                    "read2": "/data/sample-a_2.fastq.gz",
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "deliverables": ["read_qc"],
+                "options": {"viral_type": "RNA+DNA"},
+                "policy": {"mode": "standard"},
+            }
+        )
+        request = {
+            "settings": self.settings,
+            "run_id": "analysis-tool-version-rejected",
+            "worker_version": "abc",
+            "chat_id": "chat",
+            "dataset": {"status": "ready", "artifacts": []},
+            "plan": {
+                "execution_spec": execution_spec,
+                "steps": canonical_steps(execution_spec),
+            },
+        }
+        with patch(
+            "remote_worker.observe_tool_versions",
+            side_effect=ToolLibraryError("wrong version", code="TOOL_VERSION_MISMATCH"),
+        ), self.assertRaisesRegex(
+            remote_worker.WorkerError, "TOOL_VERSION_MISMATCH"
+        ):
+            remote_worker.launch(request)
+        self.assertFalse(
+            (self.runs / "analysis-tool-version-rejected/.bioagent/state.json").exists()
+        )
 
     def test_missing_queued_session_is_relaunched(self):
         run_id = "analysis-queued"
@@ -816,6 +866,25 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
             )
 
         self.assertEqual(result["telemetry"]["report"], "preliminary")
+
+    def test_snapshot_defaults_to_registered_attempt_telemetry(self):
+        run_id = "analysis-attempt-telemetry"
+        path = self._state(run_id, "completed")
+        attempt = path.parent / "attempts" / "0001" / "telemetry.json"
+        attempt.parent.mkdir(parents=True)
+        attempt.write_text(
+            json.dumps({"version": 3, "report": "registered"}), encoding="utf-8"
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["technical_report"] = {"telemetry": str(attempt), "available": True}
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        with patch("remote_worker._scheduler_session_exists", return_value=False):
+            result = remote_worker.snapshot(
+                {"settings": self.settings, "run_id": run_id, "worker_version": "abc"}
+            )
+
+        self.assertEqual(result["telemetry"]["report"], "registered")
 
     def test_delivery_artifact_requires_registered_hash_matched_file(self):
         run_id = "analysis-delivery"

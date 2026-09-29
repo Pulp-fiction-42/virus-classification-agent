@@ -17,6 +17,7 @@ from unittest.mock import patch
 from analysis_runner import (
     _attach_report_evidence,
     _classification_report_data,
+    _configured_software_directories,
     _instrument_workflow1,
     _instrument_workflow2,
     _parse_benchmarks,
@@ -37,6 +38,30 @@ from workflow_adapters import PreparedExecution, PreparedPhase
 
 
 class AnalysisRunnerTests(unittest.TestCase):
+    def test_workflow_software_directories_are_added_without_command_fragments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workflow = root / "workflow"
+            (workflow / "config").mkdir(parents=True)
+            (workflow / "config/config.yaml").write_text(
+                'software:\n  hmmsearch: "/tools/xvir/bin/hmmsearch"\n'
+                '  script: "/workflow/scripts/tool.py"\n'
+                'database:\n  profiles: "/db/profiles.hmm"\n',
+                encoding="utf-8",
+            )
+            phase = PreparedPhase(
+                id="virus-identification",
+                workflow_id="workflow2",
+                workflow_dir=workflow,
+                results_dir=root / "results",
+                command=[],
+                selected_rules=(),
+            )
+            self.assertEqual(
+                _configured_software_directories((phase,)),
+                ["/tools/xvir/bin", "/workflow/scripts"],
+            )
+
     def test_workflow6_empty_input_detection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -131,7 +156,7 @@ rule merge:
         }[exit_rule]
         execution_spec = normalize_execution_spec(
             {
-                "version": 7,
+                "version": 8,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -207,7 +232,7 @@ rule merge:
     def _contig_spec(path: Path, viral_type: str = "RNA+DNA") -> dict:
         return normalize_execution_spec(
             {
-                "version": 7,
+                "version": 8,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -237,7 +262,7 @@ rule merge:
         read2.write_text("@read/2\nTG\n+\nII\n", encoding="utf-8")
         execution_spec = normalize_execution_spec(
             {
-                "version": 7,
+                "version": 8,
                 "adapter": "analysis_pipeline",
                 "inputs": [
                     {
@@ -1443,7 +1468,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             ]
             execution_spec = normalize_execution_spec(
                 {
-                    "version": 7,
+                    "version": 8,
                     "adapter": "analysis_pipeline",
                     "inputs": [
                         {
@@ -1614,7 +1639,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
                     }
                 execution_spec = normalize_execution_spec(
                     {
-                        "version": 7,
+                        "version": 8,
                         "adapter": "analysis_pipeline",
                         "inputs": [
                             {
@@ -1671,7 +1696,7 @@ def iterative_hmmsearch(query, wdir, ncpu, iteration_num, evalue, motifcov):
             state = {
                 "execution_spec": normalize_execution_spec(
                     {
-                        "version": 7,
+                        "version": 8,
                         "adapter": "analysis_pipeline",
                         "inputs": [
                             {

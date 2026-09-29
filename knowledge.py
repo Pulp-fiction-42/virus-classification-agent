@@ -190,6 +190,19 @@ def canonical_json_digest(value: Any) -> str:
     )
 
 
+def engineering_catalog_digest() -> str:
+    """Keep the v1 engineering corpus bound to its unchanged catalog projection."""
+
+    catalog = capability_catalog()
+    return canonical_json_digest(
+        {
+            "schema_version": 1,
+            "deliverables": catalog["deliverables"],
+            "capabilities": catalog["capabilities"],
+        }
+    )
+
+
 def load_engineering_store(
     releases_path: Path = ENGINEERING_RELEASES,
 ) -> KnowledgeStore:
@@ -215,7 +228,7 @@ def load_engineering_store(
     ):
         raise ValueError("engineering knowledge release path is invalid")
     package_path = releases_path.parent / relative
-    expected_catalog = canonical_json_digest(capability_catalog())
+    expected_catalog = engineering_catalog_digest()
     if release.get("catalog_sha256") != expected_catalog:
         raise ValueError("engineering knowledge catalog identity mismatch")
     store = KnowledgeStore(package_path, str(release.get("sha256") or ""))

@@ -177,7 +177,12 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_capability_catalog_is_public_and_path_free(self):
         result = await adapter.analysis_capabilities()
+        self.assertEqual(result["schema_version"], 2)
         self.assertIn("read_qc", {item["id"] for item in result["deliverables"]})
+        self.assertEqual(result["tools"][0]["id"], "fastp")
+        self.assertEqual(result["tools"][0]["version"], "1.3.2")
+        self.assertNotIn("executable", result["tools"][0])
+        self.assertEqual(result["workflow_skills"][0]["id"], "bioagent-w1-read-qc")
         fastp = result["capabilities"][0]
         self.assertEqual(fastp["id"], "workflow1.read_qc.fastp")
         self.assertEqual(fastp["version"], 1)
