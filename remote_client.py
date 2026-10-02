@@ -133,6 +133,13 @@ class RemoteWorkerClient:
                 "assets/scientific-report-literature-v1.json",
             )
         )
+        for name in ("00_sci_theme.R", "make_figures.R"):
+            files.append(
+                (
+                    self.project_root / "assets" / "standard-report" / name,
+                    f"assets/standard-report/{name}",
+                )
+            )
         for name in ("SKILL.md", "manifest.json"):
             files.append(
                 (

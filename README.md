@@ -37,7 +37,7 @@ RPC 控制进程、tmux supervisor 与 analysis runner 使用同一套 home Pixi
 
 标准交付报告使用独立的 `BIOAGENT_REPORT_PYTHON`、`BIOAGENT_RSCRIPT` 与 `BIOAGENT_WEASYPRINT`；正常 run 完成后自动生成，也可用 `standard_report.py --state <run>/.bioagent/state.json` 单独重建。
 
-领导优先 Demo 的本地条目位于 `skills/bioagent-w1-read-qc/`、`tool_library.py` 与 `assets/scientific-report-literature-v1.json`。公开 capabilities 不包含工具执行路径；生成物仅写入 run root 的 `reports/standard/scientific/`、`tool-demo/` 或 `skill-demo/`。
+优先 Demo 的本地条目位于 `skills/bioagent-w1-read-qc/`、`tool_library.py` 与 `assets/scientific-report-literature-v1.json`。公开 capabilities 不包含工具执行路径；生成物仅写入 run root 的 `reports/standard/scientific/`、`tool-demo/` 或 `skill-demo/`。
 
 Workflow 1 在 run root 建立副本时会把 run-local `config.yaml` 的 `software.seqkit` 改为上述 Pixi 入口；Cyclone 上的 Workflow 源码保持不变。
 
