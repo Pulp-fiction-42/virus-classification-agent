@@ -44,6 +44,8 @@ RULE_IDS = (
     "DOMAIN_ASSETS_PENDING",
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+ASSESSMENT_PACKET_MAX_CANDIDATES = 5
+ASSESSMENT_PACKET_MAX_BYTES = 60 * 1024
 
 
 class AssessmentError(ValueError):
@@ -487,6 +489,77 @@ def summary(result: Workflow2AssessmentResult) -> dict[str, Any]:
         }
     )
     return payload
+
+
+def assessment_packet(
+    result: Workflow2AssessmentResult,
+    candidate_ids: list[str],
+) -> dict[str, Any]:
+    """Build a bounded, deterministic packet for an authorized review workflow."""
+
+    selected_ids = sorted(candidate_ids)
+    if (
+        not selected_ids
+        or len(selected_ids) > ASSESSMENT_PACKET_MAX_CANDIDATES
+        or len(selected_ids) != len(set(selected_ids))
+        or any(not value or len(value) > 500 for value in selected_ids)
+    ):
+        raise AssessmentError(
+            "ASSESSMENT_SELECTION_INVALID",
+            f"select 1-{ASSESSMENT_PACKET_MAX_CANDIDATES} unique candidate IDs",
+        )
+    evidence_by_id = {
+        candidate.candidate_id: candidate for candidate in result.evidence.candidates
+    }
+    assessment_by_id = {
+        assessment.candidate_id: assessment for assessment in result.assessments
+    }
+    if set(evidence_by_id) != set(assessment_by_id):
+        raise AssessmentError(
+            "ASSESSMENT_CANDIDATE_MISMATCH",
+            "candidate evidence and assessments do not have the same identities",
+        )
+    unknown = set(selected_ids) - evidence_by_id.keys()
+    if unknown:
+        raise AssessmentError(
+            "ASSESSMENT_CANDIDATE_UNKNOWN",
+            "selected candidate is not present in the run evidence",
+        )
+    packet = {
+        "schema_version": 1,
+        "run_id": result.evidence.run_id,
+        "status": "not_generated",
+        "sources": [
+            {
+                "artifact_type": source.artifact_type,
+                "path": source.path,
+                "sha256": source.sha256,
+                "bytes": source.bytes,
+                "rows": source.rows,
+            }
+            for source in result.evidence.sources
+        ],
+        "release_resolution": result.release_resolution.model_dump(),
+        "candidates": [
+            {
+                "evidence": evidence_by_id[candidate_id].model_dump(),
+                "assessment": assessment_by_id[candidate_id].model_dump(),
+            }
+            for candidate_id in selected_ids
+        ],
+    }
+    raw = json.dumps(
+        packet,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    if len(raw) > ASSESSMENT_PACKET_MAX_BYTES:
+        raise AssessmentError(
+            "ASSESSMENT_PACKET_TOO_LARGE",
+            "selected candidate assessment packet exceeds 60 KiB",
+        )
+    return {**packet, "packet_sha256": _digest(raw)}
 
 
 def main(argv: list[str] | None = None) -> int:

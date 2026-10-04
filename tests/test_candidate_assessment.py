@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from test_candidate_evidence_parser import _row, _run
-
+import remote_worker
 from candidate_assessment import (
     ASSET_ROOT,
     AssessmentError,
     assess_candidate,
+    assessment_packet,
     load_engineering_rules,
     load_release_set,
     main,
@@ -26,6 +29,7 @@ from evidence_contract import (
     EvidenceIssueV2,
     ReleaseSet,
 )
+from test_candidate_evidence_parser import _row, _run
 from workflow_catalog import CAPABILITY_MANIFESTS
 
 
@@ -280,3 +284,115 @@ def test_cli_summary_is_aggregate_only(tmp_path: Path, capsys) -> None:
     assert "sample-a-contig-1" not in serialized
     assert "candidate_id" not in serialized
     assert "observations" not in serialized
+
+
+def test_review_packet_is_deterministic_bounded_and_preserves_evidence(
+    tmp_path: Path,
+) -> None:
+    state_path = _run(
+        tmp_path,
+        [_row("sample-a-contig-2"), _row("sample-a-contig-1")],
+    )
+    result = parse_and_assess(state_path)
+
+    first = assessment_packet(
+        result,
+        ["sample-a-contig-2", "sample-a-contig-1"],
+    )
+    second = assessment_packet(
+        result,
+        ["sample-a-contig-1", "sample-a-contig-2"],
+    )
+
+    assert first == second
+    assert first["status"] == "not_generated"
+    assert [
+        item["evidence"]["candidate_id"] for item in first["candidates"]
+    ] == ["sample-a-contig-1", "sample-a-contig-2"]
+    for item in first["candidates"]:
+        evidence_ids = {
+            observation["evidence_id"]
+            for observation in item["evidence"]["observations"]
+        }
+        assert item["evidence"]["issues"]
+        assert item["assessment"]["status"] == "not_generated"
+        assert all(
+            set(finding["evidence_ids"]) <= evidence_ids
+            for finding in item["assessment"]["findings"]
+        )
+    content = {key: value for key, value in first.items() if key != "packet_sha256"}
+    encoded = json.dumps(
+        content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert len(encoded) <= 60 * 1024
+    assert first["packet_sha256"] == hashlib.sha256(encoded).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "candidate_ids",
+    [[], ["sample-a-contig-1", "sample-a-contig-1"], ["missing"]],
+)
+def test_review_packet_rejects_invalid_selection(
+    tmp_path: Path,
+    candidate_ids: list[str],
+) -> None:
+    result = parse_and_assess(_run(tmp_path, [_row()]))
+
+    with pytest.raises(AssessmentError):
+        assessment_packet(result, candidate_ids)
+
+
+def test_remote_worker_exposes_packet_only_for_run_root(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    run_dir = state_path.parent.parent
+    packet = remote_worker.candidate_assessments(
+        {
+            "settings": {"run_root": str(tmp_path), "python": sys.executable},
+            "run_dir": str(run_dir),
+            "candidate_ids": ["sample-a-contig-1"],
+        }
+    )
+
+    assert packet["run_id"] == "analysis-test"
+    assert packet["candidates"][0]["assessment"]["status"] == "not_generated"
+    with pytest.raises(remote_worker.WorkerError, match="outside"):
+        remote_worker.candidate_assessments(
+            {
+                "settings": {
+                    "run_root": str(tmp_path / "other"),
+                    "python": sys.executable,
+                },
+                "run_dir": str(run_dir),
+                "candidate_ids": ["sample-a-contig-1"],
+            }
+        )
+
+
+def test_remote_control_python_can_bridge_to_assessment_runtime(tmp_path: Path) -> None:
+    state_path = _run(tmp_path, [_row()])
+    request = {
+        "operation": "candidate_assessments",
+        "worker_version": "test",
+        "settings": {
+            "run_root": str(tmp_path),
+            "python": sys.executable,
+        },
+        "run_dir": str(state_path.parent.parent),
+        "candidate_ids": ["sample-a-contig-1"],
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-S", str(Path(remote_worker.__file__)), "rpc"],
+        input=json.dumps(request),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    response = json.loads(completed.stdout)
+
+    assert response["ok"] is True
+    assert response["result"]["status"] == "not_generated"

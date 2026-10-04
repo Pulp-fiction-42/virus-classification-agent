@@ -8,7 +8,7 @@
       "source": "BioAgent CandidateEvidence v2 engineering contract",
       "license": "same as BioAgent source",
       "files": {
-        "candidate-evidence-v2.json": "f3ed34239a3b581eb44f73723797deddc20335511a53cef0dd8fad3675664516"
+        "candidate-evidence-v2.json": "3d211080cc792492f288997097290e5234b2e67268500d5fda520cdb112d291c"
       },
       "compatible_with": ["b3-engineering-integrity-rules-v1"],
       "review_status": "approved"

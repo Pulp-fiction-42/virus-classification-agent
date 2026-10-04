@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import patch
-
-from fastapi import HTTPException
-from pydantic import ValidationError
-from starlette.requests import Request
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import adapter
 from adapter import (
+    CandidateAssessmentsRequest,
     ChatRequest,
     CompilePlanRequest,
     ResumeRunRequest,
@@ -17,9 +15,12 @@ from adapter import (
     error_sse,
 )
 from deterministic_planner import PlannerError
+from fastapi import HTTPException
+from pydantic import ValidationError
 from remote_client import RemoteConnectionError, RemoteExecutionError
 from runtime import SessionStateError, TextDelta
 from runtime_errors import ConversationPublicError
+from starlette.requests import Request
 
 
 def request_with_headers(**headers: str) -> Request:
@@ -144,6 +145,59 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["planner_version"], 1)
         self.assertEqual(fake.compile_calls[0]["goals"], ["virus_summary"])
+
+    async def test_candidate_assessment_api_forwards_only_bounded_selection(self):
+        with patch.object(
+            adapter,
+            "_remote_call",
+            AsyncMock(return_value={"status": "not_generated"}),
+        ) as remote:
+            result = await adapter.remote_candidate_assessments(
+                CandidateAssessmentsRequest(
+                    run_dir="/runs/analysis-one",
+                    candidate_ids=["candidate-one"],
+                )
+            )
+
+        self.assertEqual(result, {"status": "not_generated"})
+        remote.assert_awaited_once_with(
+            "candidate_assessments",
+            run_dir="/runs/analysis-one",
+            candidate_ids=["candidate-one"],
+        )
+        with self.assertRaises(ValidationError):
+            CandidateAssessmentsRequest(
+                run_dir="/runs/analysis-one",
+                candidate_ids=[str(index) for index in range(6)],
+            )
+
+    async def test_candidate_assessment_unavailable_error_is_retryable(self):
+        worker = SimpleNamespace(
+            invoke=AsyncMock(
+                side_effect=RemoteExecutionError(
+                    "ASSESSMENT_RUN_UNAVAILABLE: run state is unavailable"
+                )
+            )
+        )
+        with (
+            patch.object(adapter, "_remote_required", return_value=worker),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await adapter._remote_call(
+                "candidate_assessments",
+                run_dir="/runs/analysis-one",
+                candidate_ids=["candidate-one"],
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail,
+            {
+                "code": "ASSESSMENT_RUN_UNAVAILABLE",
+                "message": "run state is unavailable",
+                "retryable": True,
+            },
+        )
 
     async def test_health_separates_deterministic_model_and_knowledge(self):
         with (

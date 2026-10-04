@@ -10,10 +10,6 @@ import time
 import uuid
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict
-
 import config
 from conversation_events import (
     InvalidSessionError,
@@ -23,6 +19,8 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from priority_reports import (
     build_fact_packet,
     build_reasoning_plan,
@@ -35,6 +33,7 @@ from provider import (
     claude_agent_sdk_ready,
     claude_agent_sdk_version,
 )
+from pydantic import BaseModel, ConfigDict, Field
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -144,6 +143,13 @@ class RemoteFingerprintRequest(BaseModel):
 class RemoteEvidenceRequest(BaseModel):
     run_dir: str
     telemetry: dict[str, Any]
+
+
+class CandidateAssessmentsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_dir: str
+    candidate_ids: list[str] = Field(min_length=1, max_length=5)
 
 
 class PriorityReportRequest(BaseModel):
@@ -343,6 +349,18 @@ async def _remote_call(operation: str, **payload: Any) -> dict[str, Any]:
             },
         ) from exc
     except RemoteExecutionError as exc:
+        if operation == "candidate_assessments":
+            raw = str(exc)
+            code, separator, message = raw.partition(":")
+            code = code if separator else "ASSESSMENT_FAILED"
+            raise HTTPException(
+                status_code=503 if code.endswith("_UNAVAILABLE") else 422,
+                detail={
+                    "code": code,
+                    "message": message.strip() if separator else raw,
+                    "retryable": code.endswith("_UNAVAILABLE"),
+                },
+            ) from exc
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -381,6 +399,16 @@ async def remote_analysis_snapshot(
 ):
     return await _remote_call(
         "snapshot", run_id=run_id, run_dir=run_dir, report_kind=report_kind
+    )
+
+
+@app.post("/v1/analysis/runs/candidate-assessments")
+@app.post("/analysis/runs/candidate-assessments")
+async def remote_candidate_assessments(req: CandidateAssessmentsRequest):
+    return await _remote_call(
+        "candidate_assessments",
+        run_dir=req.run_dir,
+        candidate_ids=req.candidate_ids,
     )
 
 

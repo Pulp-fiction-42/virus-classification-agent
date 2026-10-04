@@ -5,7 +5,7 @@
   "review_record": "bounded Workflow 2 evidence parsing and deterministic assessment contract",
   "schema_version": 2,
   "implementation_sha256": {
-    "candidate_assessment.py": "273ea895f06f24d69ffeb5cf6120cf5ec5690fb11b20d61d6f10963ae2522c62",
+    "candidate_assessment.py": "78ff5ceb8137a882c8ebe9315219cccd726169d08263409736bc8a637c65dd2b",
     "candidate_evidence.py": "3dfb677ce901a5df727161d04561b7032b5d823d42c7175adc440af013d39f11",
     "evidence_contract.py": "f95fd8ebc5961fdbf3835462d7d79593dc01e6bb2180351de453ad3ed935d5a6"
   },

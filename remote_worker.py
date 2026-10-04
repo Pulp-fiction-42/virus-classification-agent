@@ -45,6 +45,23 @@ RECOVERY_CONTRACT_VERSION = 2
 FASTQ_EXTENSION_RE = re.compile(r"(?i)(\.fastq|\.fq)(\.gz)?$")
 QUICK_RECORD_LIMIT = 1_000
 QUICK_BYTE_LIMIT = 8 * 1024 * 1024
+CANDIDATE_ASSESSMENT_BRIDGE = """
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from candidate_assessment import AssessmentError, assessment_packet, parse_and_assess
+from candidate_evidence import CandidateEvidenceParseError
+
+try:
+    result = assessment_packet(parse_and_assess(Path(sys.argv[2])), sys.argv[3:])
+except (AssessmentError, CandidateEvidenceParseError) as error:
+    payload = {"ok": False, "code": error.code, "message": str(error)}
+else:
+    payload = {"ok": True, "result": result}
+print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+""".strip()
 
 
 class WorkerError(ValueError):
@@ -1814,6 +1831,84 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def candidate_assessments(request: dict[str, Any]) -> dict[str, Any]:
+    """Read a bounded Workflow 2 packet without modifying the run."""
+
+    run_dir = request.get("run_dir")
+    candidate_ids = request.get("candidate_ids")
+    if (
+        not isinstance(run_dir, str)
+        or not isinstance(candidate_ids, list)
+        or not 1 <= len(candidate_ids) <= 5
+        or any(
+            not isinstance(value, str) or not value or len(value) > 500
+            for value in candidate_ids
+        )
+        or len(candidate_ids) != len(set(candidate_ids))
+    ):
+        raise WorkerError(
+            "ASSESSMENT_REQUEST_INVALID: run_dir and candidate_ids are required"
+        )
+    candidate = Path(run_dir)
+    root = Path(request["settings"]["run_root"])
+    if not candidate.is_absolute() or not _lexical_under(candidate, root):
+        raise WorkerError(
+            "ASSESSMENT_RUN_INVALID: run directory is outside the analysis run root"
+        )
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_run = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise WorkerError("ASSESSMENT_RUN_UNAVAILABLE: run directory is unavailable") from exc
+    if not _lexical_under(resolved_run, resolved_root) or resolved_run != candidate:
+        raise WorkerError(
+            "ASSESSMENT_RUN_INVALID: run directory must be a canonical path under the run root"
+        )
+    state_path = resolved_run / ".bioagent" / "state.json"
+    if not state_path.is_file():
+        raise WorkerError("ASSESSMENT_RUN_UNAVAILABLE: run state is unavailable")
+    try:
+        completed = _run_captured(
+            [
+                str(request["settings"]["python"]),
+                "-c",
+                CANDIDATE_ASSESSMENT_BRIDGE,
+                str(Path(__file__).resolve().parent),
+                str(state_path),
+                *candidate_ids,
+            ],
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorkerError(
+            "ASSESSMENT_PROCESS_UNAVAILABLE: candidate assessment process is unavailable"
+        ) from exc
+    if completed.returncode != 0:
+        raise WorkerError(
+            "ASSESSMENT_PROCESS_FAILED: candidate assessment process failed"
+        )
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise WorkerError(
+            "ASSESSMENT_PROCESS_FAILED: candidate assessment process returned invalid JSON"
+        ) from exc
+    if not isinstance(response, dict) or response.get("ok") not in {True, False}:
+        raise WorkerError(
+            "ASSESSMENT_PROCESS_FAILED: candidate assessment process returned an invalid result"
+        )
+    if response["ok"] is not True:
+        code = str(response.get("code") or "ASSESSMENT_FAILED")
+        message = str(response.get("message") or "candidate assessment failed")
+        raise WorkerError(f"{code}: {message}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise WorkerError(
+            "ASSESSMENT_PROCESS_FAILED: candidate assessment result is missing"
+        )
+    return result
+
+
 def resources(request: dict[str, Any]) -> dict[str, Any]:
     settings = request["settings"]
     cpu_total = os.cpu_count() or 0
@@ -2244,6 +2339,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
         return diagnostic_launch(request)
     if operation == "snapshot":
         return snapshot(request)
+    if operation == "candidate_assessments":
+        return candidate_assessments(request)
     if operation == "resources":
         return resources(request)
     if operation == "estimate":
