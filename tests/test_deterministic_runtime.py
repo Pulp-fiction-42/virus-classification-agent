@@ -164,6 +164,13 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first["status"], "running")
         self.assertEqual(second["status"], "running")
+        self.assertEqual(first["observation"]["current_attempt"], 0)
+        self.assertEqual(first["observation"]["openwebui_chat_id"], self.chat_id)
+        self.assertEqual(first["observation"]["plan_ref"], plan["plan_ref"])
+        self.assertEqual(
+            first["observation"]["state_mtime_ns"],
+            Path(plan["run"]["state_path"]).stat().st_mtime_ns,
+        )
         self.assertEqual(len(self.launches), 1)
         self.assertEqual(state["plan_ref"], {"id": "pl_test", "revision": 1})
         self.assertEqual(state["decision_trace"][0]["kind"], "plan_compiled")

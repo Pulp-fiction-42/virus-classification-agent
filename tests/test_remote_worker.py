@@ -567,6 +567,10 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(result["status"], "queued")
         self.assertEqual(duplicate["status"], "queued")
+        self.assertEqual(result["observation"]["current_attempt"], 2)
+        self.assertEqual(
+            result["observation"]["state_mtime_ns"], state_path.stat().st_mtime_ns
+        )
         self.assertEqual(state["execution"]["status"], "queued")
         self.assertEqual(len(state["attempts"]), 2)
         self.assertEqual(state["attempts"][-1]["trigger"], "manual_resume")

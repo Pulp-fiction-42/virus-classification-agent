@@ -46,6 +46,7 @@ from remote_client import (
     RemoteExecutionError,
     RemoteWorkerClient,
 )
+from run_status_cache import RunStatusCache
 from runtime_errors import ConversationPublicError, SessionStateError
 from workflow_catalog import capability_catalog
 
@@ -69,6 +70,7 @@ sessions: Any | None = None
 log = logging.getLogger(__name__)
 CONVERSATION_ERROR = "对话模型暂时不可用，请稍后重试；数据集、方案与执行功能不受影响。"
 remote_snapshot_cache: dict[str, dict[str, Any]] = {}
+run_status_cache = RunStatusCache()
 
 
 def _warm_remote_worker() -> None:
@@ -136,6 +138,12 @@ class ResumeRunRequest(BaseModel):
     plan_id: str
     plan_revision: int
     run_id: str
+
+
+class RunStatusSummaryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_ids: list[str] = Field(min_length=1, max_length=50)
 
 
 class RemoteSourcesRequest(BaseModel):
@@ -345,6 +353,8 @@ async def _remote_call(operation: str, **payload: Any) -> dict[str, Any]:
     try:
         result = await _remote_required().invoke(operation, **payload)
         if operation == "snapshot" and result.get("found") is True:
+            if isinstance(result.get("observation"), dict):
+                run_status_cache.observe(result["observation"])
             state = result.get("state") if isinstance(result.get("state"), dict) else {}
             for key in (
                 payload.get("run_id"),
@@ -361,7 +371,14 @@ async def _remote_call(operation: str, **payload: Any) -> dict[str, Any]:
                 str(payload.get("run_id") or payload.get("run_dir") or "")
             )
             if cached:
-                return {**cached, "connection_lost": True, "stale": True}
+                result = {**cached, "connection_lost": True, "stale": True}
+                if isinstance(cached.get("observation"), dict):
+                    result["observation"] = {
+                        **cached["observation"],
+                        "connection_lost": True,
+                        "stale": True,
+                    }
+                return result
         raise HTTPException(
             status_code=503,
             detail={
@@ -422,6 +439,17 @@ async def remote_analysis_snapshot(
     return await _remote_call(
         "snapshot", run_id=run_id, run_dir=run_dir, report_kind=report_kind
     )
+
+
+@app.post("/v1/analysis/runs/status-summary")
+@app.post("/analysis/runs/status-summary")
+async def remote_analysis_status_summary(req: RunStatusSummaryRequest):
+    from deterministic_planner import RUN_ID_RE
+
+    if any(not RUN_ID_RE.fullmatch(run_id) for run_id in req.run_ids):
+        raise HTTPException(status_code=422, detail="invalid analysis run ID")
+    worker = _remote_required()
+    return await run_status_cache.summary(list(dict.fromkeys(req.run_ids)), worker.invoke)
 
 
 @app.post("/v1/analysis/runs/candidate-assessments")
@@ -581,7 +609,7 @@ async def compile_analysis_plan(req: CompilePlanRequest):
 async def start_analysis_run(req: StartRunRequest):
     try:
         require_admission(config.ADMISSION_STATE_FILE)
-        return await planner.start(
+        result = await planner.start(
             persisted_plan=req.plan,
             dataset=req.dataset,
             chat_id=req.chat_id,
@@ -590,6 +618,9 @@ async def start_analysis_run(req: StartRunRequest):
             run_id=req.run_id,
             queue_context=req.queue_context.model_dump(),
         )
+        if isinstance(result.get("observation"), dict):
+            run_status_cache.observe(result["observation"])
+        return result
     except AdmissionUnavailable as exc:
         raise HTTPException(
             status_code=503,
@@ -616,7 +647,7 @@ async def start_analysis_run(req: StartRunRequest):
 async def resume_analysis_run(req: ResumeRunRequest):
     try:
         require_admission(config.ADMISSION_STATE_FILE)
-        return await planner.resume(
+        result = await planner.resume(
             persisted_plan=req.plan,
             dataset=req.dataset,
             chat_id=req.chat_id,
@@ -624,6 +655,9 @@ async def resume_analysis_run(req: ResumeRunRequest):
             plan_revision=req.plan_revision,
             run_id=req.run_id,
         )
+        if isinstance(result.get("observation"), dict):
+            run_status_cache.observe(result["observation"])
+        return result
     except AdmissionUnavailable as exc:
         raise HTTPException(
             status_code=503,

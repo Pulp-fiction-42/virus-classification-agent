@@ -340,11 +340,20 @@ class DeterministicRuntime:
 
     @staticmethod
     def _analysis_run_item(plan: dict[str, Any], status: str) -> dict[str, Any]:
+        from run_observation import ObservationError, read_run_observation
+
         run = plan.get("run") if isinstance(plan.get("run"), dict) else {}
+        try:
+            _state, observation = read_run_observation(
+                Path(run["state_path"]), run_id=run.get("run_id")
+            )
+        except ObservationError as exc:
+            raise SessionStateError(str(exc)) from exc
         return {
             "type": "analysis_run",
             "id": f"analysis_run_{run.get('run_id')}",
-            "status": status,
+            "status": observation["execution"]["status"],
+            "observation": observation,
             "run": {
                 key: run.get(key)
                 for key in ("run_id", "run_dir", "state_path", "log_path")

@@ -29,6 +29,7 @@ from pipeline_spec import (
     validate_plan_rules,
 )
 from priority_reports import generate_priority_reports, report_artifact
+from run_observation import ObservationError, read_run_observation
 from tool_library import ToolLibraryError, observe_tool_versions, validate_tool_contract
 from workflow_catalog import CAPABILITY_MANIFESTS
 
@@ -1728,19 +1729,16 @@ def resume(request: dict[str, Any]) -> dict[str, Any]:
 def _run_item(run_id: str, settings: dict[str, Any], status: str) -> dict[str, Any]:
     run_dir = Path(settings["run_root"]) / run_id
     state_path = run_dir / ".bioagent" / "state.json"
-    log_path = run_dir / ".bioagent" / "execution.log"
-    if state_path.is_file():
-        try:
-            state = _read_json(state_path)
-            value = (state.get("execution") or {}).get("log")
-            if isinstance(value, str):
-                log_path = Path(value)
-        except WorkerError:
-            pass
+    try:
+        _state, observation = read_run_observation(state_path, run_id=run_id)
+    except ObservationError as exc:
+        raise WorkerError(str(exc)) from exc
+    log_path = Path(observation["run"]["log_path"])
     return {
         "type": "analysis_run",
         "id": f"analysis_run_{run_id}",
-        "status": status,
+        "status": observation["execution"]["status"],
+        "observation": observation,
         "run": {
             "run_id": run_id,
             "run_dir": str(run_dir),
@@ -1748,6 +1746,49 @@ def _run_item(run_id: str, settings: dict[str, Any], status: str) -> dict[str, A
             "log_path": str(log_path),
         },
     }
+
+
+def status_summary(request: dict[str, Any]) -> dict[str, Any]:
+    """Read only bounded state files; do not load telemetry, logs or run lists."""
+    run_ids = request.get("run_ids")
+    if (
+        not isinstance(run_ids, list)
+        or not 1 <= len(run_ids) <= 50
+        or any(
+            not isinstance(value, str) or not RUN_ID_RE.fullmatch(value)
+            for value in run_ids
+        )
+    ):
+        raise WorkerError("invalid analysis run IDs (expected 1–50)")
+    settings = request["settings"]
+    items = []
+    for run_id in dict.fromkeys(run_ids):
+        state_path = _state_path(settings, run_id)
+        try:
+            expected_path = (
+                Path(settings["run_root"]).resolve() / run_id / ".bioagent" / "state.json"
+            )
+            if state_path.resolve() != expected_path:
+                raise ObservationError("RUN_STATE_PATH_INVALID")
+            _state, observation = read_run_observation(state_path, run_id=run_id)
+        except (ObservationError, OSError) as exc:
+            items.append(
+                {
+                    "run_id": run_id,
+                    "found": False,
+                    "error": str(exc)
+                    if isinstance(exc, ObservationError)
+                    else "RUN_STATE_UNAVAILABLE",
+                }
+            )
+        else:
+            items.append(observation)
+    if any(
+        item.get("execution", {}).get("status") in QUEUE_STATUSES | {"running"}
+        for item in items
+    ) and not _scheduler_session_exists(settings):
+        _ensure_scheduler(settings, str(request["worker_version"]))
+    return {"items": items}
 
 
 def _read_optional(path: Path, limit: int = 4 * 1024 * 1024) -> str | None:
@@ -1782,7 +1823,12 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
         state_path = max(candidates, key=lambda value: value.stat().st_mtime_ns)
     if not state_path.is_file():
         return {"found": False}
-    state = _read_json(state_path)
+    try:
+        state, observation = read_run_observation(
+            state_path, run_id=str(run_id) if run_id else None
+        )
+    except ObservationError as exc:
+        raise WorkerError(str(exc)) from exc
     run_id = str(state.get("run_id") or state_path.parent.parent.name)
     supervisor_path = state_path.parent / "supervisor.json"
     supervisor = _read_json(supervisor_path) if supervisor_path.is_file() else {}
@@ -1827,6 +1873,7 @@ def snapshot(request: dict[str, Any]) -> dict[str, Any]:
     return {
         "found": True,
         "state": state,
+        "observation": observation,
         "supervisor": {
             **supervisor,
             "session_alive": session_alive,
@@ -2359,6 +2406,8 @@ def handle(request: dict[str, Any]) -> dict[str, Any]:
         return diagnostic_launch(request)
     if operation == "snapshot":
         return snapshot(request)
+    if operation == "status_summary":
+        return status_summary(request)
     if operation == "candidate_assessments":
         return candidate_assessments(request)
     if operation == "resources":
