@@ -8,9 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from jsonschema import Draft202012Validator, ValidationError
+from test_evidence_replay import ASSETS, synthetic_bundle
+
 from conversation_contract import RetrievalRequest
 from evidence_replay import screening_candidate
-from jsonschema import Draft202012Validator, ValidationError
 from knowledge import KnowledgeStore, digest
 from m1_assets import check_assets, observe
 from m1_evaluation import (
@@ -22,9 +24,9 @@ from m1_evaluation import (
     validate_output,
 )
 from provider import MiniMaxProvider, ProviderResult
-from test_evidence_replay import ASSETS, synthetic_bundle
 
 CASES = ASSETS.parents[1] / "benchmarks/m1_development.json"
+PROTOCOL = CASES.with_name("evaluation_protocol_v1.json")
 
 
 class M1Tests(unittest.IsolatedAsyncioTestCase):
@@ -32,7 +34,8 @@ class M1Tests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.suite = json.loads(CASES.read_text())
+        raw_suite = json.loads(CASES.read_text())
+        self.suite = load_cases(CASES, raw_suite["bundle_sha256"], ASSETS)
         self.manifest = synthetic_bundle(self.root)
         self.candidate = screening_candidate(self.root, self.manifest)
         self.store = KnowledgeStore(
@@ -52,6 +55,59 @@ class M1Tests(unittest.IsolatedAsyncioTestCase):
         changed.write_text(json.dumps(self.suite))
         with self.assertRaisesRegex(ValueError, "duplicate"):
             load_cases(changed, self.suite["bundle_sha256"], ASSETS)
+
+    def test_protocol_rejects_suite_digest_drift(self):
+        protocol = json.loads(PROTOCOL.read_text())
+        protocol["suite_sha256"] = "0" * 64
+        changed = self.root / "wrong-digest.json"
+        changed.write_text(json.dumps(protocol))
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            load_cases(
+                CASES,
+                self.suite["bundle_sha256"],
+                ASSETS,
+                changed,
+            )
+
+    def test_protocol_rejects_partition_group_metric_and_gate_drift(self):
+        variants = []
+        missing_case = json.loads(PROTOCOL.read_text())
+        missing_case["splits"]["development"]["case_ids"].pop()
+        variants.append((missing_case, "partition"))
+
+        missing_metric = json.loads(PROTOCOL.read_text())
+        missing_metric["metrics"].pop()
+        variants.append((missing_metric, "metric set"))
+
+        open_gate = json.loads(PROTOCOL.read_text())
+        open_gate["release_gate"] = {"status": "ready", "blockers": []}
+        variants.append((open_gate, "remain blocked"))
+
+        for index, (protocol, error) in enumerate(variants):
+            with self.subTest(error=error):
+                changed = self.root / f"invalid-protocol-{index}.json"
+                changed.write_text(json.dumps(protocol))
+                with self.assertRaisesRegex(ValueError, error):
+                    load_cases(
+                        CASES,
+                        self.suite["bundle_sha256"],
+                        ASSETS,
+                        changed,
+                    )
+
+        protocol = json.loads(PROTOCOL.read_text())
+        moved = "intent_clarification-4"
+        protocol["splits"]["development"]["case_ids"].remove(moved)
+        protocol["splits"]["final_test"]["case_ids"] = [moved]
+        changed = self.root / "cross-split.json"
+        changed.write_text(json.dumps(protocol))
+        with self.assertRaisesRegex(ValueError, "crosses split"):
+            load_cases(
+                CASES,
+                self.suite["bundle_sha256"],
+                ASSETS,
+                changed,
+            )
 
     async def test_all_offline_cases_pass_and_injected_failures_are_rejected(self):
         before = self.candidate.model_dump()
@@ -82,6 +138,14 @@ class M1Tests(unittest.IsolatedAsyncioTestCase):
             "COUNT_CONFLICT", [r["rule_id"] for r in report["records"][-1]["findings"]]
         )
         self.assertEqual(report["semantic_accuracy"], "not_reviewed")
+        protocol = report["evaluation_protocol"]
+        self.assertEqual(protocol["split_counts"]["development"], 16)
+        self.assertEqual(protocol["split_counts"]["final_test"], 0)
+        self.assertEqual(
+            protocol["automated"]["schema_pass_rate"],
+            {"numerator": 16, "denominator": 16, "rate": 1.0},
+        )
+        self.assertEqual(protocol["release_gate"]["status"], "blocked")
 
     async def test_provider_called_once_per_case_and_failures_remain_results(self):
         class FailingProvider:
@@ -105,6 +169,22 @@ class M1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(r["engineering_pass"] for r in report["records"]))
         self.assertEqual(report["records"][0]["result"]["error_code"], "MODEL_TIMEOUT")
         self.assertEqual(report["records"][1]["validation_error"], "SCHEMA_INVALID")
+        protocol = report["evaluation_protocol"]["automated"]
+        self.assertEqual(
+            protocol["provider_error_rate"],
+            {"numerator": 8, "denominator": 16, "rate": 0.5},
+        )
+        self.assertEqual(
+            protocol["total_latency_ms"],
+            {
+                "status": "measured",
+                "count": 16,
+                "p50": 0,
+                "p95": 0,
+                "max": 0,
+                "first_response_latency": "unavailable",
+            },
+        )
 
     async def test_cloud_disabled_does_not_load_sdk(self):
         request, *_ = await prepare(

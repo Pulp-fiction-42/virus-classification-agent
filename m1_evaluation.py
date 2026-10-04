@@ -11,6 +11,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from pydantic import BaseModel, ConfigDict, Field
 
 from conversation_contract import ConversationAction, RetrievalRequest
+from evaluation_protocol import load_protocol, summarize_records
 from evidence_contract import AssessmentDraft
 from evidence_replay import evaluate_rules, validate_draft
 from knowledge import digest
@@ -28,6 +29,7 @@ CORPORA = (
     "faq_policy",
     "workflow_capabilities",
 )
+DEFAULT_PROTOCOL = Path(__file__).parent / "benchmarks/evaluation_protocol_v1.json"
 
 
 class CitationAnswer(BaseModel):
@@ -36,7 +38,12 @@ class CitationAnswer(BaseModel):
     citation_ids: list[str] = Field(max_length=8)
 
 
-def load_cases(path: Path, bundle_sha256: str, assets: Path) -> dict:
+def load_cases(
+    path: Path,
+    bundle_sha256: str,
+    assets: Path,
+    protocol_path: Path = DEFAULT_PROTOCOL,
+) -> dict:
     suite = json.loads(path.read_text())
     if suite["bundle_sha256"] != bundle_sha256:
         raise ValueError("evaluation bundle differs from frozen development suite")
@@ -50,10 +57,13 @@ def load_cases(path: Path, bundle_sha256: str, assets: Path) -> dict:
         raise ValueError("suite requires four development cases per task")
     if len({c["id"] for c in cases}) != 16:
         raise ValueError("duplicate development case")
-    if suite["split"] != "development" or any(
-        c["review_status"] != "pending" for c in cases
+    if (
+        suite["split"] != "development"
+        or suite.get("biological_ground_truth") is not False
+        or any(c["review_status"] != "pending" for c in cases)
     ):
         raise ValueError("M1 suite is unreviewed development data only")
+    suite["evaluation_protocol"] = load_protocol(protocol_path, path, suite)
     return suite
 
 
@@ -195,6 +205,9 @@ def fixture_output(case, candidate, retrieval, findings):
 
 
 async def evaluate(suite, candidate, store, rules, provider=None, progress=None):
+    protocol = suite.get("evaluation_protocol")
+    if not isinstance(protocol, dict):
+        raise TypeError("evaluation protocol is required")
     records = []
     for case in suite["cases"]:
         request, evidence, retrieval, findings = await prepare(
@@ -265,10 +278,14 @@ async def evaluate(suite, candidate, store, rules, provider=None, progress=None)
             if provider
             else None,
         }
+    protocol_summary = summarize_records(
+        records, protocol, model_evaluation=provider is not None
+    )
     return {
         "schema_version": 1,
         "mode": "model_evaluation" if provider else "offline_validator_fixtures",
         "summary": summary,
+        "evaluation_protocol": protocol_summary,
         "records": records,
         "semantic_accuracy": "not_reviewed",
         "first_response_latency": "not_measured_by_provider",

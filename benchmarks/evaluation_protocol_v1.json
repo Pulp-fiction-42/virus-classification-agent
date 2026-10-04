@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "protocol_id": "bioagent-four-task-evaluation-v1",
+  "suite_id": "m1-development-v1",
+  "suite_sha256": "668559eb0372db4316ef50a7fd46aa909895d2064e03359e1c3affcfcd11b2a3",
+  "splits": {
+    "development": {
+      "purpose": "Prompt, schema and host-validator development; results are not an unbiased model estimate.",
+      "allows_prompt_iteration": true,
+      "case_ids": [
+        "citation_qa-1",
+        "citation_qa-2",
+        "citation_qa-3",
+        "citation_qa-4",
+        "controlled_patch-1",
+        "controlled_patch-2",
+        "controlled_patch-3",
+        "controlled_patch-4",
+        "evidence_explanation-1",
+        "evidence_explanation-2",
+        "evidence_explanation-3",
+        "evidence_explanation-4",
+        "intent_clarification-1",
+        "intent_clarification-2",
+        "intent_clarification-3",
+        "intent_clarification-4"
+      ]
+    },
+    "training": {
+      "purpose": "Expert-approved records eligible for supervised training; currently empty.",
+      "allows_prompt_iteration": false,
+      "case_ids": []
+    },
+    "validation": {
+      "purpose": "Frozen expert-reviewed model selection set; currently empty.",
+      "allows_prompt_iteration": false,
+      "case_ids": []
+    },
+    "final_test": {
+      "purpose": "Sealed expert-reviewed release decision set; currently empty.",
+      "allows_prompt_iteration": false,
+      "case_ids": []
+    }
+  },
+  "groups": [
+    {
+      "group_id": "bj-2024-615-screening-and-m0-assets",
+      "basis": "All current cases share one candidate, evidence snapshot and M0 asset release, so they must remain in one split.",
+      "case_ids": [
+        "citation_qa-1",
+        "citation_qa-2",
+        "citation_qa-3",
+        "citation_qa-4",
+        "controlled_patch-1",
+        "controlled_patch-2",
+        "controlled_patch-3",
+        "controlled_patch-4",
+        "evidence_explanation-1",
+        "evidence_explanation-2",
+        "evidence_explanation-3",
+        "evidence_explanation-4",
+        "intent_clarification-1",
+        "intent_clarification-2",
+        "intent_clarification-3",
+        "intent_clarification-4"
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "metric_id": "schema_pass_rate",
+      "category": "structure",
+      "measurement": "Automated JSON Schema validation per task kind.",
+      "automated": true,
+      "direction": "higher"
+    },
+    {
+      "metric_id": "legal_action_or_boundary_pass_rate",
+      "category": "action_safety",
+      "measurement": "Automated host validation of expected action, allowlisted patch, citation identity or evidence/finding retention.",
+      "automated": true,
+      "direction": "higher"
+    },
+    {
+      "metric_id": "provider_error_rate",
+      "category": "availability",
+      "measurement": "Provider errors divided by attempted model cases; not applicable to offline fixtures.",
+      "automated": true,
+      "direction": "lower"
+    },
+    {
+      "metric_id": "total_latency_ms",
+      "category": "latency",
+      "measurement": "Provider-reported total latency count, p50, p95 and maximum; first-token latency is unavailable.",
+      "automated": true,
+      "direction": "lower"
+    },
+    {
+      "metric_id": "citation_semantic_applicability",
+      "category": "knowledge_quality",
+      "measurement": "Expert review of whether each located source actually supports the associated claim.",
+      "automated": false,
+      "direction": "higher"
+    },
+    {
+      "metric_id": "conflict_omission_and_hallucinated_fact_rate",
+      "category": "semantic_safety",
+      "measurement": "Expert review of omitted conflicts, unsupported facts and incorrect biological interpretation.",
+      "automated": false,
+      "direction": "lower"
+    },
+    {
+      "metric_id": "human_revision_cost",
+      "category": "review_cost",
+      "measurement": "Expert correction time and changed fields per case.",
+      "automated": false,
+      "direction": "lower"
+    }
+  ],
+  "release_gate": {
+    "status": "blocked",
+    "blockers": [
+      "EXPERT_SEMANTIC_REVIEW_MISSING",
+      "FINAL_TEST_SPLIT_EMPTY",
+      "LOCAL_MODEL_BASELINE_MISSING",
+      "TRAINING_SPLIT_EMPTY",
+      "VALIDATION_SPLIT_EMPTY"
+    ]
+  }
+}
