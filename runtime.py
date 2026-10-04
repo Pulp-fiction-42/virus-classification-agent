@@ -185,6 +185,7 @@ class SessionManager:
             ),
             conversation_id=conversation_id,
             timeout_seconds=config.CONVERSATION_TIMEOUT_SECONDS,
+            max_context_chars=64000 if analysis else 24000,
         )
         result = await self.provider.generate(request)
         if not analysis:

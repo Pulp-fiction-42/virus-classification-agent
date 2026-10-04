@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from copy import deepcopy
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -98,6 +99,68 @@ def safe_context(value: Any) -> Any:
     if isinstance(value, str):
         return SEQUENCE_RE.sub("[序列已移除]", PATH_RE.sub("[路径已移除]", value))
     return value
+
+
+def _sdk_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Expose nested wire types while keeping the original validation contract.
+
+    Optional nullable fields can be omitted instead of emitting null. Other
+    unions retain their meaning; no generated values are coerced or repaired.
+    """
+
+    def expand(
+        value: Any, *, optional: bool = False, refs: tuple[str, ...] = ()
+    ) -> Any:
+        if isinstance(value, list):
+            return [expand(item, refs=refs) for item in value]
+        if not isinstance(value, dict):
+            return value
+        if "$ref" in value:
+            reference = value["$ref"]
+            if not reference.startswith("#/$defs/") or reference in refs:
+                raise ValueError("unsupported structured output schema reference")
+            definition = schema["$defs"][reference.removeprefix("#/$defs/")]
+            return expand(
+                {**definition, **{k: v for k, v in value.items() if k != "$ref"}},
+                optional=optional,
+                refs=(*refs, reference),
+            )
+        alternatives = value.get("anyOf")
+        if (
+            optional
+            and isinstance(alternatives, list)
+            and len(alternatives) == 2
+            and all(isinstance(item, dict) for item in alternatives)
+            and alternatives.count({"type": "null"}) == 1
+        ):
+            non_null = next(item for item in alternatives if item != {"type": "null"})
+            return expand(
+                {
+                    **non_null,
+                    **{
+                        k: v
+                        for k, v in value.items()
+                        if k != "anyOf" and not (k == "default" and v is None)
+                    },
+                },
+                refs=refs,
+            )
+        return {
+            key: {
+                name: expand(
+                    item, optional=name not in value.get("required", []), refs=refs
+                )
+                for name, item in child.items()
+            }
+            if key == "properties"
+            else deepcopy(child)
+            if key in {"default", "const", "enum", "examples"}
+            else expand(child, refs=refs)
+            for key, child in value.items()
+            if key != "$defs"
+        }
+
+    return expand(schema)
 
 
 class MiniMaxProvider:
@@ -206,7 +269,10 @@ class MiniMaxProvider:
             permission_mode="dontAsk",
             max_turns=1,
             resume=resume,
-            output_format={"type": "json_schema", "schema": request.output_schema},
+            output_format={
+                "type": "json_schema",
+                "schema": _sdk_output_schema(request.output_schema),
+            },
             cwd=config.PROJECT_ROOT,
             env={
                 "ANTHROPIC_BASE_URL": config.ANTHROPIC_BASE_URL,

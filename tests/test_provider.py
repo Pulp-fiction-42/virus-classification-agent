@@ -11,7 +11,11 @@ from unittest.mock import patch
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from conversation_contract import ConversationAction
+from conversation_contract import (
+    ConversationAction,
+    ConversationReply,
+    validate_conversation_action,
+)
 from provider import MiniMaxProvider, ProviderRequest
 
 
@@ -146,9 +150,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 client.options.env["ANTHROPIC_BASE_URL"],
                 "https://api.minimax.cn/anthropic",
             )
-            self.assertEqual(
-                client.options.env["ANTHROPIC_MODEL"], "MiniMax-M3[1m]"
-            )
+            self.assertEqual(client.options.env["ANTHROPIC_MODEL"], "MiniMax-M3[1m]")
             self.assertEqual(
                 client.options.env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
                 "MiniMax-M3[1m]",
@@ -202,6 +204,139 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.error_code, "MODEL_SCHEMA_INVALID")
         self.assertIsNone(result.output)
+
+    async def test_sdk_schema_exposes_nested_action_types_without_changing_contract(
+        self,
+    ):
+        FakeClient.output = {
+            "action": "propose_patch",
+            "message": "建议仅做序列质控，最短保留长度为80 bp。",
+            "proposed_patch": {
+                "goals": ["read_qc"],
+                "capability_parameters": [
+                    {
+                        "capability_id": "workflow1.read_qc.fastp",
+                        "manifest_version": 1,
+                        "values": {"length_required": 80},
+                    }
+                ],
+            },
+            "citations": [],
+        }
+        request = self.request(output_schema=ConversationAction.model_json_schema())
+        original = json.dumps(request.output_schema)
+
+        result = await self.provider.generate(request)
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual(
+            validate_conversation_action(result.output).action, "propose_patch"
+        )
+        wire = FakeClient.instances[-1].options.output_format["schema"]
+        patch_schema = wire["properties"]["proposed_patch"]
+        self.assertEqual(patch_schema["type"], "object")
+        self.assertNotIn("proposed_patch", wire["required"])
+        self.assertNotIn("default", patch_schema)
+        for field in ("goals", "excluded_stages", "capability_parameters"):
+            self.assertEqual(patch_schema["properties"][field]["type"], "array")
+        parameter = patch_schema["properties"]["capability_parameters"]["items"]
+        self.assertEqual(parameter["type"], "object")
+        self.assertEqual(parameter["properties"]["manifest_version"]["type"], "integer")
+        self.assertEqual(
+            parameter["properties"]["values"]["additionalProperties"]["anyOf"],
+            [{"type": "integer"}, {"type": "boolean"}],
+        )
+        self.assertNotIn('"$ref"', json.dumps(wire))
+        self.assertNotIn("$defs", wire)
+        self.assertEqual(json.dumps(request.output_schema), original)
+
+    async def test_original_nullable_action_contract_still_validates_results(self):
+        FakeClient.output = {
+            "action": "respond",
+            "message": "说明",
+            "proposed_patch": None,
+            "citations": [],
+        }
+
+        result = await self.provider.generate(
+            self.request(output_schema=ConversationAction.model_json_schema())
+        )
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual(result.output, FakeClient.output)
+        self.assertIsNone(validate_conversation_action(result.output).proposed_patch)
+
+    async def test_malformed_live_tool_shapes_are_not_coerced(self):
+        parameter = {
+            "capability_id": "workflow1.read_qc.fastp",
+            "manifest_version": 1,
+            "values": {"length_required": 80},
+        }
+        patches = [
+            {
+                "goals": {"item": "read_qc"},
+                "capability_parameters": {"item": parameter},
+            },
+            {"excluded_stages": {"item": ["rrna_filter", "sample_merge"]}},
+            {"capability_parameters": [{**parameter, "manifest_version": "1"}]},
+            {
+                "capability_parameters": [
+                    {**parameter, "values": {"length_required": "80"}}
+                ]
+            },
+        ]
+        FakeClient.structured_turn_limit = True
+        for proposed_patch in patches:
+            with self.subTest(proposed_patch=proposed_patch):
+                FakeClient.output = {
+                    "action": "propose_patch",
+                    "message": "待确认修改",
+                    "proposed_patch": proposed_patch,
+                    "citations": [],
+                }
+                result = await self.provider.generate(
+                    self.request(output_schema=ConversationAction.model_json_schema())
+                )
+                self.assertEqual(result.error_code, "MODEL_SCHEMA_INVALID")
+                self.assertIsNone(result.output)
+
+    async def test_dashboard_schema_is_unchanged(self):
+        schema = ConversationReply.model_json_schema()
+
+        result = await self.provider.generate(self.request(output_schema=schema))
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual(
+            FakeClient.instances[-1].options.output_format["schema"], schema
+        )
+
+    async def test_required_nullable_and_other_unions_are_preserved(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "required_nullable": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "optional_union": {"anyOf": [{"type": "integer"}, {"type": "boolean"}]},
+                "optional_three_way": {
+                    "anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}]
+                },
+                "optional_one_of": {"oneOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+            "required": ["required_nullable"],
+            "additionalProperties": False,
+        }
+        FakeClient.output = {
+            "required_nullable": None,
+            "optional_union": False,
+            "optional_three_way": None,
+            "optional_one_of": None,
+        }
+
+        result = await self.provider.generate(self.request(output_schema=schema))
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual(
+            FakeClient.instances[-1].options.output_format["schema"], schema
+        )
 
     async def test_synthetic_or_api_error_text_is_not_a_reply(self):
         for model, error in (("<synthetic>", None), ("test", "rate_limit")):

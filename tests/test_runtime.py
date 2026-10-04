@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import unittest
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import config
 from conversation_contract import RetrievalResult
 from conversation_events import OutputItemAdded, TextDelta
-from provider import ProviderResult
+from provider import MiniMaxProvider, ProviderResult
 from runtime import SessionManager
 from runtime_errors import ConversationPublicError
+from workflow_catalog import capability_catalog
 
 
 class FakeProvider:
@@ -57,7 +60,92 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         request = provider.requests[0]
         self.assertEqual(set(request.output_schema["properties"]), {"message"})
         self.assertEqual(request.instructions, config.DASHBOARD_SYSTEM_PROMPT)
+        self.assertEqual(request.max_context_chars, 24000)
         self.assertNotIn("analysis", request.context)
+
+    async def test_analysis_catalog_dataset_and_plan_fit_provider_budget(self):
+        provider = MiniMaxProvider(allow_cloud=True)
+        output = {"action": "respond", "message": "请检查建议。", "citations": []}
+        message = (
+            "请只对当前双端测序数据进行序列质控，将最短保留读长改为80bp，"
+            "其他设置保持当前默认值。请说明这个调整的含义，以及执行前还需要"
+            "确认哪些事项，先给出建议供我检查，不要自动开始计算，也不要扩大分析范围。"
+        )
+        with (
+            patch("provider.claude_agent_sdk_ready", return_value=True),
+            patch.object(
+                provider, "_generate", new_callable=AsyncMock, return_value=output
+            ) as generate,
+        ):
+            events = await self.turn(
+                provider,
+                message,
+                routing_request={"mode": "standard"},
+                dataset_context={
+                    "summary": {
+                        "dataset_id": "ds-test",
+                        "revision": 1,
+                        "status": "ready",
+                        "artifacts": [
+                            {
+                                "id": "primary",
+                                "type": "raw_paired_reads",
+                                "records": [
+                                    {
+                                        "record_id": "rec-1",
+                                        "run_id": "run-1",
+                                        "sample_id": "sample-1",
+                                    }
+                                ],
+                            }
+                        ],
+                        "checks": {},
+                        "issues": [],
+                    }
+                },
+                plan_context={
+                    "title": "序列质控方案",
+                    "summary": "对当前双端测序数据进行质控。",
+                    "goals": ["read_qc"],
+                    "ready_to_execute": True,
+                    "options": {"viral_type": "RNA+DNA"},
+                    "steps": [
+                        {
+                            "id": "read_qc",
+                            "label": "序列质控",
+                            "depends_on": [],
+                            "is_deliverable": True,
+                        }
+                    ],
+                },
+            )
+
+        generate.assert_awaited_once()
+        request, prompt, _key = generate.call_args.args
+        self.assertEqual(request.max_context_chars, 64000)
+        self.assertEqual(
+            request.context["analysis"]["capability_catalog"], capability_catalog()
+        )
+        total_chars = (
+            len(prompt)
+            + len(request.instructions)
+            + len(json.dumps(request.output_schema))
+        )
+        self.assertGreater(total_chars, 24000)
+        self.assertLessEqual(total_chars, request.max_context_chars)
+        self.assertIn(TextDelta(output["message"]), events)
+
+    async def test_analysis_still_rejects_oversized_context_before_generation(self):
+        provider = MiniMaxProvider(allow_cloud=True)
+        with (
+            patch("provider.claude_agent_sdk_ready", return_value=True),
+            patch.object(provider, "_generate", new_callable=AsyncMock) as generate,
+            self.assertRaises(ConversationPublicError) as raised,
+        ):
+            await self.turn(provider, plan_context={"summary": "摘要" * 32000})
+
+        self.assertEqual(raised.exception.code, "CONTEXT_LIMIT")
+        generate.assert_not_awaited()
 
     async def test_dashboard_rejects_analysis_action_fields(self):
         provider = FakeProvider()
