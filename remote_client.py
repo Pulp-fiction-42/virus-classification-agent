@@ -28,6 +28,7 @@ class RemoteConnectionError(RemoteExecutionError):
 
 WORKER_FILES = (
     "remote_worker.py",
+    "asset_release_binding.py",
     "analysis_runner.py",
     "standard_report.py",
     "priority_reports.py",

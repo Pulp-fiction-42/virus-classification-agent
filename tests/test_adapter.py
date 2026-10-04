@@ -220,6 +220,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v4")
         self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
         self.assertEqual(result["admission"]["status"], "accepting")
+        self.assertEqual(result["asset_release"]["status"], "not_configured")
 
     async def test_draining_gate_rejects_start_before_planner(self):
         fake = FakePlanner()

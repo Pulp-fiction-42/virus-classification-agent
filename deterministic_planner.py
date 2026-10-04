@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
+from asset_release_binding import (
+    AssetReleaseBindingError,
+    normalize_release_binding,
+)
 from pipeline_spec import (
     EXECUTION_SPEC_VERSION,
     ExecutionSpecError,
@@ -123,7 +128,12 @@ def _dataset_label(dataset: dict[str, Any]) -> str:
 
 
 class DeterministicPlanner:
-    def __init__(self, session_manager: Any, enabled_goals: Any = None):
+    def __init__(
+        self,
+        session_manager: Any,
+        enabled_goals: Any = None,
+        release_resolver: Callable[[], dict[str, Any]] | None = None,
+    ):
         self.session_manager = session_manager
         requested = GOAL_ORDER if enabled_goals is None else tuple(enabled_goals)
         unknown = set(requested) - set(GOAL_ORDER)
@@ -133,6 +143,7 @@ class DeterministicPlanner:
                 + ", ".join(sorted(map(str, unknown)))
             )
         self.enabled_goals = tuple(goal for goal in GOAL_ORDER if goal in requested)
+        self.release_resolver = release_resolver
 
     def compile(
         self,
@@ -141,6 +152,7 @@ class DeterministicPlanner:
         goals: Any,
         options: Any,
         routing: Any,
+        _resolve_assets: bool = True,
     ) -> dict[str, Any]:
         if not isinstance(dataset, dict):
             raise PlannerError("analysis dataset is required")
@@ -178,6 +190,15 @@ class DeterministicPlanner:
         labels = [GOAL_LABELS[goal] for goal in normalized_goals]
         title = f"{_dataset_label(dataset)} · {'、'.join(labels)}"
         ready = status == "ready"
+        asset_release_set = None
+        if _resolve_assets and self.release_resolver is not None:
+            try:
+                asset_release_set = normalize_release_binding(self.release_resolver())
+            except (AssetReleaseBindingError, OSError) as exc:
+                raise PlannerError(
+                    f"active asset ReleaseSet is unavailable: {exc}",
+                    code="ASSET_RELEASE_UNAVAILABLE",
+                ) from exc
         plan = {
             "schema_version": 1,
             "planner_version": PLANNER_VERSION,
@@ -197,6 +218,11 @@ class DeterministicPlanner:
                 ),
             },
             "execution_spec": execution_spec,
+            **(
+                {"asset_release_set": asset_release_set}
+                if asset_release_set is not None
+                else {}
+            ),
             "steps": steps,
             "ready_to_execute": ready,
             **(
@@ -213,6 +239,17 @@ class DeterministicPlanner:
                 {"kind": "goals", "values": normalized_goals},
                 {"kind": "routing", "value": execution_spec["policy"]},
                 {"kind": "compiler", "planner_version": PLANNER_VERSION},
+                *(
+                    [
+                        {
+                            "kind": "asset_release_set",
+                            "release_set_id": asset_release_set["release_set_id"],
+                            "sha256": asset_release_set["sha256"],
+                        }
+                    ]
+                    if asset_release_set is not None
+                    else []
+                ),
             ],
         }
         try:
@@ -251,16 +288,27 @@ class DeterministicPlanner:
                 persisted_plan.get("execution_spec")
             )
             validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
+            persisted_release = (
+                normalize_release_binding(persisted_plan["asset_release_set"])
+                if "asset_release_set" in persisted_plan
+                else None
+            )
         except ExecutionSpecError as exc:
             raise PlannerError(
                 f"persisted analysis plan is invalid: {exc}", code=exc.code
             ) from exc
+        except AssetReleaseBindingError as exc:
+            raise PlannerError(
+                f"persisted asset ReleaseSet is invalid: {exc}",
+                code="ASSET_RELEASE_INVALID",
+            ) from exc
         if (
             persisted_spec != compiled["execution_spec"]
             or persisted_plan.get("steps") != compiled["steps"]
+            or persisted_release != compiled.get("asset_release_set")
         ):
             raise PlannerError(
-                "persisted analysis plan does not match the authoritative dataset"
+                "persisted analysis plan does not match the authoritative dataset or active assets"
             )
 
         run_dir = self.session_manager.analysis_run_root / run_id
@@ -304,15 +352,23 @@ class DeterministicPlanner:
                     "requested_mode"
                 ),
             },
+            _resolve_assets=False,
         )
         try:
             persisted_spec = normalize_execution_spec(
                 persisted_plan.get("execution_spec")
             )
             validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
+            if "asset_release_set" in persisted_plan:
+                normalize_release_binding(persisted_plan["asset_release_set"])
         except ExecutionSpecError as exc:
             raise PlannerError(
                 f"persisted analysis plan is invalid: {exc}", code=exc.code
+            ) from exc
+        except AssetReleaseBindingError as exc:
+            raise PlannerError(
+                f"persisted asset ReleaseSet is invalid: {exc}",
+                code="ASSET_RELEASE_INVALID",
             ) from exc
         if (
             persisted_spec != compiled["execution_spec"]

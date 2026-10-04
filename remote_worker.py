@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from adaptive_routing import collect_resource_snapshot
+from asset_release_binding import AssetReleaseBindingError, normalize_release_binding
 from pipeline_spec import (
     ExecutionSpecError,
     normalize_execution_spec,
@@ -1251,6 +1252,12 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         validate_plan_rules(execution_spec, plan.get("steps") or [])
     except ExecutionSpecError as exc:
         raise WorkerError(f"analysis execution spec is invalid: {exc}") from exc
+    asset_release_set = None
+    if "asset_release_set" in plan:
+        try:
+            asset_release_set = normalize_release_binding(plan["asset_release_set"])
+        except AssetReleaseBindingError as exc:
+            raise WorkerError(f"asset ReleaseSet is invalid: {exc}") from exc
     try:
         validate_tool_contract(
             execution_spec.get("tool_contract"),
@@ -1262,7 +1269,15 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         tool_observations = observe_tool_versions(execution_spec["tool_contract"])
     except ToolLibraryError as exc:
         raise WorkerError(f"{exc.code}: {exc}") from exc
-    plan = {**plan, "execution_spec": execution_spec}
+    plan = {
+        **plan,
+        "execution_spec": execution_spec,
+        **(
+            {"asset_release_set": asset_release_set}
+            if asset_release_set is not None
+            else {}
+        ),
+    }
     _validate_dataset(dataset, settings)
     if state_path.exists():
         state = _read_json(state_path)
@@ -1294,6 +1309,11 @@ def launch(request: dict[str, Any]) -> dict[str, Any]:
         "plan": {**plan, "dataset": dataset},
         "metadata_snapshot": plan.get("metadata_snapshot"),
         "execution_spec": execution_spec,
+        **(
+            {"asset_release_set": asset_release_set}
+            if asset_release_set is not None
+            else {}
+        ),
         "tool_observations": tool_observations,
         "tool_results": [],
         "artifact_reports": {},

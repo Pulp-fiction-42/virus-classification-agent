@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import config
+from asset_release_binding import (
+    AssetReleaseBindingError,
+    normalize_release_binding,
+)
 from pipeline_spec import (
     ExecutionSpecError,
     normalize_execution_spec,
@@ -137,6 +141,16 @@ class DeterministicRuntime:
 
         execution_spec = normalize_execution_spec(plan.get("execution_spec"))
         validate_plan_rules(execution_spec, plan.get("steps") or [])
+        asset_release_set = None
+        if "asset_release_set" in plan:
+            try:
+                asset_release_set = normalize_release_binding(
+                    plan["asset_release_set"]
+                )
+            except AssetReleaseBindingError as exc:
+                raise SessionStateError(
+                    f"分析方案资产版本无效：{exc}"
+                ) from exc
         state = {
             "version": 3,
             "run_id": run.get("run_id"),
@@ -156,6 +170,11 @@ class DeterministicRuntime:
             "plan": plan,
             "metadata_snapshot": plan.get("metadata_snapshot"),
             "execution_spec": execution_spec,
+            **(
+                {"asset_release_set": asset_release_set}
+                if asset_release_set is not None
+                else {}
+            ),
             "steps": [
                 {
                     **{

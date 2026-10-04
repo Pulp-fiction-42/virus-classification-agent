@@ -464,6 +464,56 @@ class RemoteWorkerRecoveryTests(unittest.TestCase):
             (self.runs / "analysis-tool-version-rejected/.bioagent/state.json").exists()
         )
 
+    def test_launch_rejects_invalid_asset_release_binding(self):
+        execution_spec = compile_execution_spec(
+            {
+                "version": 8,
+                "adapter": "analysis_pipeline",
+                "inputs": [
+                    {
+                        "id": "primary",
+                        "type": "raw_paired_reads",
+                        "records": [
+                            {
+                                "sample_id": "sample-a",
+                                "run_id": "run-a",
+                                "files": {
+                                    "read1": "/data/sample-a_1.fastq.gz",
+                                    "read2": "/data/sample-a_2.fastq.gz",
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "deliverables": ["read_qc"],
+                "options": {"viral_type": "RNA+DNA"},
+                "policy": {"mode": "standard"},
+            }
+        )
+        request = {
+            "settings": self.settings,
+            "run_id": "analysis-release-forged",
+            "worker_version": "abc",
+            "chat_id": "chat",
+            "dataset": {"status": "ready", "artifacts": []},
+            "plan": {
+                "asset_release_set": {
+                    "schema_version": 1,
+                    "release_set_id": "set-1",
+                    "release_set_sha256": "0" * 64,
+                    "packages": [],
+                    "sha256": "0" * 64,
+                },
+                "execution_spec": execution_spec,
+                "steps": canonical_steps(execution_spec),
+            },
+        }
+        with self.assertRaisesRegex(remote_worker.WorkerError, "ReleaseSet is invalid"):
+            remote_worker.launch(request)
+        self.assertFalse(
+            (self.runs / "analysis-release-forged/.bioagent/state.json").exists()
+        )
+
     def test_missing_queued_session_is_relaunched(self):
         run_id = "analysis-queued"
         self._state(run_id, "queued")

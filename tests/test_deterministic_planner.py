@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import unittest
 from pathlib import Path
 
@@ -42,9 +44,14 @@ class FakeManager:
 
     def __init__(self):
         self.launched = None
+        self.resumed = None
 
     async def launch_deterministic_plan(self, plan, chat_id):
         self.launched = (plan, chat_id)
+        return {"type": "analysis_run", "status": "running", "run": plan["run"]}
+
+    async def resume_deterministic_plan(self, plan, chat_id):
+        self.resumed = (plan, chat_id)
         return {"type": "analysis_run", "status": "running", "run": plan["run"]}
 
 
@@ -56,6 +63,28 @@ def dataset(*artifacts: dict, status: str = "ready") -> dict:
         "artifacts": list(artifacts),
         "checks": {},
         "issues": [],
+    }
+
+
+def release_binding(release_set_id: str, version: str) -> dict:
+    body = {
+        "schema_version": 1,
+        "release_set_id": release_set_id,
+        "release_set_sha256": hashlib.sha256(release_set_id.encode()).hexdigest(),
+        "packages": [
+            {
+                "asset_type": "knowledge",
+                "asset_id": "engineering",
+                "version": version,
+                "manifest_sha256": hashlib.sha256(version.encode()).hexdigest(),
+            }
+        ],
+    }
+    return {
+        **body,
+        "sha256": hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
     }
 
 
@@ -481,6 +510,46 @@ class DeterministicPlannerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.code, "CAPABILITY_VERSION_UNAVAILABLE")
         self.assertIsNone(self.manager.launched)
+
+    async def test_start_uses_current_release_but_resume_keeps_frozen_release(self):
+        active = {"binding": release_binding("set-1", "1")}
+        planner = DeterministicPlanner(
+            self.manager, release_resolver=lambda: active["binding"]
+        )
+        plan = planner.compile(
+            dataset=dataset(RAW),
+            goals=["read_qc"],
+            options={"viral_type": "RNA+DNA"},
+            routing={"mode": "standard"},
+        )
+        self.assertEqual(plan["asset_release_set"]["release_set_id"], "set-1")
+
+        active["binding"] = release_binding("set-2", "2")
+        with self.assertRaisesRegex(PlannerError, "authoritative dataset"):
+            await planner.start(
+                persisted_plan=plan,
+                dataset=dataset(RAW),
+                chat_id="00000000-0000-0000-0000-000000000001",
+                plan_id="pl_test",
+                plan_revision=2,
+                run_id="analysis-release-changed",
+                queue_context={"project_id": "project-test"},
+            )
+
+        planner.release_resolver = lambda: (_ for _ in ()).throw(
+            AssertionError("resume must not read current release")
+        )
+        result = await planner.resume(
+            persisted_plan=plan,
+            dataset=dataset(RAW),
+            chat_id="00000000-0000-0000-0000-000000000001",
+            plan_id="pl_test",
+            plan_revision=2,
+            run_id="analysis-release-resume",
+        )
+        resumed, _ = self.manager.resumed
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(resumed["asset_release_set"], plan["asset_release_set"])
 
     async def test_start_rejects_caller_controlled_run_path(self):
         plan = self.compile(dataset(RAW), ["contig_filter"])

@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import config
 from admission_control import AdmissionUnavailable, admission_status, require_admission
+from asset_release_binding import (
+    load_active_release_binding,
+    release_binding_status,
+)
 from conversation_events import (
     InvalidSessionError,
     OutputItemAdded,
@@ -54,6 +59,11 @@ deterministic_runtime = (
 planner = DeterministicPlanner(
     deterministic_runtime,
     enabled_goals=config.ENABLED_ANALYSIS_GOALS,
+    release_resolver=(
+        (lambda: load_active_release_binding(Path(config.ASSET_RELEASE_STORE)))
+        if config.ASSET_RELEASE_STORE
+        else None
+    ),
 )
 sessions: Any | None = None
 log = logging.getLogger(__name__)
@@ -305,6 +315,9 @@ async def analysis_health():
         "knowledge": knowledge,
         "execution": remote,
         "admission": admission_status(config.ADMISSION_STATE_FILE),
+        "asset_release": release_binding_status(
+            Path(config.ASSET_RELEASE_STORE) if config.ASSET_RELEASE_STORE else None
+        ),
     }
 
 

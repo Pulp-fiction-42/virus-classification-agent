@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -9,6 +10,28 @@ from pathlib import Path
 from deterministic_runtime import DeterministicRuntime
 from pipeline_spec import canonical_steps, normalize_execution_spec
 from runtime_errors import SessionStateError
+
+
+def _release_binding() -> dict:
+    body = {
+        "schema_version": 1,
+        "release_set_id": "set-1",
+        "release_set_sha256": hashlib.sha256(b"set-1").hexdigest(),
+        "packages": [
+            {
+                "asset_type": "knowledge",
+                "asset_id": "engineering",
+                "version": "1",
+                "manifest_sha256": hashlib.sha256(b"manifest").hexdigest(),
+            }
+        ],
+    }
+    return {
+        **body,
+        "sha256": hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
 
 
 class FakeCalibrator:
@@ -122,6 +145,7 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "planner_version": 1,
             "plan_ref": {"id": "pl_test", "revision": 1},
             "decision_trace": [{"kind": "plan_compiled"}],
+            "asset_release_set": _release_binding(),
             "execution_spec": spec,
             "steps": canonical_steps(spec),
             "run": {
@@ -143,6 +167,7 @@ class DeterministicRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.launches), 1)
         self.assertEqual(state["plan_ref"], {"id": "pl_test", "revision": 1})
         self.assertEqual(state["decision_trace"][0]["kind"], "plan_compiled")
+        self.assertEqual(state["asset_release_set"], plan["asset_release_set"])
         self.assertTrue(Path(state["technical_report"]["agent_trace"]).is_file())
 
     async def test_changed_file_is_rejected_before_state_creation(self):
