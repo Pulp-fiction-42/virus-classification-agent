@@ -10,7 +10,12 @@ import time
 import uuid
 from typing import Any, Literal
 
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
 import config
+from admission_control import AdmissionUnavailable, admission_status, require_admission
 from conversation_events import (
     InvalidSessionError,
     OutputItemAdded,
@@ -19,8 +24,6 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
 from priority_reports import (
     build_fact_packet,
     build_reasoning_plan,
@@ -33,7 +36,6 @@ from provider import (
     claude_agent_sdk_ready,
     claude_agent_sdk_version,
 )
-from pydantic import BaseModel, ConfigDict, Field
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -302,6 +304,7 @@ async def analysis_health():
         },
         "knowledge": knowledge,
         "execution": remote,
+        "admission": admission_status(config.ADMISSION_STATE_FILE),
     }
 
 
@@ -309,6 +312,12 @@ async def analysis_health():
 @app.get("/analysis/capabilities")
 async def analysis_capabilities():
     return capability_catalog()
+
+
+@app.get("/v1/analysis/admission")
+@app.get("/analysis/admission")
+async def analysis_admission():
+    return admission_status(config.ADMISSION_STATE_FILE)
 
 
 def _remote_required() -> RemoteWorkerClient:
@@ -558,6 +567,7 @@ async def compile_analysis_plan(req: CompilePlanRequest):
 @app.post("/v1/analysis/runs/start")
 async def start_analysis_run(req: StartRunRequest):
     try:
+        require_admission(config.ADMISSION_STATE_FILE)
         return await planner.start(
             persisted_plan=req.plan,
             dataset=req.dataset,
@@ -567,6 +577,11 @@ async def start_analysis_run(req: StartRunRequest):
             run_id=req.run_id,
             queue_context=req.queue_context.model_dump(),
         )
+    except AdmissionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "message": str(exc), "retryable": True},
+        ) from exc
     except RemoteConnectionError as exc:
         raise HTTPException(
             status_code=503,
@@ -587,6 +602,7 @@ async def start_analysis_run(req: StartRunRequest):
 @app.post("/v1/analysis/runs/resume")
 async def resume_analysis_run(req: ResumeRunRequest):
     try:
+        require_admission(config.ADMISSION_STATE_FILE)
         return await planner.resume(
             persisted_plan=req.plan,
             dataset=req.dataset,
@@ -595,6 +611,11 @@ async def resume_analysis_run(req: ResumeRunRequest):
             plan_revision=req.plan_revision,
             run_id=req.run_id,
         )
+    except AdmissionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "message": str(exc), "retryable": True},
+        ) from exc
     except RemoteConnectionError as exc:
         raise HTTPException(
             status_code=503,

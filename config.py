@@ -14,6 +14,7 @@ ANTHROPIC_BASE_URL = os.getenv(
     "BIOAGENT_MODEL_BASE_URL", "https://api.minimax.cn/anthropic"
 )
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+ADMISSION_STATE_FILE = os.getenv("BIOAGENT_ADMISSION_STATE_FILE", "").strip()
 CLAUDE_STATE_DIR = PROJECT_ROOT / ".claude" / "sessions"
 CONVERSATION_TIMEOUT_SECONDS = float(
     os.getenv("BIOAGENT_CONVERSATION_TIMEOUT_SECONDS", "180")

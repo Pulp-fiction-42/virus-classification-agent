@@ -5,6 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+from pydantic import ValidationError
+from starlette.requests import Request
+
 import adapter
 from adapter import (
     CandidateAssessmentsRequest,
@@ -15,12 +19,9 @@ from adapter import (
     error_sse,
 )
 from deterministic_planner import PlannerError
-from fastapi import HTTPException
-from pydantic import ValidationError
 from remote_client import RemoteConnectionError, RemoteExecutionError
 from runtime import SessionStateError, TextDelta
 from runtime_errors import ConversationPublicError
-from starlette.requests import Request
 
 
 def request_with_headers(**headers: str) -> Request:
@@ -218,6 +219,35 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["knowledge"]["provider"], "sqlite_fts5")
         self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v4")
         self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
+        self.assertEqual(result["admission"]["status"], "accepting")
+
+    async def test_draining_gate_rejects_start_before_planner(self):
+        fake = FakePlanner()
+        adapter.planner = fake
+        request = StartRunRequest(
+            plan={"goals": ["virus_summary"]},
+            dataset={"id": "ds", "revision": 1, "status": "ready"},
+            chat_id="00000000-0000-0000-0000-000000000001",
+            plan_id="pl_test",
+            plan_revision=3,
+            run_id="analysis-fixed",
+            queue_context={"project_id": "project-test", "project_priority": "high"},
+        )
+        with (
+            patch.object(
+                adapter,
+                "require_admission",
+                side_effect=adapter.AdmissionUnavailable(
+                    "ADMISSION_DRAINING", "系统维护中"
+                ),
+            ),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await adapter.start_analysis_run(request)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail["code"], "ADMISSION_DRAINING")
+        self.assertEqual(fake.start_calls, [])
 
     async def test_health_rejects_unpinned_sdk(self):
         with (
