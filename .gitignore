@@ -8,3 +8,14 @@ __pycache__/
 .claude/sessions/
 python-agent-sdk-reference.md
 /start-*.sh
+# XvirMind runtime artifacts: generated logs, state and analysis outputs
+.bioagent/
+logs/
+results/
+runs/
+run/
+workflows/
+test-results/
+analysis-results/
+*.log
+*.dryrun.log

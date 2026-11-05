@@ -1,238 +1,44 @@
 ---
 name: bioinformatics-workflow-gatekeeper
-description: Use when a user requests a bioinformatics analysis that may match one or more fixed Snakemake workflows workflow1-workflow6 on cyclone. Guides conservative internal workflow matching, plan-mode analysis_plan output, one explicit user confirmation gate, and execute-mode Snakemake execution through the Bash tool.
+description: Plan or revise XvirMind bioinformatics analyses at stage level, interpret intent and rule-based parameter requests, clarify missing dependencies, and explain validated execution results. Applies to the supported W1–W6 workflows and selected intermediate artifacts.
 ---
 
-# Bioinformatics Workflow Gatekeeper
+# XvirMind 分析方案 Skill
 
-Use this skill when a user asks for a bioinformatics analysis that may match one or more fixed Snakemake workflows available on the cyclone server.
+本 Skill 支持 `intent` 和 `param_suggest`。输入是用户本轮需求、后端当前方案及版本、已选输入文件；输出是结构化方案或必要澄清。W1–W6 是流程分组，实际执行单位是 stage。
 
-## Supported workflows
+## 规划与澄清
 
-Only these workflows are in scope:
+- 使用运行时注入的 `DETERMINISTIC PLANNING CONTEXT`。它是后端校验结果，不能用模型自行编写的 `analysis_plan` 覆盖。
+- 流程与参数目录由同一份代码提供。在 Agent 目录运行 `python analysis_planner.py --catalog` 可获得当前目录；规划接口见 [planning-contract.md](references/planning-contract.md)。只读规划脚本不启动生信任务。
+- 用户只说“W1”“W2”或“病毒注释”时，询问具体步骤、终点或是否执行该组完整流程。“只做质控”仅选 `read_qc`；“W1做到组装”停止于 `assembly`，不加 contig 过滤。
+- “W2只提取病毒候选，后面的证据分析先不做”以 `virus_candidate_extract` 为终点，不增加 `virus_evidence` 或 `virus_summary`。
+- W2 需要 contigs。已有合格 contigs 可直接进入 W2；只有原始 reads 时，说明缺少 contigs，列出需要的 W1 前置步骤，询问是否补做或提供中间产物。必要依赖不代表已授权。确认前 `ready_to_execute=false`。
+- 同意补做依赖只更新方案中的已列出依赖，保留原目标，并等待执行入口的确认。拒绝补跑且缺少产物时保持不可执行。
+- 被排除的步骤若仍是目标依赖，说明冲突；不能悄悄跳过，也不能把目标改成最后一个可执行步骤。
+- 不清楚用户指哪个步骤、参数或输入类型时主动澄清，不用默认值代替范围决定。
 
-| ID        | Directory                      | Purpose                                                                                                                                           |
-| --------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| workflow1 | workflow1_upstream             | Upstream preprocessing for paired-end viral metagenomic reads: fastp QC, rRNA removal, sample merge, MEGAHIT assembly, contig renaming/filtering. |
-| workflow2 | workflow2_virusid              | Virus identification workflow.                                                                                                                    |
-| workflow3 | workflow3_hostid               | Host identification workflow.                                                                                                                     |
-| workflow4 | workflow4_kraken_bracken       | Kraken/Bracken taxonomic profiling workflow.                                                                                                      |
-| workflow5 | workflow5_virus_quantification | Virus quantification workflow.                                                                                                                    |
-| workflow6 | workflow6_virus_annotation     | Virus annotation workflow.                                                                                                                        |
+## 参数修改
 
-Do not propose workflow7 or any other workflow. You may internally compose supported workflows in series when the user's request clearly requires multiple supported phases, but do not expose workflow IDs as the main user-facing plan.
+- 参数只从后端白名单选择；合法范围属于当前项目策略。不能编造工具支持范围或添加任意命令行参数。
+- “fastp最短长度改成八十”规范化为 `fastp.length_required=80`。没有上下文可区分的“最短长度改80”需询问是 read、组装 contig 还是过滤长度。
+- 参数建议返回 `base_plan_revision`、`parameter_patch` 和 `json_patch`。`json_patch` 先测试版本，修改已有值时先测试旧值，再只修改指定字段。
+- 参数单独修改保留 goals、输入、选中阶段、排除项以及其他参数；`scope_patch={}`。未知参数、越界或陈旧版本整次拒绝，原方案保持不变。
+- Use the selected workflow's existing tool flags, databases, presets, and thresholds as defaults. These technical choices are not user requirements. Qualitative requests such as “宽松一点” require clarification or a documented preset; do not invent thresholds.
 
-## Core rule
+## 方案和执行边界
 
-This skill uses conversational confirmation gates, not Claude Agent SDK lifecycle hooks.
+- Plan mode must not create run directories, write workflow configs, run dry-runs, or execute Snakemake.
+- 对已识别需求，文字说明应与校验结果一致，先说明已选范围，再展示缺少输入/依赖或修改结果。可输出末尾 `analysis_plan` JSON 控制块，运行时会隐藏它并生成最终卡片。
+- The agent must ask the user for one explicit confirmation before preparing a workflow run and launching real Snakemake execution. 运行时的执行入口确认与补做依赖的范围确认是两个不同动作。
+- Never execute a stage omitted from the latest plan. 新版方案由确定性执行器处理，模型只解释实际结果；不得另行复制流程或运行 shell 来扩大范围。
+- 使用注入的运行目录和状态：`${RUN_DIR}/.bioagent/state.json`、`${RUN_DIR}/.bioagent/execution.log`。Do not output `analysis_plan` in execute mode.
+- 修改参数只作用于运行副本；不得修改共享工作流。每次 Snakemake 调用使用显式产物目标，禁止默认 `all`。路径约束包括 `--directory "${RUN_DIR}/workflow"`、`--snakefile "${RUN_DIR}/workflow/Snakefile"` 和 `--configfile "${RUN_DIR}/workflow/config/config.yaml"`；多阶段执行器使用其实际的 `workflows/<phase>` 目录。
 
-The agent must ask the user for one explicit confirmation before preparing a workflow run and launching the real Snakemake execution. A user message such as "确认启动分析，请按当前方案执行" counts as that confirmation when a concrete plan has already been discussed.
+## 报告
 
-## Plan-mode contract
+报告只引用本次成功运行的事实，按实际选中阶段呈现范围、参数修改、依赖授权、指标来源和产物。Quality-control or assembly results alone 不支持病毒分类或病因诊断。缺失字段明确未记录。
 
-In plan mode, produce a concrete analysis plan and append exactly one internal `analysis_plan` fenced block whenever the user-facing flow is clear enough for the `/analysis` page:
+工具、软件库、Skill 调用和文献附录由后端根据当前 run 的证据与已核验的引用目录生成。不能把可用或已安装的 Skill 声称为实际调用，也不能编造版本、作者或 DOI。后端生成 `analysis-provenance.json` 和 `references.bib`；历史未记录的字段保持未记录。扩展规则见项目 `REPORT_REFERENCES.md`。
 
-````markdown
-```analysis_plan
-{
-  "version": 1,
-  "title": "病毒宏基因组上游流程",
-  "ready_to_execute": true,
-  "steps": [
-    {"label": "质控", "tool": "fastp", "rules": ["fastp"]},
-    {"label": "去 rRNA", "tool": "Bowtie2", "rules": ["bowtie2"]},
-    {"label": "样本合并", "rules": ["merge"]},
-    {"label": "组装", "tool": "MEGAHIT", "rules": ["megahit"]},
-    {"label": "重命名过滤", "rules": ["rename_filter"]}
-  ],
-  "resource_estimate": {
-    "eta": "约 1-2 小时",
-    "compute": "4-12 核，约 20 GB 内存",
-    "confidence": "估算"
-  }
-}
-```
-````
-
-Requirements:
-
-- The fenced block content must be valid JSON only.
-- The runtime removes this block before the user sees the reply.
-- The fenced block is the final content in the response. Put every user-visible explanation or question before it.
-- `steps` are user-understandable flow steps, not workflow names.
-- `tool` is optional; omit it when uncertain.
-- `rules` is internal progress metadata. For every fixed Snakemake workflow step, list the exact rule names represented by that user-facing step; inspect that workflow's Snakefile when necessary. One step may contain multiple rules.
-- Use the selected workflow's existing tool flags, databases, presets, and thresholds as defaults. These technical choices are not user requirements and must not make an otherwise executable plan unready.
-- Set `ready_to_execute` to `true` once the supported analysis goal, input files, and required sample relationships are clear. Set it to `false` only when one of those user-level facts is missing or ambiguous, and ask for that information in plain language before the fenced block.
-- If the user adjusts requirements in natural language, translate the request into the run-local workflow configuration and output a complete updated scheme, not a partial diff. Reflect qualitative changes in the step labels and remove omitted stages from the step list.
-- Plan mode must not create run directories, write configs, run dry-runs, or execute Snakemake.
-- BioAgent plan mode is not Claude Code Plan Mode. Never call EnterPlanMode or ExitPlanMode and never write `.claude/sessions/plans` files; finish with the `analysis_plan` block.
-
-## Behavior
-
-- Match conservatively. Suggest a workflow only when the user's request clearly fits workflow1-workflow6.
-- Explain the concrete analysis flow briefly. Keep workflow IDs as internal implementation details unless the user explicitly asks about them.
-- Before the user confirmation, do not call any workflow tool, do not create a run directory, do not write configuration files, and do not run Snakemake.
-- After the user confirms the selected workflow, use the runtime-injected run_id and run_dir, copy the selected workflow source, prepare the run-local configuration, update state steps, and launch exactly the stages in the latest plan. Apply qualitative adjustments only to the run-local configuration.
-- Never execute a stage omitted from the latest plan. When the plan stops before a workflow's default final target, invoke Snakemake with the explicit output targets for the last selected stage instead of the default `all` target.
-- In execute mode, summarize the execution result for the user as Markdown, including the run directory, execution log, return code, and any obvious next steps. Do not output `analysis_plan` in execute mode.
-- After a successful execution summary, append the `diagnostic_report` control block described below. Failed or incomplete runs must not produce that block.
-- If the user rejects the proposed workflow, exit this skill and continue normal conversation.
-
-## Diagnostic report contract
-
-When `execution.status` is `completed` and `execution.ok` is `true`, finish the response with exactly one internal report block:
-
-````html
-```diagnostic_report
-<article class="diagnostic-report">
-  <header>
-    <h1>诊断意见书</h1>
-    <p class="review-status">待专家审核</p>
-  </header>
-  <section>
-    <h2>基本信息</h2>
-    <dl>
-      <dt>分析任务</dt>
-      <dd>病毒宏基因组上游分析</dd>
-    </dl>
-  </section>
-</article>
-```
-````
-
-Requirements:
-
-- The block contains one unstyled `<article class="diagnostic-report">` fragment, not a complete HTML document. The runtime hides it, applies the shared print style, and writes `diagnostic-opinion.html`; do not write that file yourself.
-- Use only `article`, `header`, `section`, `h1`-`h3`, `p`, `ul`, `ol`, `li`, `dl`, `dt`, `dd`, `table`, `thead`, `tbody`, `tr`, `th`, `td`, `strong`, `em`, `small`, `code`, and `br`. Only `class` attributes are allowed.
-- Do not include a doctype, `html`, `head`, `body`, `style`, `script`, links, images, external resources, inline styles, event attributes, Markdown, comments, or text outside the article.
-- Include the available sections 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物. Omit empty sections, unknown fields, and every analysis stage the user skipped.
-- Base every metric, finding, conclusion, and evidence path on the completed run or the current conversation. Quality-control or assembly results alone must not be presented as a pathogen classification or etiological diagnosis.
-- The fenced block is the final response content. Put the user-visible Markdown execution summary before it and write nothing after it.
-
-## Tool boundaries
-
-- Use the Bash tool directly for Snakemake workflow preparation and execution.
-- Do not use MCP custom tools for this workflow path.
-- Do not edit the source workflow directories under `/data/user/guojindan/Projects/Workflows`.
-- The run root is controlled by `BIOAGENT_RUN_ROOT`.
-- Work only inside the runtime-injected run directory.
-- Copy the workflow source into `${RUN_DIR}/workflow` before running it.
-- Every Snakemake invocation must pass `--directory "${RUN_DIR}/workflow"`, `--snakefile "${RUN_DIR}/workflow/Snakefile"`, and an absolute `--configfile` path. Snakemake resolves CLI file arguments before switching directory, and an absolute Snakefile alone does not change its working directory; do not rely on a previous Bash tool call's `cd`.
-- The real Snakemake execution must only happen after explicit user confirmation and execute-mode context.
-- Runtime state has already been created at `${RUN_DIR}/.bioagent/state.json`; update it as each user-facing step starts or finishes. Step status is exactly `pending`, `running`, `completed`, or `failed`; execution status is exactly `running`, `completed`, or `failed`.
-- Snakemake stdout/stderr should be captured in `${RUN_DIR}/.bioagent/execution.log`.
-- Do not run Snakemake in the background. Before the Bash command exits, write terminal `execution.status`, `execution.ok`, and `execution.returncode`.
-
-## Bash execution pattern
-
-Use this structure only after the user confirmation. Replace placeholders before running.
-
-```bash
-set -euo pipefail
-
-export WORKFLOW_ID="workflow1"
-export WORKFLOW_SRC="/data/user/guojindan/Projects/Workflows/workflow1_upstream"
-export SNAKEMAKE="/data/user/guojindan/softwares/xvirmin/bin/snakemake"
-export RUN_ID="<runtime injected run_id>"
-export RUN_DIR="<runtime injected run_dir>"
-export STATE_PATH="${RUN_DIR}/.bioagent/state.json"
-export LOG_PATH="${RUN_DIR}/.bioagent/execution.log"
-
-mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/results" "${RUN_DIR}/.bioagent"
-rsync -a \
-  --exclude .git \
-  --exclude .snakemake \
-  --exclude logs \
-  --exclude results \
-  --exclude example \
-  "${WORKFLOW_SRC}/" "${RUN_DIR}/workflow/"
-```
-
-For workflow1, prepare the run-local sample list and config inside `${RUN_DIR}/workflow`:
-
-```bash
-# If the user provided real samples, overwrite data/samples.txt with:
-# run_id sample_name /absolute/path/to/R1.fastq.gz /absolute/path/to/R2.fastq.gz
-#
-# If this is only a workflow1 test and the user did not provide data, keep the
-# workflow's existing example data/samples.txt.
-
-python - <<'PY'
-import os
-from pathlib import Path
-workflow_dir = Path(os.environ["RUN_DIR"]) / "workflow"
-config = workflow_dir / "config/config.yaml"
-text = config.read_text()
-lines = []
-for line in text.splitlines():
-    if line.startswith("sample_list:"):
-        lines.append('sample_list: "data/samples.txt"')
-    elif line.startswith("output_dir:"):
-        lines.append('output_dir: "../results"')
-    else:
-        lines.append(line)
-config.write_text("\n".join(lines) + "\n")
-PY
-```
-
-Update the run-local state and launch Snakemake:
-
-```bash
-python - <<'PY'
-import json
-import os
-from pathlib import Path
-path = Path(os.environ["STATE_PATH"])
-state = json.loads(path.read_text())
-state["workflow_id"] = os.environ["WORKFLOW_ID"]
-state["workflow_dir"] = f'{os.environ["RUN_DIR"]}/workflow'
-state["results_dir"] = f'{os.environ["RUN_DIR"]}/results'
-state["execution"]["current_step_id"] = state["steps"][0]["id"]
-state["steps"][0]["status"] = "running"
-path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-PY
-
-set +e
-"${SNAKEMAKE}" \
-  --directory "${RUN_DIR}/workflow" \
-  --snakefile "${RUN_DIR}/workflow/Snakefile" \
-  --configfile "${RUN_DIR}/workflow/config/config.yaml" \
-  --cores 4 \
-  > "${LOG_PATH}" 2>&1
-EXEC_STATUS=$?
-set -e
-
-python - <<PY
-import json
-from pathlib import Path
-state_path = Path("${STATE_PATH}")
-state = json.loads(state_path.read_text())
-ok = ${EXEC_STATUS} == 0
-for step in state.get("steps", []):
-    if step.get("status") == "running":
-        step["status"] = "completed" if ok else "failed"
-    elif ok and step.get("status") == "pending":
-        step["status"] = "completed"
-state["execution"]["status"] = "completed" if ok else "failed"
-state["execution"]["ok"] = ok
-state["execution"]["returncode"] = ${EXEC_STATUS}
-state["execution"]["current_step_id"] = None
-state["execution"]["log"] = "${LOG_PATH}"
-state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-PY
-
-cat "${LOG_PATH}"
-exit "${EXEC_STATUS}"
-```
-
-## Input expectations
-
-For workflow1, collect paired-end sample information when the user provides real data:
-
-- `run_id`
-- `sample_name`
-- absolute path to R1 FASTQ
-- absolute path to R2 FASTQ
-
-If required input details are missing, ask the user for them before preparing a run.
+旧版已完成 run 的 `diagnostic_report` 控制块包含一个无样式的 `<article class="diagnostic-report">`，由运行时验证并保存。历史报告恢复规则和旧运行格式位于 [legacy-execution.md](references/legacy-execution.md)，仅在恢复旧 run 时读取；不能用于启动新的未校验流程。

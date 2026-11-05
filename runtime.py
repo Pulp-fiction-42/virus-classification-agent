@@ -71,6 +71,13 @@ except (
 
 import config
 
+from intent_router import CONFIRM_RE, resolve_intent
+from plan_proposals import ProposalFormatError, admit_proposal, blocked_plan
+from semantic_planner import PlannerFailure, QwenPlanner
+from pipeline_runner import run_pipeline, validate_execution_plan
+from report_evidence import collect_evidence, render_fragment, summary_text
+from report_provenance import collect_provenance, render_appendix, save_provenance, SkillUsageAudit
+
 
 PLAN_MODE = "plan"
 EXECUTE_MODE = "execute"
@@ -90,6 +97,8 @@ EXECUTE_PROMPT_PREFIX = """当前是 execute 模式。遵循之前计划模式�
 
 执行回合先返回普通 Markdown 状态或结果说明；不要输出 analysis_plan fenced block，也不要输出任何卡片 JSON。
 runtime 已经创建 run_dir 和 .bioagent/state.json。必须使用注入的 run_id、run_dir、state_path、log_path 和 steps；不要创建第二个 run 目录。
+执行日志固定写入本次运行目录下的 .bioagent/execution.log。
+state.json 可能包含此前已完成的执行；先读取已有状态。用户只是追问结果或补生成报告时，复用已有产物，不得重置步骤或重复计算。
 每次运行 Snakemake 都必须显式传入 --directory "<run_dir>/workflow"、--snakefile "<run_dir>/workflow/Snakefile" 和绝对 configfile 路径；不得只依赖 cd，否则会污染 agent 工作目录。
 每个阶段开始或结束时更新 state.json 中的 steps[].status 和 execution.current_step_id。
 步骤状态只使用 pending、running、completed、failed；execution 状态只使用 running、completed、failed。
@@ -380,8 +389,18 @@ class ManagedSession:
     claude_session_id: str | None
 
 
+class PlanningSessionClient:
+    """Session mode control without starting a tool-enabled CLI for planning."""
+
+    async def set_permission_mode(self, mode: str) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+
 class SessionManager:
-    """Keeps one ClaudeSDKClient per Open WebUI chat ID."""
+    """Keep planning state and execution admission per Open WebUI chat ID."""
 
     def __init__(
         self,
@@ -392,10 +411,18 @@ class SessionManager:
         client_factory: Callable[[ClaudeAgentOptions], Any] = ClaudeSDKClient,
         idle_timeout_seconds: float = config.SESSION_IDLE_TIMEOUT_SECONDS,
         analysis_run_root: Path = config.ANALYSIS_RUN_ROOT,
+        allow_legacy_execution: bool = False,
+        planning_backend: str = "model",
+        semantic_planner: Any | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config_dir = config_dir.resolve()
         self.analysis_run_root = analysis_run_root.resolve()
+        self.allow_legacy_execution = allow_legacy_execution
+        if planning_backend not in {"model", "legacy"}:
+            raise ValueError("planning_backend must be model or legacy")
+        self.planning_backend = planning_backend
+        self.semantic_planner = semantic_planner if semantic_planner is not None else QwenPlanner()
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.projects_dir = self.config_dir / "projects"
         self.projects_dir.mkdir(parents=True, exist_ok=True)
@@ -423,10 +450,22 @@ class SessionManager:
                 return
             projects_link.unlink()
         if projects_link.exists():
+            # A previous Windows run may have used the non-symlink fallback.
+            # Reuse that directory consistently so sessions can be resumed.
+            if projects_link.is_dir():
+                self.projects_dir = projects_link
+                return
             raise SessionStateError(
-                f"Claude runtime projects path must be a symlink: {projects_link}"
+                f"Claude runtime projects path must be a symlink or directory: {projects_link}"
             )
-        projects_link.symlink_to(self.projects_dir, target_is_directory=True)
+        try:
+            projects_link.symlink_to(self.projects_dir, target_is_directory=True)
+        except OSError:
+            # Windows commonly disables developer-mode symlinks.  Keep the
+            # runtime usable with a normal directory and make it the canonical
+            # transcript location for this process.
+            projects_link.mkdir(parents=True, exist_ok=True)
+            self.projects_dir = projects_link
 
     async def set_mode(self, chat_id: str | None, mode: str) -> None:
         if mode not in {PLAN_MODE, EXECUTE_MODE}:
@@ -449,16 +488,116 @@ class SessionManager:
 
         async with session.lock:
             user_prompt = self._prompt_for_session(messages, session)
+            if self.planning_backend == "model":
+                latest = self._latest_user_message(messages)
+                if CONFIRM_RE.fullmatch(latest):
+                    stored = self._load_analysis_plan(normalized_chat_id)
+                    if session.mode == PLAN_MODE:
+                        yield TextDelta(
+                            "方案已就绪，请通过执行入口确认启动。"
+                            if stored and stored.get("ready_to_execute") is True
+                            else "当前方案尚未通过校验或仍有未解决的问题，暂时不能执行。"
+                        )
+                        return
+                    # The explicit UI confirmation reuses the deterministic
+                    # executor below. Any combined edit goes to Qwen instead.
+                else:
+                    async for event in self._stream_semantic_turn(messages, normalized_chat_id, session):
+                        yield event
+                    return
+            if session.mode == EXECUTE_MODE:
+                stored = self._load_analysis_plan(normalized_chat_id)
+                edit = resolve_intent(
+                    self._latest_user_message(messages), self._planning_state(stored), check_files=True
+                )
+                if edit.get("action") in {"plan", "param_suggest", "clarify", "explain"} or (
+                    stored and stored.get("execution_spec") and edit.get("action") == "conversation"
+                ):
+                    # Follow-up edits create a new draft even when the previous
+                    # UI state is execute mode. They never start the old run.
+                    await session.client.set_permission_mode(SDK_PLAN_PERMISSION_MODE)
+                    session.mode = PLAN_MODE
             plan = None
+            planning_intent: dict[str, Any] | None = None
+            previous_plan = None
+            if session.mode == PLAN_MODE:
+                previous_plan = self._load_analysis_plan(normalized_chat_id)
+                previous_planning = self._planning_state(previous_plan)
+                try:
+                    planning_intent = resolve_intent(
+                        self._latest_user_message(messages), previous_planning,
+                        check_files=True,
+                    )
+                except (TypeError, ValueError, KeyError) as exc:
+                    planning_intent = {
+                        "action": "clarify", "handled": True, "ready_to_execute": False,
+                        "questions": ["当前方案状态无法通过校验，请重新明确分析范围与输入。"],
+                        "validation_error": str(exc),
+                    }
+                if planning_intent.get("action") == "execute":
+                    yield TextDelta(
+                        "方案已就绪，请通过执行入口确认启动。"
+                        if planning_intent.get("ready_to_execute")
+                        else "\n\n".join(planning_intent.get("questions", []))
+                    )
+                    return
+                if planning_intent.get("handled"):
+                    draft = self._build_analysis_plan({"steps": []}, planning_intent)
+                    if draft:
+                        # Persist the question before querying Qwen. A failed
+                        # model turn must not leave an older plan executable.
+                        self._save_analysis_plan(normalized_chat_id, draft)
+                else:
+                    planning_intent = None
             if session.mode == EXECUTE_MODE:
                 plan = self._load_analysis_plan(normalized_chat_id)
                 if not plan or plan.get("ready_to_execute") is not True:
                     yield TextDelta("请先生成可执行分析方案，再确认启动分析。")
                     return
+                if plan.get("execution_spec"):
+                    existing_path = Path(plan["run"]["state_path"])
+                    if edit.get("action") != "execute" and not existing_path.is_file():
+                        yield TextDelta("请明确确认执行当前方案后再启动；修改参数或范围会先更新方案。")
+                        return
+                    try:
+                        validate_execution_plan(plan)
+                    except ValueError as exc:
+                        yield TextDelta(f"当前方案不能执行：{exc}")
+                        return
+                    self._write_initial_run_state(plan)
+                    yield TextDelta("已按确认方案启动，先校验实际调度规则，再执行选中步骤。\n\n")
+                    state = await asyncio.to_thread(run_pipeline, Path(plan["run"]["state_path"]))
+                    if not state.get("execution", {}).get("ok"):
+                        yield TextDelta("分析已停止：" + str(state.get("execution", {}).get("error", "请检查执行日志")))
+                        return
+                    try:
+                        evidence = collect_evidence(Path(plan["run"]["run_dir"]), state)
+                        evidence_path = Path(plan["run"]["run_dir"]) / ".bioagent/report-evidence.json"
+                        self._write_json_atomic(evidence_path, evidence)
+                        report_item = self._save_diagnostic_report(plan, render_fragment(state, evidence))
+                    except (ValueError, OSError) as exc:
+                        self._mark_report_failed(plan, str(exc))
+                        yield TextDelta("分析执行成功，报告生成未通过校验：" + str(exc))
+                        return
+                    yield TextDelta(summary_text(evidence) + "\n\n运行目录：" + plan["run"]["run_dir"])
+                    yield OutputItemAdded(report_item)
+                    session.last_used_at = time.time()
+                    return
+                # Older reservations can still be used to inspect completed
+                # runs, but new execution requires a validated specification.
+                legacy_state_exists = Path(plan.get("run", {}).get("state_path", "")).is_file()
+                if not self.allow_legacy_execution and (not legacy_state_exists or not self._run_succeeded(plan)):
+                    yield TextDelta("这是旧版方案，请重新明确范围并生成通过校验的新方案后再执行。")
+                    return
                 self._write_initial_run_state(plan)
 
+            skill_audit = None
+            if session.mode == EXECUTE_MODE and plan and not self._run_succeeded(plan):
+                skill_audit = SkillUsageAudit(Path(plan["run"]["run_dir"]), Path(__file__).parent / ".claude/skills")
             try:
-                prompt = self._prefixed_prompt(session.mode, user_prompt, plan)
+                prompt = self._prefixed_prompt(
+                    session.mode, user_prompt, plan, planning_intent
+                )
                 session.last_used_at = time.time()
                 await session.client.query(prompt)
 
@@ -469,6 +608,8 @@ class SessionManager:
                     else "```diagnostic_report"
                 )
                 async for message in session.client.receive_response():
+                    if skill_audit:
+                        skill_audit.observe(message)
                     if isinstance(message, StreamEvent):
                         event = message.event
                         if event.get("type") != "content_block_delta":
@@ -476,7 +617,8 @@ class SessionManager:
                         delta = event.get("delta", {})
                         if delta.get("type") == "text_delta" and delta.get("text"):
                             for visible_text in control_filter.push(delta["text"]):
-                                yield TextDelta(visible_text)
+                                if not planning_intent:
+                                    yield TextDelta(visible_text)
                     elif isinstance(message, ResultMessage):
                         result_seen = True
                         self._record_result(normalized_chat_id, session, message)
@@ -485,6 +627,8 @@ class SessionManager:
                     raise SessionStateError(
                         "Claude Agent SDK ended without a ResultMessage"
                     )
+                if skill_audit:
+                    skill_audit.finish()
             except Exception:
                 if plan:
                     self._fail_missing_terminal_state(plan)
@@ -492,11 +636,21 @@ class SessionManager:
 
             visible_parts, hidden_text = control_filter.finish()
             for visible_text in visible_parts:
-                yield TextDelta(visible_text)
+                if not planning_intent:
+                    yield TextDelta(visible_text)
 
             if session.mode == PLAN_MODE:
-                trailing_text, analysis_plan = self._extract_analysis_plan(hidden_text)
-                if trailing_text:
+                trailing_text, analysis_plan = self._extract_analysis_plan(
+                    hidden_text, planning_intent
+                )
+                if planning_intent:
+                    # Control blocks are optional transport, never a condition
+                    # for persisting the validator's dependency/ambiguity state.
+                    analysis_plan = analysis_plan or self._build_analysis_plan(
+                        {"steps": []}, planning_intent
+                    )
+                    yield TextDelta(self._planning_summary(planning_intent))
+                elif trailing_text:
                     yield TextDelta(f"\n\n{trailing_text}")
                 if analysis_plan:
                     self._save_analysis_plan(normalized_chat_id, analysis_plan)
@@ -571,6 +725,116 @@ class SessionManager:
         finally:
             await client.disconnect()
 
+    async def _stream_semantic_turn(
+        self, messages: list[dict], chat_id: str, session: ManagedSession,
+    ) -> AsyncIterator[RuntimeEvent]:
+        """One model proposal, atomic backend admission, no planning tool calls."""
+        stored = self._load_analysis_plan(chat_id)
+        previous = self._planning_state(stored)
+        text = self._latest_user_message(messages)
+        if session.mode != PLAN_MODE:
+            await session.client.set_permission_mode(SDK_PLAN_PERMISSION_MODE)
+            session.mode = PLAN_MODE
+        # Revoke the old execution card before the first network request.
+        # Model timeout, disconnect or process restart cannot execute old scope.
+        guard = blocked_plan(previous, text, ["正在理解本轮需求，完成校验前不能执行。"], code="parsing")
+        guarded_card = self._build_analysis_plan({"steps": []}, guard)
+        self._carry_completed_run(guarded_card, stored)
+        self._save_analysis_plan(chat_id, guarded_card)
+        proposal = None
+        trace = {"source": "qwen"}
+        try:
+            proposal, trace = await self.semantic_planner.propose(text, previous, messages)
+            intent = admit_proposal(proposal, previous, text, check_files=True)
+        except PlannerFailure as exc:
+            trace.update(failure_code=exc.code, attempts=exc.attempts)
+            reason = "模型响应超时" if exc.code == "model_timeout" else (
+                "模型返回的方案或复核格式未通过校验" if exc.code in {"invalid_model_proposal", "invalid_semantic_review"} else "模型服务暂时不可用"
+            )
+            intent = blocked_plan(previous, text, [
+                reason + "，本次修改未应用，当前方案已暂停执行。请重试本轮需求。"
+            ], code=exc.code)
+        except (ProposalFormatError, ValueError, TypeError, KeyError) as exc:
+            trace.update(failure_code="invalid_proposal", error_type=type(exc).__name__)
+            intent = blocked_plan(previous, text, ["本轮候选方案未通过结构或状态校验。请重新明确需求；本次修改未应用，当前方案不能执行。"], code="invalid_proposal", proposal=proposal)
+        intent["planner_trace"] = trace
+        self._append_planning_audit(chat_id, text, proposal, intent)
+        if not intent.get("handled"):
+            if stored:
+                self._save_analysis_plan(chat_id, stored)
+            if intent.get("action") == "report":
+                for event in self._existing_report_events(stored):
+                    yield event
+                if "explain" in intent.get("tasks", []) and intent.get("message"):
+                    yield TextDelta("\n\n" + intent["message"])
+            else:
+                yield TextDelta(intent.get("message") or "请说明希望执行的步骤或修改的参数。")
+            session.last_used_at = time.time()
+            return
+        if intent.get("action") == "execute":
+            if stored:
+                self._save_analysis_plan(chat_id, stored)
+            yield TextDelta("方案已就绪，请通过执行入口确认启动。" if intent.get("ready_to_execute") else "当前方案仍有未解决的问题，暂时不能执行。")
+            if "explain" in intent.get("tasks", []) and intent.get("message"):
+                yield TextDelta("\n\n" + intent["message"])
+            if "report" in intent.get("tasks", []):
+                for event in self._existing_report_events(stored):
+                    yield event
+            return
+        draft = self._build_analysis_plan({"steps": []}, intent)
+        self._carry_completed_run(draft, stored)
+        self._save_analysis_plan(chat_id, draft)
+        yield TextDelta(self._planning_summary(intent))
+        if intent.get("model_message"):
+            yield TextDelta("\n\n" + intent["model_message"])
+        if intent.get("execution_deferred"):
+            yield TextDelta("\n\n本轮包含方案修改，请核对最新方案后通过执行入口确认启动。")
+        yield OutputItemAdded(draft)
+        if "report" in intent.get("tasks", []):
+            yield TextDelta("\n\n以下为修改前已完成分析的报告，新方案尚未执行。\n\n")
+            for event in self._existing_report_events(stored):
+                yield event
+        session.last_used_at = time.time()
+
+    def _carry_completed_run(self, draft: dict, stored: dict | None) -> None:
+        if not stored:
+            return
+        source = stored.get("last_completed_plan")
+        try:
+            if Path(stored.get("run", {}).get("state_path", "")).is_file() and self._run_succeeded(stored):
+                source = {key: value for key, value in stored.items() if key != "last_completed_plan"}
+        except (OSError, ValueError):
+            pass
+        if isinstance(source, dict):
+            draft["last_completed_plan"] = source
+
+    def _existing_report_events(self, stored: dict | None) -> list[RuntimeEvent]:
+        try:
+            if stored and not Path(stored.get("run", {}).get("state_path", "")).is_file():
+                stored = stored.get("last_completed_plan")
+            if not stored or not self._run_succeeded(stored):
+                return [TextDelta("当前会话还没有成功执行的结果报告；请先明确方案并完成分析。")]
+            state = json.loads(Path(stored["run"]["state_path"]).read_text(encoding="utf-8"))
+            evidence = collect_evidence(Path(stored["run"]["run_dir"]), state)
+            report = self._save_diagnostic_report(stored, render_fragment(state, evidence))
+        except (OSError, ValueError, KeyError):
+            if stored:
+                self._mark_report_failed(stored, "report_read_failed")
+            return [TextDelta("已有执行结果，但报告读取未通过校验，请检查结果文件；未重新计算。")]
+        return [TextDelta(summary_text(evidence)), OutputItemAdded(report)]
+
+    def _append_planning_audit(self, chat_id: str, text: str, proposal: dict | None, intent: dict) -> None:
+        path = self.config_dir / "bioagent" / "planning-audit" / (self._analysis_plan_path(chat_id).stem + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "at": time.time(), "user_text": text, "proposal": proposal,
+            "accepted": intent.get("accepted"), "ready_to_execute": intent.get("ready_to_execute"),
+            "plan_revision": intent.get("plan_revision"), "failure_code": intent.get("failure_code"),
+            "questions": intent.get("questions", []), "trace": intent.get("planner_trace"),
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     async def ensure_session(self, chat_id: str | None) -> None:
         normalized_chat_id = self._validate_chat_id(chat_id)
         await self._get_or_create_session(normalized_chat_id)
@@ -580,7 +844,7 @@ class SessionManager:
         stale_chat_ids: list[str] = []
         async with self._sessions_lock:
             for chat_id, session in self._sessions.items():
-                if now - session.last_used_at >= self.idle_timeout_seconds:
+                if not session.lock.locked() and now - session.last_used_at >= self.idle_timeout_seconds:
                     stale_chat_ids.append(chat_id)
             stale_sessions = [self._sessions.pop(chat_id) for chat_id in stale_chat_ids]
 
@@ -617,6 +881,11 @@ class SessionManager:
             return session
 
     async def _create_session(self, chat_id: str) -> ManagedSession:
+        if self.planning_backend == "model":
+            return ManagedSession(
+                client=PlanningSessionClient(), mode=PLAN_MODE, lock=asyncio.Lock(),
+                last_used_at=time.time(), bootstrapped=False, claude_session_id=None,
+            )
         claude_session_id = self._load_claude_session_id(chat_id)
         if claude_session_id:
             transcript = self.transcript_path(claude_session_id)
@@ -665,6 +934,7 @@ class SessionManager:
             permission_mode=permission_mode,
             resume=resume,
             model=config.MODEL,
+            effort=config.MODEL_EFFORT,
             include_partial_messages=True,
             cwd=self.project_root,
             add_dirs=config.EXTRA_DIRS,
@@ -672,8 +942,7 @@ class SessionManager:
             skills="all",
             env={
                 "ANTHROPIC_BASE_URL": config.ANTHROPIC_BASE_URL,
-                "ANTHROPIC_AUTH_TOKEN": config.MINIMAX_API_KEY,
-                "MINIMAX_API_KEY": config.MINIMAX_API_KEY,
+                "ANTHROPIC_AUTH_TOKEN": config.PROVIDER_AUTH_TOKEN,
                 "CLAUDE_CONFIG_DIR": str(self.sdk_config_dir),
                 "BIOAGENT_RUN_ROOT": str(self.analysis_run_root),
             },
@@ -686,10 +955,23 @@ class SessionManager:
 
     @staticmethod
     def _prefixed_prompt(
-        mode: str, prompt: str, plan: dict[str, Any] | None = None
+        mode: str,
+        prompt: str,
+        plan: dict[str, Any] | None = None,
+        planning_intent: dict[str, Any] | None = None,
     ) -> str:
         if mode == PLAN_MODE:
-            return f"{PLAN_PROMPT_PREFIX}\n\nUSER REQUEST:\n{prompt}"
+            context = ""
+            if planning_intent and planning_intent.get("handled"):
+                context = (
+                    "\n\nDETERMINISTIC PLANNING CONTEXT (backend validation; follow it):\n"
+                    "```json\n"
+                    + json.dumps(planning_intent, ensure_ascii=False, indent=2)
+                    + "\n```\n"
+                    "Do not add stages that are absent from this context. If questions "
+                    "or missing_dependencies are present, ask the user before execution."
+                )
+            return f"{PLAN_PROMPT_PREFIX}{context}\n\nUSER REQUEST:\n{prompt}"
         plan_json = json.dumps(plan, ensure_ascii=False, indent=2) if plan else "{}"
         return (
             f"{EXECUTE_PROMPT_PREFIX}\n\n"
@@ -812,7 +1094,11 @@ class SessionManager:
                 "the stored Claude session ID"
             )
 
-    def _extract_analysis_plan(self, text: str) -> tuple[str, dict[str, Any] | None]:
+    def _extract_analysis_plan(
+        self,
+        text: str,
+        planning_intent: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any] | None]:
         matches = list(ANALYSIS_PLAN_BLOCK_RE.finditer(text))
         visible = ANALYSIS_PLAN_BLOCK_RE.sub("", text).strip()
         if not matches:
@@ -823,7 +1109,7 @@ class SessionManager:
                 raw_plan = json.loads(match.group(1))
             except json.JSONDecodeError:
                 continue
-            plan = self._build_analysis_plan(raw_plan)
+            plan = self._build_analysis_plan(raw_plan, planning_intent)
             if plan:
                 return visible, plan
         return visible, None
@@ -838,7 +1124,11 @@ class SessionManager:
         fragment = matches[-1].group(1).strip()
         return visible, fragment or None
 
-    def _build_analysis_plan(self, raw_plan: Any) -> dict[str, Any] | None:
+    def _build_analysis_plan(
+        self,
+        raw_plan: Any,
+        planning_intent: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(raw_plan, dict) or not isinstance(
             raw_plan.get("steps"), list
         ):
@@ -869,8 +1159,30 @@ class SessionManager:
                     step["rules"] = normalized_rules
             steps.append(step)
 
-        if not steps:
+        if not steps and not planning_intent:
             return None
+
+        if planning_intent and planning_intent.get("handled"):
+            # Cards reflect the admitted planning result. Model proposals
+            # cannot override backend readiness or dependency admission.
+            steps = []
+            if planning_intent.get("steps"):
+                for raw_step in planning_intent["steps"]:
+                    if not isinstance(raw_step, dict):
+                        continue
+                    stage_id = raw_step.get("id")
+                    label = raw_step.get("label")
+                    if not isinstance(stage_id, str) or not isinstance(label, str):
+                        continue
+                    step = {"id": stage_id, "label": label}
+                    for key in ("tool", "rules", "depends_on", "produces", "is_deliverable"):
+                        if key in raw_step:
+                            step[key] = raw_step[key]
+                    steps.append(step)
+            ready = planning_intent.get("ready_to_execute") is True
+        else:
+            # A model-authored card without a validated scope is a proposal.
+            ready = False
 
         run_id = self._new_run_id()
         run_dir = self.analysis_run_root / run_id
@@ -879,10 +1191,10 @@ class SessionManager:
             "type": "analysis_plan",
             "id": f"analysis_plan_{run_id}",
             "status": "completed",
-            "title": raw_plan.get("title")
+            "title": "分析方案（待补充）" if planning_intent and not ready else raw_plan.get("title")
             if isinstance(raw_plan.get("title"), str)
             else "分析方案",
-            "ready_to_execute": raw_plan.get("ready_to_execute") is not False,
+            "ready_to_execute": ready,
             "run": {
                 "run_id": run_id,
                 "run_dir": str(run_dir),
@@ -891,6 +1203,22 @@ class SessionManager:
             },
             "steps": steps,
         }
+        if planning_intent and planning_intent.get("handled"):
+            plan["planning"] = planning_intent
+            if ready:
+                plan["execution_spec"] = planning_intent["execution_spec"]
+                plan["parameters"] = planning_intent.get("parameters", {})
+            for key in (
+                "plan_revision",
+                "base_plan_revision",
+                "scope_patch",
+                "parameter_patch",
+                "missing_dependencies",
+            ):
+                if key in planning_intent:
+                    plan[key] = planning_intent[key]
+            if planning_intent.get("questions"):
+                plan["clarifications"] = list(planning_intent["questions"])
         if isinstance(resource_estimate, dict):
             plan["resource_estimate"] = {
                 "eta": resource_estimate.get("eta"),
@@ -899,6 +1227,29 @@ class SessionManager:
                 "confidence": resource_estimate.get("confidence"),
             }
         return plan
+
+    @staticmethod
+    def _planning_summary(intent: dict[str, Any]) -> str:
+        parts = []
+        if intent.get("accepted") is False:
+            parts.append("本次修改未通过校验，原有参数和范围未应用本次修改。")
+        elif intent.get("steps"):
+            parts.append("本次范围：" + " → ".join(step["label"] for step in intent["steps"]) + "。")
+        if intent.get("parameter_patch"):
+            parts.append("参数修改：" + "；".join(
+                f"{key} = {value}" for key, value in intent["parameter_patch"].items()
+            ) + "。其余参数沿用当前方案。")
+        parts.extend(str(question) for question in intent.get("questions", []))
+        if intent.get("ready_to_execute"):
+            parts.append(f"方案版本 {intent.get('plan_revision', 1)} 已通过校验，确认执行后启动。")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _planning_state(plan: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(plan, dict):
+            return {}
+        state = plan.get("planning")
+        return dict(state) if isinstance(state, dict) else {}
 
     @staticmethod
     def _new_run_id() -> str:
@@ -944,6 +1295,34 @@ class SessionManager:
                 f"分析日志不在 BIOAGENT_RUN_ROOT 内：{log_path}；root={self.analysis_run_root}"
             )
 
+        state_path = run_dir / ".bioagent" / "state.json"
+        if state_path.exists():
+            try:
+                existing = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise SessionStateError(
+                    f"Cannot read existing analysis run state: {state_path}"
+                ) from exc
+            if (
+                not isinstance(existing, dict)
+                or existing.get("run_id") != run.get("run_id")
+                or existing.get("run_dir") != str(run_dir)
+                or not isinstance(existing.get("execution"), dict)
+                or not isinstance(existing.get("steps"), list)
+                or [step.get("id") for step in existing["steps"] if isinstance(step, dict)]
+                != [step.get("id") for step in plan.get("steps", []) if isinstance(step, dict)]
+                or (plan.get("execution_spec") and (
+                    existing.get("execution_spec") != plan["execution_spec"]
+                    or existing.get("plan_revision") != plan.get("plan_revision")
+                ))
+            ):
+                raise SessionStateError(
+                    f"Existing analysis run state does not match plan: {state_path}"
+                )
+            # Follow-up questions and report recovery reuse the same execution.
+            # Never erase completed steps or the recorded return code here.
+            return
+
         state = {
             "version": 1,
             "run_id": run.get("run_id"),
@@ -961,6 +1340,14 @@ class SessionManager:
                 if isinstance(step, dict) and step.get("id") and step.get("label")
             ],
             "resource_estimate": plan.get("resource_estimate"),
+            **({
+                "execution_spec": plan["execution_spec"],
+                "confirmed_plan": plan,
+                "plan_revision": plan.get("plan_revision"),
+                "parameters": plan.get("parameters", {}),
+                "parameter_patch": plan.get("parameter_patch", {}),
+                "confirmed_dependencies": plan.get("planning", {}).get("confirmed_dependencies", []),
+            } if plan.get("execution_spec") else {}),
             "execution": {
                 "started": True,
                 "status": "running",
@@ -1054,6 +1441,20 @@ class SessionManager:
         title = f"{title_base} · 诊断意见书"
         report_path = run_dir / DIAGNOSTIC_REPORT_FILENAME
         generated_at = int(time.time())
+        # Legacy model-authored reports predate the typed execution contract.
+        # Preserve recovery while explicitly marking unavailable provenance.
+        evidence_state = state if plan.get("execution_spec") else {**state, "steps": []}
+        evidence = collect_evidence(run_dir, evidence_state)
+        provenance = collect_provenance(run_dir, state, evidence["fastp"])
+        save_provenance(run_dir, provenance)
+        self._write_json_atomic(run_dir / ".bioagent/report-evidence.json", evidence)
+        # Only trusted, escaped code renders reference links. The model's
+        # fragment still passes the original strict validator above.
+        close_match = re.search(r"</article\s*>\s*$", fragment, re.IGNORECASE)
+        if close_match is None:
+            raise ValueError("Cannot locate the report article closing tag")
+        close_article = close_match.start()
+        fragment = fragment[:close_article] + render_appendix(provenance) + fragment[close_article:]
         document = self._render_diagnostic_report(title, fragment)
         self._write_text_atomic(report_path, document)
 
@@ -1062,6 +1463,8 @@ class SessionManager:
             "title": title,
             "path": str(report_path),
             "generated_at": generated_at,
+            "provenance_path": str(run_dir / "analysis-provenance.json"),
+            "bibliography_path": str(run_dir / "references.bib"),
         }
         self._write_json_atomic(state_path, state)
 

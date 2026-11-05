@@ -1,0 +1,434 @@
+{
+  "version": 1,
+  "tools": {
+    "fastp": {
+      "name": "fastp",
+      "executables": [
+        "fastp"
+      ],
+      "reference": "fastp"
+    },
+    "seqkit": {
+      "name": "SeqKit",
+      "executables": [
+        "seqkit"
+      ],
+      "reference": "seqkit"
+    },
+    "snakemake": {
+      "name": "Snakemake",
+      "executables": [
+        "snakemake"
+      ],
+      "reference": "snakemake"
+    },
+    "bowtie2": {
+      "name": "Bowtie 2",
+      "executables": [
+        "bowtie2",
+        "bowtie2-build"
+      ],
+      "reference": "bowtie2"
+    },
+    "megahit": {
+      "name": "MEGAHIT",
+      "executables": [
+        "megahit"
+      ],
+      "reference": "megahit"
+    },
+    "prodigal": {
+      "name": "Prodigal",
+      "executables": [
+        "prodigal"
+      ],
+      "reference": "prodigal"
+    },
+    "mmseqs2": {
+      "name": "MMseqs2",
+      "executables": [
+        "mmseqs"
+      ],
+      "reference": "mmseqs2"
+    },
+    "checkv": {
+      "name": "CheckV",
+      "executables": [
+        "checkv"
+      ],
+      "reference": "checkv"
+    },
+    "blast": {
+      "name": "BLAST+",
+      "executables": [
+        "blastn",
+        "blastp",
+        "blastx",
+        "makeblastdb"
+      ],
+      "reference": "blast"
+    },
+    "hmmer": {
+      "name": "HMMER",
+      "executables": [
+        "hmmsearch",
+        "hmmscan",
+        "hmmpress"
+      ],
+      "reference": "hmmer"
+    },
+    "kraken2": {
+      "name": "Kraken 2",
+      "executables": [
+        "kraken2"
+      ],
+      "reference": "kraken2"
+    },
+    "bracken": {
+      "name": "Bracken",
+      "executables": [
+        "bracken"
+      ],
+      "reference": "bracken"
+    },
+    "samtools": {
+      "name": "SAMtools",
+      "executables": [
+        "samtools"
+      ],
+      "reference": "samtools"
+    },
+    "diamond": {
+      "name": "DIAMOND",
+      "executables": [
+        "diamond"
+      ],
+      "reference": "diamond"
+    },
+    "dram": {
+      "name": "DRAM",
+      "executables": [
+        "DRAM.py",
+        "DRAM-v.py"
+      ],
+      "reference": "dram"
+    },
+    "bedtools": {
+      "name": "BEDTools",
+      "executables": [
+        "bedtools"
+      ],
+      "reference": "bedtools"
+    }
+  },
+  "references": {
+    "fastp": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1093/bioinformatics/bty560",
+      "title": "fastp: an ultra-fast all-in-one FASTQ preprocessor",
+      "authors": "Chen, Shifu and Zhou, Yanqing and Chen, Yaru and Gu, Jia",
+      "editors": "",
+      "year": "2018",
+      "journal": "Bioinformatics",
+      "volume": "34",
+      "issue": "17",
+      "pages": "i884-i890",
+      "publisher": "Oxford University Press (OUP)",
+      "isbn": "",
+      "issn": "1367-4803",
+      "url": "https://doi.org/10.1093/bioinformatics/bty560",
+      "verified_from": "https://api.crossref.org/works/10.1093%2Fbioinformatics%2Fbty560",
+      "verified_at": "2026-11-04T07:44:04.050710+00:00"
+    },
+    "seqkit": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1371/journal.pone.0163962",
+      "title": "SeqKit: A Cross-Platform and Ultrafast Toolkit for FASTA/Q File Manipulation",
+      "authors": "Shen, Wei and Le, Shuai and Li, Yan and Hu, Fuquan",
+      "editors": "Zou, Quan",
+      "year": "2016",
+      "journal": "PLOS ONE",
+      "volume": "11",
+      "issue": "10",
+      "pages": "e0163962",
+      "publisher": "Public Library of Science (PLoS)",
+      "isbn": "",
+      "issn": "1932-6203",
+      "url": "https://doi.org/10.1371/journal.pone.0163962",
+      "verified_from": "https://api.crossref.org/works/10.1371%2Fjournal.pone.0163962",
+      "verified_at": "2026-11-04T07:44:03.976019+00:00"
+    },
+    "snakemake": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.12688/f1000research.29032.2",
+      "title": "Sustainable data analysis with Snakemake",
+      "authors": "Mölder, Felix and Jablonski, Kim Philipp and Letcher, Brice and Hall, Michael B. and Tomkins-Tinch, Christopher H. and Sochat, Vanessa and Forster, Jan and Lee, Soohyun and Twardziok, Sven O. and Kanitz, Alexander and Wilm, Andreas and Holtgrewe, Manuel and Rahmann, Sven and Nahnsen, Sven and Köster, Johannes",
+      "editors": "",
+      "year": "2021",
+      "journal": "F1000Research",
+      "volume": "10",
+      "issue": "",
+      "pages": "33",
+      "publisher": "F1000 Research Ltd",
+      "isbn": "",
+      "issn": "2046-1402",
+      "url": "https://doi.org/10.12688/f1000research.29032.2",
+      "verified_from": "https://api.crossref.org/works/10.12688%2Ff1000research.29032.2",
+      "verified_at": "2026-11-04T07:44:05.835450+00:00"
+    },
+    "bowtie2": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1038/nmeth.1923",
+      "title": "Fast gapped-read alignment with Bowtie 2",
+      "authors": "Langmead, Ben and Salzberg, Steven L",
+      "editors": "",
+      "year": "2012",
+      "journal": "Nature Methods",
+      "volume": "9",
+      "issue": "4",
+      "pages": "357-359",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1548-7091",
+      "url": "https://doi.org/10.1038/nmeth.1923",
+      "verified_from": "https://api.crossref.org/works/10.1038%2Fnmeth.1923",
+      "verified_at": "2026-11-04T07:44:04.923553+00:00"
+    },
+    "megahit": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1093/bioinformatics/btv033",
+      "title": "MEGAHIT: an ultra-fast single-node solution for large and complex metagenomics assembly via succinct <i>de Bruijn</i> graph",
+      "authors": "Li, Dinghua and Liu, Chi-Man and Luo, Ruibang and Sadakane, Kunihiko and Lam, Tak-Wah",
+      "editors": "",
+      "year": "2015",
+      "journal": "Bioinformatics",
+      "volume": "31",
+      "issue": "10",
+      "pages": "1674-1676",
+      "publisher": "Oxford University Press (OUP)",
+      "isbn": "",
+      "issn": "1367-4811",
+      "url": "https://doi.org/10.1093/bioinformatics/btv033",
+      "verified_from": "https://api.crossref.org/works/10.1093%2Fbioinformatics%2Fbtv033",
+      "verified_at": "2026-11-04T07:44:05.745721+00:00"
+    },
+    "prodigal": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1186/1471-2105-11-119",
+      "title": "Prodigal: prokaryotic gene recognition and translation initiation site identification",
+      "authors": "Hyatt, Doug and Chen, Gwo-Liang and LoCascio, Philip F and Land, Miriam L and Larimer, Frank W and Hauser, Loren J",
+      "editors": "",
+      "year": "2010",
+      "journal": "BMC Bioinformatics",
+      "volume": "11",
+      "issue": "1",
+      "pages": "119",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1471-2105",
+      "url": "https://doi.org/10.1186/1471-2105-11-119",
+      "note": "Uses article number in place of page range (Crossref).",
+      "verified_from": "https://api.crossref.org/works/10.1186%2F1471-2105-11-119",
+      "verified_at": "2026-11-04T07:44:07.431282+00:00"
+    },
+    "mmseqs2": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1038/nbt.3988",
+      "title": "MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets",
+      "authors": "Steinegger, Martin and Söding, Johannes",
+      "editors": "",
+      "year": "2017",
+      "journal": "Nature Biotechnology",
+      "volume": "35",
+      "issue": "11",
+      "pages": "1026-1028",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1087-0156",
+      "url": "https://doi.org/10.1038/nbt.3988",
+      "verified_from": "https://api.crossref.org/works/10.1038%2Fnbt.3988",
+      "verified_at": "2026-11-04T07:44:07.244569+00:00"
+    },
+    "checkv": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1038/s41587-020-00774-7",
+      "title": "CheckV assesses the quality and completeness of metagenome-assembled viral genomes",
+      "authors": "Nayfach, Stephen and Camargo, Antonio Pedro and Schulz, Frederik and Eloe-Fadrosh, Emiley and Roux, Simon and Kyrpides, Nikos C.",
+      "editors": "",
+      "year": "2021",
+      "journal": "Nature Biotechnology",
+      "volume": "39",
+      "issue": "5",
+      "pages": "578-585",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1087-0156",
+      "url": "https://doi.org/10.1038/s41587-020-00774-7",
+      "verified_from": "https://api.crossref.org/works/10.1038%2Fs41587-020-00774-7",
+      "verified_at": "2026-11-04T07:44:08.103827+00:00"
+    },
+    "blast": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1186/1471-2105-10-421",
+      "title": "BLAST+: architecture and applications",
+      "authors": "Camacho, Christiam and Coulouris, George and Avagyan, Vahram and Ma, Ning and Papadopoulos, Jason and Bealer, Kevin and Madden, Thomas L",
+      "editors": "",
+      "year": "2009",
+      "journal": "BMC Bioinformatics",
+      "volume": "10",
+      "issue": "1",
+      "pages": "421",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1471-2105",
+      "url": "https://doi.org/10.1186/1471-2105-10-421",
+      "note": "Uses article number in place of page range (Crossref).",
+      "verified_from": "https://api.crossref.org/works/10.1186%2F1471-2105-10-421",
+      "verified_at": "2026-11-04T07:44:09.231281+00:00"
+    },
+    "hmmer": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1371/journal.pcbi.1002195",
+      "title": "Accelerated Profile HMM Searches",
+      "authors": "Eddy, Sean R.",
+      "editors": "Pearson, William R.",
+      "year": "2011",
+      "journal": "PLoS Computational Biology",
+      "volume": "7",
+      "issue": "10",
+      "pages": "e1002195",
+      "publisher": "Public Library of Science (PLoS)",
+      "isbn": "",
+      "issn": "1553-7358",
+      "url": "https://doi.org/10.1371/journal.pcbi.1002195",
+      "verified_from": "https://api.crossref.org/works/10.1371%2Fjournal.pcbi.1002195",
+      "verified_at": "2026-11-04T07:44:08.941960+00:00"
+    },
+    "kraken2": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1186/s13059-019-1891-0",
+      "title": "Improved metagenomic analysis with Kraken 2",
+      "authors": "Wood, Derrick E. and Lu, Jennifer and Langmead, Ben",
+      "editors": "",
+      "year": "2019",
+      "journal": "Genome Biology",
+      "volume": "20",
+      "issue": "1",
+      "pages": "257",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1474-760X",
+      "url": "https://doi.org/10.1186/s13059-019-1891-0",
+      "note": "Uses article number in place of page range (Crossref).",
+      "verified_from": "https://api.crossref.org/works/10.1186%2Fs13059-019-1891-0",
+      "verified_at": "2026-11-04T07:44:11.691444+00:00"
+    },
+    "bracken": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.7717/peerj-cs.104",
+      "title": "Bracken: estimating species abundance in metagenomics data",
+      "authors": "Lu, Jennifer and Breitwieser, Florian P. and Thielen, Peter and Salzberg, Steven L.",
+      "editors": "",
+      "year": "2017",
+      "journal": "PeerJ Computer Science",
+      "volume": "3",
+      "issue": "",
+      "pages": "e104",
+      "publisher": "PeerJ",
+      "isbn": "",
+      "issn": "2376-5992",
+      "url": "https://doi.org/10.7717/peerj-cs.104",
+      "verified_from": "https://api.crossref.org/works/10.7717%2Fpeerj-cs.104",
+      "verified_at": "2026-11-04T07:44:10.109179+00:00"
+    },
+    "samtools": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1093/gigascience/giab008",
+      "title": "Twelve years of SAMtools and BCFtools",
+      "authors": "Danecek, Petr and Bonfield, James K and Liddle, Jennifer and Marshall, John and Ohan, Valeriu and Pollard, Martin O and Whitwham, Andrew and Keane, Thomas and McCarthy, Shane A and Davies, Robert M and Li, Heng",
+      "editors": "",
+      "year": "2021",
+      "journal": "GigaScience",
+      "volume": "10",
+      "issue": "2",
+      "pages": "giab008",
+      "publisher": "Oxford University Press (OUP)",
+      "isbn": "",
+      "issn": "2047-217X",
+      "url": "https://doi.org/10.1093/gigascience/giab008",
+      "note": "Uses article number in place of page range (Crossref).",
+      "verified_from": "https://api.crossref.org/works/10.1093%2Fgigascience%2Fgiab008",
+      "verified_at": "2026-11-04T07:44:11.780430+00:00"
+    },
+    "diamond": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1038/s41592-021-01101-x",
+      "title": "Sensitive protein alignments at tree-of-life scale using DIAMOND",
+      "authors": "Buchfink, Benjamin and Reuter, Klaus and Drost, Hajk-Georg",
+      "editors": "",
+      "year": "2021",
+      "journal": "Nature Methods",
+      "volume": "18",
+      "issue": "4",
+      "pages": "366-368",
+      "publisher": "Springer Science and Business Media LLC",
+      "isbn": "",
+      "issn": "1548-7091",
+      "url": "https://doi.org/10.1038/s41592-021-01101-x",
+      "verified_from": "https://api.crossref.org/works/10.1038%2Fs41592-021-01101-x",
+      "verified_at": "2026-11-04T07:44:12.552826+00:00"
+    },
+    "dram": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1093/nar/gkaa621",
+      "title": "DRAM for distilling microbial metabolism to automate the curation of microbiome function",
+      "authors": "Shaffer, Michael and Borton, Mikayla A and McGivern, Bridget B and Zayed, Ahmed A and La Rosa, Sabina Leanti and Solden, Lindsey M and Liu, Pengfei and Narrowe, Adrienne B and Rodríguez-Ramos, Josué and Bolduc, Benjamin and Gazitúa, M Consuelo and Daly, Rebecca A and Smith, Garrett J and Vik, Dean R and Pope, Phil B and Sullivan, Matthew B and Roux, Simon and Wrighton, Kelly C",
+      "editors": "",
+      "year": "2020",
+      "journal": "Nucleic Acids Research",
+      "volume": "48",
+      "issue": "16",
+      "pages": "8883-8900",
+      "publisher": "Oxford University Press (OUP)",
+      "isbn": "",
+      "issn": "0305-1048",
+      "url": "https://doi.org/10.1093/nar/gkaa621",
+      "verified_from": "https://api.crossref.org/works/10.1093%2Fnar%2Fgkaa621",
+      "verified_at": "2026-11-04T07:44:12.642621+00:00"
+    },
+    "bedtools": {
+      "type": "doi",
+      "entry_type": "article",
+      "doi": "10.1093/bioinformatics/btq033",
+      "title": "BEDTools: a flexible suite of utilities for comparing genomic features",
+      "authors": "Quinlan, Aaron R. and Hall, Ira M.",
+      "editors": "",
+      "year": "2010",
+      "journal": "Bioinformatics",
+      "volume": "26",
+      "issue": "6",
+      "pages": "841-842",
+      "publisher": "Oxford University Press (OUP)",
+      "isbn": "",
+      "issn": "1367-4811",
+      "url": "https://doi.org/10.1093/bioinformatics/btq033",
+      "verified_from": "https://api.crossref.org/works/10.1093%2Fbioinformatics%2Fbtq033",
+      "verified_at": "2026-11-04T07:44:13.848563+00:00"
+    }
+  }
+}

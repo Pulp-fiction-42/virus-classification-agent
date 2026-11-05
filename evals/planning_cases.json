@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "provenance": "人工编写的功能回归样例，覆盖本次用户要求；不是专家金标准或模型能力统计评估。",
+  "cases": [
+    {"id": "intent_qc_only", "task": "intent", "turns": ["只做质控"], "expected": {"ready_to_execute": true, "goals": ["read_qc"], "selected": ["read_qc"]}},
+    {"id": "intent_bare_w1", "task": "intent", "turns": ["只做W1"], "expected": {"ready_to_execute": false, "ambiguous_workflows": ["workflow1"]}},
+    {"id": "intent_bare_w2", "task": "intent", "turns": ["只做W2"], "expected": {"ready_to_execute": false, "ambiguous_workflows": ["workflow2"]}},
+    {"id": "intent_assembly_endpoint", "task": "intent", "turns": ["W1做到组装为止"], "expected": {"ready_to_execute": true, "goals": ["assembly"], "selected": ["read_qc", "rrna_filter", "sample_merge", "assembly"]}},
+    {"id": "intent_missing_contigs", "task": "intent", "turns": ["W2只提取病毒候选，后面的证据分析先不做"], "expected": {"ready_to_execute": false, "goals": ["virus_candidate_extract"], "missing_dependencies": ["read_qc", "rrna_filter", "sample_merge", "assembly", "contig_filter"]}},
+    {"id": "intent_dependency_consent", "task": "intent", "turns": ["W2只提取病毒候选", "同意补跑W1"], "expected": {"ready_to_execute": true, "goals": ["virus_candidate_extract"]}},
+    {"id": "intent_dependency_refusal", "task": "intent", "turns": ["W2只提取病毒候选", "不补跑W1"], "expected": {"ready_to_execute": false, "goals": ["virus_candidate_extract"]}},
+    {"id": "intent_existing_contigs", "task": "intent", "turns": ["W2只提取病毒候选", "提供已有contigs：{contigs}"], "expected": {"ready_to_execute": true, "selected": ["virus_sequence_prep", "virus_candidate_search", "virus_candidate_extract"]}},
+    {"id": "intent_partial_groups", "task": "intent", "turns": ["完整执行W1，W2只提取病毒候选"], "expected": {"ready_to_execute": true, "goals": ["contig_filter", "virus_candidate_extract"]}},
+    {"id": "intent_excluded_dependency", "task": "intent", "turns": ["W1做到组装，但不要去rRNA"], "expected": {"ready_to_execute": false, "missing_dependencies": ["rrna_filter"]}},
+    {"id": "param_preserve_scope", "task": "param_suggest", "turns": ["完整执行W1，W2只提取病毒候选", "fastp最短长度改成80，其他不变"], "expected": {"ready_to_execute": true, "goals": ["contig_filter", "virus_candidate_extract"], "parameter_patch": {"fastp.length_required": 80}, "scope_patch": {}}},
+    {"id": "param_chinese_integer", "task": "param_suggest", "turns": ["只做质控", "fastp最短长度改成八十"], "expected": {"ready_to_execute": true, "parameter_patch": {"fastp.length_required": 80}}},
+    {"id": "param_bounds", "task": "param_suggest", "turns": ["只做质控", "fastp.length_required改成-10"], "expected": {"ready_to_execute": false, "accepted": false, "parameter_patch": {}}},
+    {"id": "param_ambiguous_length", "task": "param_suggest", "turns": ["完整执行W1", "最短长度改成80"], "expected": {"ready_to_execute": false, "accepted": false, "parameter_patch": {}}},
+    {"id": "param_boolean", "task": "param_suggest", "turns": ["只做质控", "关闭fastp去重"], "expected": {"ready_to_execute": true, "parameter_patch": {"fastp.dedup": false}, "scope_patch": {}}},
+    {"id": "param_unknown", "task": "param_suggest", "turns": ["只做质控", "fastp.unknown_flag改成1"], "expected": {"ready_to_execute": false, "accepted": false, "parameter_patch": {}}}
+  ]
+}

@@ -1,19 +1,32 @@
+# Local source mirror; credentials are read from environment only.
 """Static configuration for the BioAgent runtime."""
 
 import os
+import getpass
+import tempfile
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-MODEL = "MiniMax-M3"
-ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic"
-MINIMAX_API_KEY = "sk-cp-2s7sx6WFkXWrcMxnR6X0Ls_uh1wKJHx59YGtPSP0ftdA9It1UIrhkE2nAQ36TIUniZfgXokV0IcSMFeIoWdyR1dI4nxE0oFYU9PNLHcsEKAkoy13DgYQ6T4"
+MODEL = os.getenv("BIOAGENT_MODEL", "qwen3.8-27b")
+MODEL_EFFORT = os.getenv("BIOAGENT_EFFORT") or None
+ANTHROPIC_BASE_URL = os.getenv(
+    "ANTHROPIC_BASE_URL", "http://172.24.195.65:8000"
+)
+MINIMAX_API_KEY = os.getenv('MINIMAX_API_KEY', "")
+PROVIDER_AUTH_TOKEN = os.getenv("PROVIDER_AUTH_TOKEN") or os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+
+# Bounded, tool-free semantic planner. Authentication remains environment-owned.
+PLANNER_BASE_URL = os.getenv("BIOAGENT_PLANNER_BASE_URL", ANTHROPIC_BASE_URL).rstrip("/")
+PLANNER_MODEL = os.getenv("BIOAGENT_PLANNER_MODEL", MODEL)
+PLANNER_TIMEOUT_SECONDS = float(os.getenv("BIOAGENT_PLANNER_TIMEOUT_SECONDS", "75"))
 
 CLAUDE_STATE_DIR = PROJECT_ROOT / ".claude" / "sessions"
+_RUNTIME_UID = getattr(os, "getuid", getpass.getuser)()
 CLAUDE_RUNTIME_CONFIG_DIR = Path(
     os.getenv(
-        "CLAUDE_RUNTIME_CONFIG_DIR", f"/tmp/bioagent-claude-runtime-{os.getuid()}"
+        "CLAUDE_RUNTIME_CONFIG_DIR", str(Path(tempfile.gettempdir()) / f"bioagent-claude-runtime-{_RUNTIME_UID}")
     )
 )
 SESSION_IDLE_TIMEOUT_SECONDS = 30 * 60
@@ -28,13 +41,17 @@ SYSTEM_PROMPT = """You are BioAgent, a bioinformatics agent specialized in virus
 Default to plan behavior unless the user request is explicitly wrapped by the runtime execute-mode prefix.
 
 Plan behavior:
+- W1-W6 are workflow groups, not mandatory whole-workflow selections. Ask for stages or an endpoint when a bare group name is ambiguous.
+- Follow the runtime's DETERMINISTIC PLANNING CONTEXT for selected stages, parameters, readiness and questions. It overrides model-authored analysis_plan fields.
+- Missing prerequisites do not grant permission to add analysis scope. W2 requires contigs; with raw reads, ask permission for the displayed W1 prerequisite stages or ask for existing contigs. Never execute before resolving this.
+- A parameter-only edit preserves the existing scope, inputs, exclusions and every other parameter. Unsupported, ambiguous, invalid or stale patches require clarification.
 - Understand the user's analysis goal and propose the concrete biological analysis flow.
 - Do not create run directories, write workflow configuration, run dry-runs, launch Snakemake, or otherwise mutate files.
 - Do not emphasize internal workflow names such as workflow1 or workflow2 in user-facing answers. Treat fixed workflows as implementation details.
 - If the user changes requirements in natural language, produce a complete updated plan rather than a diff.
 - Treat the fixed workflow's tool flags, reference databases, presets, and thresholds as executable defaults. Do not ask the user to choose them and do not mark a plan unready merely because the user did not specify them.
-- A supported plan is ready_to_execute when the analysis goal, input files, and required sample relationships are clear. Set it to false only when one of those required user-level facts is missing or ambiguous.
-- Interpret qualitative requests such as looser quality control or skipping assembly, and reflect the result directly in the complete updated step list. Omitted steps must not run later.
+- A supported plan is ready_to_execute only after the backend validates its goal, typed inputs, sample relationships, parameter rules, and authorization for every required stage.
+- Clarify qualitative parameter requests such as looser quality control when no maintained preset defines them. Skipping a necessary prerequisite requires an appropriate intermediate input; do not silently shorten the goal.
 - When ready_to_execute is false, explain the missing user-level information in plain language before the analysis_plan block. Do not expose tool flags or ask technical parameter questions.
 - When a plan can be represented for the Open WebUI /analysis page, append exactly one Markdown fenced block with info string analysis_plan.
 - The analysis_plan block is an internal control block. It must contain valid JSON only: no comments, no trailing commas, and no Markdown inside the JSON.
@@ -64,7 +81,7 @@ Final block format and JSON contract:
 
 Field rules:
 - version is currently 1.
-- ready_to_execute is false only when required input files, analysis intent, or sample relationships are still unclear; workflow parameter defaults never block execution.
+- ready_to_execute is false while required inputs, intent, sample relationships, parameter validation or prerequisite authorization are unresolved; workflow parameter defaults never block execution.
 - steps is required and ordered by the user-understandable analysis flow.
 - each step needs label; tool is optional and should be omitted when uncertain.
 - rules is optional internal metadata listing the Snakemake rule names represented by the user-facing step. Include it for every matched fixed workflow step; one step may contain multiple rules.

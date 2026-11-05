@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import uuid
+from unittest.mock import patch
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,6 +107,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             client_factory=FakeClient,
             idle_timeout_seconds=60 * 60,
             analysis_run_root=self.run_root,
+            allow_legacy_execution=True,  # Explicit fixture for historical SDK execution tests.
+            planning_backend="legacy",  # Historical transport/router regression only.
         )
         self.chat_id = str(uuid.uuid4())
 
@@ -174,7 +177,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
     def test_sdk_runtime_projects_link_targets_persistent_transcripts(self):
         projects_link = self.manager.sdk_config_dir / "projects"
 
-        self.assertTrue(projects_link.is_symlink())
+        self.assertTrue(
+            projects_link.is_symlink() or projects_link.resolve() == self.manager.projects_dir
+        )
         self.assertEqual(projects_link.resolve(), self.manager.projects_dir)
 
     async def test_plan_mode_calls_sdk_permission_mode(self):
@@ -307,7 +312,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         item = output_items[0]
         self.assertEqual(item["type"], "analysis_plan")
         self.assertEqual(item["title"], "测序质控与分类方案")
-        self.assertTrue(item["ready_to_execute"])
+        # Model-authored steps alone cannot authorize an executable plan.
+        self.assertFalse(item["ready_to_execute"])
         self.assertEqual([step["label"] for step in item["steps"]], ["质控", "分类"])
         self.assertEqual(item["steps"][0]["rules"], ["fastp"])
         self.assertEqual(item["steps"][1]["rules"], ["classify", "summarize"])
@@ -437,6 +443,52 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(state["execution"]["ok"], False)
         self.assertEqual(state["execution"]["returncode"], -1)
 
+    async def test_execute_followup_preserves_completed_run_for_report_recovery(self):
+        plan = self.ready_plan()
+        self.manager._save_analysis_plan(self.chat_id, plan)
+        self.manager._write_initial_run_state(plan)
+        self.finish_run(plan)
+        state_path = Path(plan["run"]["state_path"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["results_dir"] = str(Path(plan["run"]["run_dir"]) / "results")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        FakeClient.response_text_parts = [
+            '读取已有结果。\n```diagnostic_report\n'
+            '<article class="diagnostic-report"><h1>已有结果</h1></article>\n```'
+        ]
+
+        events = [event async for event in self.manager.stream_turn(MESSAGES, self.chat_id)]
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["execution"], state["execution"])
+        self.assertEqual(saved["steps"], state["steps"])
+        self.assertEqual(saved["results_dir"], state["results_dir"])
+        self.assertEqual(saved["report"]["status"], "completed")
+        self.assertTrue(any(isinstance(e, OutputItemAdded) for e in events))
+
+    def test_existing_failed_run_is_not_reset_before_retry(self):
+        plan = self.ready_plan()
+        self.manager._write_initial_run_state(plan)
+        self.finish_run(plan, ok=False)
+        state_path = Path(plan["run"]["state_path"])
+        before = state_path.read_bytes()
+
+        self.manager._write_initial_run_state(plan)
+
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_corrupt_existing_run_state_is_not_overwritten(self):
+        plan = self.ready_plan()
+        self.manager._write_initial_run_state(plan)
+        state_path = Path(plan["run"]["state_path"])
+        state_path.write_text("not json", encoding="utf-8")
+
+        with self.assertRaisesRegex(SessionStateError, "Cannot read existing"):
+            self.manager._write_initial_run_state(plan)
+
+        self.assertEqual(state_path.read_text(encoding="utf-8"), "not json")
+
     async def test_execute_create_state_error_is_clear(self):
         blocked_root = Path(self.temp_dir.name) / "blocked-run-root"
         blocked_root.write_text("not a directory", encoding="utf-8")
@@ -449,6 +501,8 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             client_factory=FakeClient,
             idle_timeout_seconds=60 * 60,
             analysis_run_root=blocked_root,
+            allow_legacy_execution=True,
+            planning_backend="legacy",
         )
         run_id = "analysis-20260709-120000-blocked1"
         run_dir = blocked_root / run_id
@@ -499,7 +553,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
   <header><h1>诊断意见书</h1><p class="review-status">待专家审核</p></header>
   <section><h2>实际分析范围</h2><ul><li>质控</li><li>分类</li></ul></section>
   <section><h2>诊断意见</h2><p><strong>结果</strong>来自本次分析。</p></section>
-</article>
+</article >
 ```
 """,
         ]
@@ -530,6 +584,9 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('<article class="diagnostic-report">', document)
         self.assertEqual(state["report"]["status"], "completed")
         self.assertEqual(state["report"]["path"], str(report_path))
+        self.assertIn("方法、软件与引用", document)
+        self.assertTrue((report_path.parent / "analysis-provenance.json").is_file())
+        self.assertTrue((report_path.parent / "references.bib").is_file())
 
     async def test_successful_execute_rejects_unsafe_report_fragment(self):
         plan = self.ready_plan()
@@ -635,6 +692,7 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
             sdk_config_dir=self.manager.sdk_config_dir,
             client_factory=FakeClient,
             idle_timeout_seconds=60 * 60,
+            planning_backend="legacy",
         )
         [chunk async for chunk in recreated.stream_turn(MESSAGES, self.chat_id)]
 
@@ -666,6 +724,22 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run workflow1", prompt)
         self.assertNotIn("/execute", prompt)
         self.assertNotIn("已切换到 execute mode", prompt)
+
+    async def test_sdk_provider_uses_configured_model_effort_and_auth(self):
+        with (
+            patch.object(config, "MODEL", "qwen3.8-27b"),
+            patch.object(config, "MODEL_EFFORT", "xhigh"),
+            patch.object(config, "ANTHROPIC_BASE_URL", "http://dgx.example:8000"),
+            patch.object(config, "PROVIDER_AUTH_TOKEN", "provider-test-token"),
+        ):
+            options = self.manager._build_options(
+                permission_mode=runtime.SDK_PLAN_PERMISSION_MODE
+            )
+        self.assertEqual(options.model, "qwen3.8-27b")
+        self.assertEqual(options.effort, "xhigh")
+        self.assertEqual(options.env["ANTHROPIC_BASE_URL"], "http://dgx.example:8000")
+        self.assertEqual(options.env["ANTHROPIC_AUTH_TOKEN"], "provider-test-token")
+        self.assertNotIn("MINIMAX_API_KEY", options.env)
 
     async def test_sdk_options_load_all_skills_and_all_builtin_tools(self):
         await self.manager.ensure_session(self.chat_id)
@@ -717,6 +791,95 @@ class SessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("omitting empty sections", config.SYSTEM_PROMPT)
         self.assertIn("ICTV virus taxonomy", config.SYSTEM_PROMPT)
         self.assertIn("ictv_family_info", config.SYSTEM_PROMPT)
+
+    async def test_backend_overrides_model_scope_and_preserves_stage_ids(self):
+        r1, r2 = self.manager.project_root / "demo_R1.fq", self.manager.project_root / "demo_R2.fq"
+        r1.touch()
+        r2.touch()
+        FakeClient.response_text_parts = ['自动加跑组装。```analysis_plan\n' + json.dumps({
+            "ready_to_execute": True, "steps": [{"label": "组装", "rules": ["megahit"]}]
+        }) + '\n```']
+        events = [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": f"只做质控。{r1} {r2}"}
+        ], self.chat_id)]
+        plan = [event.item for event in events if isinstance(event, OutputItemAdded)][0]
+        self.assertTrue(plan["ready_to_execute"])
+        self.assertEqual([step["id"] for step in plan["steps"]], ["read_qc"])
+        self.assertEqual(plan["steps"][0]["rules"], ["fastp"])
+        self.assertNotIn("自动加跑组装", "".join(self.texts(events)))
+        self.assertIn("DETERMINISTIC PLANNING CONTEXT", FakeClient.instances[0].queries[0][0])
+
+    async def test_missing_dependencies_persist_even_without_model_control_block(self):
+        r1, r2 = self.manager.project_root / "demo_R1.fq", self.manager.project_root / "demo_R2.fq"
+        r1.touch()
+        r2.touch()
+        FakeClient.response_text_parts = ["立即执行。"]
+        events = [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": f"W2只提取病毒候选，后面的证据分析先不做。{r1} {r2}"}
+        ], self.chat_id)]
+        plan = self.manager._load_analysis_plan(self.chat_id)
+        self.assertFalse(plan["ready_to_execute"])
+        self.assertIn("assembly", plan["planning"]["missing_dependencies"])
+        self.assertFalse(self.run_root.exists())
+        self.assertIn("contigs", "".join(self.texts(events)))
+        self.assertNotIn("立即执行", "".join(self.texts(events)))
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        blocked = [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": "确认启动分析"}
+        ], self.chat_id)]
+        self.assertIn("请先生成", "".join(self.texts(blocked)))
+        self.assertFalse(self.run_root.exists())
+
+    async def test_runtime_multiturn_dependency_consent_and_parameter_change(self):
+        r1, r2 = self.manager.project_root / "demo_R1.fq", self.manager.project_root / "demo_R2.fq"
+        r1.touch()
+        r2.touch()
+        requests = [f"W2只提取病毒候选。{r1} {r2}", "同意补跑W1", "fastp最短长度改成八十"]
+        for request in requests:
+            [event async for event in self.manager.stream_turn([{"role": "user", "content": request}], self.chat_id)]
+        plan = self.manager._load_analysis_plan(self.chat_id)
+        self.assertTrue(plan["ready_to_execute"])
+        self.assertEqual(plan["planning"]["goals"], ["virus_candidate_extract"])
+        self.assertEqual(plan["parameters"], {"fastp.length_required": 80})
+        self.assertEqual(plan["plan_revision"], 3)
+        self.assertEqual(plan["scope_patch"], {})
+
+    async def test_ambiguous_new_scope_invalidates_previous_ready_card(self):
+        self.manager._save_analysis_plan(self.chat_id, self.ready_plan())
+        [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": "只做W2"}
+        ], self.chat_id)]
+        plan = self.manager._load_analysis_plan(self.chat_id)
+        self.assertFalse(plan["ready_to_execute"])
+        self.assertEqual(plan["planning"]["ambiguous_workflows"], ["workflow2"])
+
+    async def test_edit_in_execute_mode_returns_to_planning_without_starting_run(self):
+        r1, r2 = self.manager.project_root / "demo_R1.fq", self.manager.project_root / "demo_R2.fq"
+        r1.touch()
+        r2.touch()
+        [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": f"只做质控。{r1} {r2}"}
+        ], self.chat_id)]
+        previous = self.manager._load_analysis_plan(self.chat_id)
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": "fastp最短长度改成80"}
+        ], self.chat_id)]
+        updated = self.manager._load_analysis_plan(self.chat_id)
+        self.assertEqual(self.manager.current_mode(self.chat_id), PLAN_MODE)
+        self.assertEqual(updated["planning"]["goals"], previous["planning"]["goals"])
+        self.assertEqual(updated["parameters"], {"fastp.length_required": 80})
+        self.assertFalse(self.run_root.exists())
+
+    async def test_legacy_plan_cannot_start_in_default_runtime(self):
+        self.manager.allow_legacy_execution = False
+        self.manager._save_analysis_plan(self.chat_id, self.ready_plan())
+        await self.manager.set_mode(self.chat_id, EXECUTE_MODE)
+        events = [event async for event in self.manager.stream_turn([
+            {"role": "user", "content": "确认启动分析"}
+        ], self.chat_id)]
+        self.assertIn("旧版方案", "".join(self.texts(events)))
+        self.assertFalse(self.run_root.exists())
 
     def test_gatekeeper_skill_contains_minimal_analysis_contract(self):
         skill_path = (
