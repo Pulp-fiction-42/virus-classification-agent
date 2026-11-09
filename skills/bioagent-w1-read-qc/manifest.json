@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "bioagent-w1-read-qc",
+  "version": "1.0.0",
+  "capability_id": "workflow1.read_qc.fastp",
+  "stage_id": "read_qc",
+  "tool": {
+    "id": "fastp",
+    "version": "1.3.2"
+  },
+  "preset_id": "workflow_default",
+  "defaults": {
+    "average_qual": 20,
+    "detect_adapter_for_pe": true,
+    "length_required": 50,
+    "n_base_limit": 5,
+    "qualified_quality_phred": 20
+  },
+  "parameters": [
+    "average_qual",
+    "detect_adapter_for_pe",
+    "length_required",
+    "n_base_limit",
+    "qualified_quality_phred",
+    "unqualified_percent_limit"
+  ],
+  "input_artifacts": ["raw_paired_reads"],
+  "output_artifacts": ["qc_paired_reads", "fastp_json", "fastp_html"],
+  "compile_adapter": "workflow1.read_qc.fastp"
+}

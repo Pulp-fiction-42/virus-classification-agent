@@ -1,127 +1,76 @@
 # BioAgent Runtime
 
-BioAgent 是 Open WebUI 与 Claude Agent SDK 之间的 OpenAI-compatible runtime，面向病毒分类和固定 Snakemake 生物信息学工作流。
+BioAgent 为 Open WebUI 提供 OpenAI-compatible adapter、可替换的结构化生成 provider 和固定 Workflow 1–6 的 deterministic planner。macOS 模式下，编排在本机运行，所有数据访问和 Snakemake 执行通过 SSH worker 留在 Cyclone。
 
-## 本次改进
+## 主要接口
 
-- 引入 `/plan` 和 `/execute` 模式切换，并为 Open WebUI `chat_id` 保存持久 Claude SDK session 映射。
-- `plan` mode 使用 `dontAsk` permission mode，并注入 BioAgent 方案协议，避免进入 Claude Code Plan/ExitPlanMode；`execute` mode 在用户请求前追加 `遵循之前计划模式下生成的计划执行`。
-- 固定 Snakemake workflow gatekeeper 改为一次确认后直接执行，取消 dry-run 和第二次确认。
-- `plan` mode 通过内部 `analysis_plan` control block 生成隐藏结构化 output item；`execute` mode 使用同一个 run reservation 写入标准 `.bioagent/state.json`，成功后将 agent 生成的语义化 HTML fragment 套用统一样式并写入 `diagnostic-opinion.html`。
-- 集成 TaxonAgent MCP Server；遇到 ICTV 病毒分类、划界标准、marker gene 或 genome type 查询时，runtime 可自动调用 `ictv_family_info`。
+- `/v1/models`、`/v1/chat/completions`：OpenAI-compatible 对话。
+- `/v1/analysis/plans/compile`：确定性编译分析方案。
+- `/v1/analysis/runs/start`：验证 dataset revision 后排队远端 run。
+- `/v1/analysis/runs/resume`：仅对具备冻结恢复契约的 `interrupted` run 重新校验并追加 attempt；旧 run 或依赖身份不完整时拒绝原地恢复。
+- `/v1/analysis/files`：列举 Cyclone data root 的 logical 文件树。
+- `/v1/analysis/datasets/resolve|preflight|fingerprints`：symlink-aware 解析、FASTQ quick/full check 与二次指纹验证。
+- `/v1/analysis/runs/snapshot`：state、队列/tmux、progress、telemetry、trace 与报告资料；传 `report_kind=preliminary|final` 选择对应 telemetry。
+- `/v1/analysis/runs/delivery-report?format=html|pdf`：校验 run-local 登记、大小与 SHA-256 后传输标准交付报告。
+- `/v1/analysis/runs/priority-reports`：为已完成 run 生成受控科学、工具或技能 Demo 报告；技能对照可另传 `baseline_run_dir`。
+- `/v1/analysis/runs/artifact-report?run_dir=&kind=&format=`：校验登记、大小与 SHA-256 后下载 `scientific`、`tool_demo` 或 `skill_demo` 产物。
+- `/v1/analysis/resources`：Cyclone CPU、内存、run-root storage 和 active/queued 数量。
+- `/v1/analysis/evidence/verify`：在 Cyclone 对报告数值做原始产物复算。
 
-## 结构
+## Cyclone transport
 
-```text
-agent/
-├── adapter.py       # HTTP/OpenAI SSE 协议适配
-├── runtime.py       # SDK 配置、会话恢复、结果流与 MCP 注册
-├── config.py        # 模型、密钥、路径与 MCP endpoint 等静态配置
-├── .claude/
-│   ├── skills/      # 项目级 Agent Skills
-│   └── sessions/    # chat-map 与 SDK JSONL transcript，不提交 Git
-├── tests/
-├── tools/watch.py   # 可选的消息监控脚本
-├── taxonagent_mcp_integration.md
-└── e2e_test_result_20260719.md
-```
+设置 `BIOAGENT_SSH_HOST=Cyclone` 后使用 `RemoteDeterministicRuntime`。`remote_client.py` 负责：
 
-TaxonAgent MCP Server 的实现位于 5090 上独立的 `taxonagent` 项目，不属于本目录。
+- 强制 `ClearAllForwardings=yes` 并复用 SSH control socket。
+- 对最小 worker 文件集计算 SHA-256，原子发布到 `BIOAGENT_REMOTE_WORKER_ROOT/releases/<sha256>`。
+- 使用指定的远端 Python；worker 和 RPC 仅依赖标准库，runner 依赖随发布同步的本项目模块。
 
-## 会话模型
+`remote_worker.py` 负责 data allowlist、双层指纹、FASTQ 检查、资源采集、单一持久 scheduler 和 reconciliation。scheduler 以 `fcntl.flock` 保证最终互斥，并在独立 `supervisor.json` 写 heartbeat、PID、boot ID 与 worker version，避免与 runner 的 state 原子写互相覆盖。
 
-Open WebUI 向 adapter 转发 `X-OpenWebUI-Chat-Id`。runtime 用轻量 chat-map 保存对应的 Claude session ID，不修改 Open WebUI 数据库：
+新 run 在 state v3 中冻结 recovery contract v2，并把每次小型控制日志、telemetry 与 checkpoint 登记在 `.bioagent/attempts/<序号>/`；大型计算结果继续共用 run root。恢复只跳过 checkpoint 已验证的完整 phase，中断 phase 使用 Snakemake `--rerun-incomplete` 并强制重跑受控 rules。新建的 Workflow 1 run 会按所选阶段冻结 workflow 源码闭包、软件及 rRNA 索引身份；旧恢复契约与 Workflow 2–6 会明确返回不可恢复，不会原地补写身份。当前只完成全阶段 dry-run，尚未完成真实 Workflow 1 中断恢复验收。
 
-1. adapter 为每个 `chat_id` 保留一个常驻 `ClaudeSDKClient`。
-2. 同一 `chat_id` 的请求复用同一个 client，并通过会话锁串行写入 SDK stream。
-3. 新建 client 时以 `bypassPermissions` 能力启动 SDK subprocess，随后立即调用 `set_permission_mode("dontAsk")`；方案阶段预先允许 `Read`、`Glob`、`Grep` 与 TaxonAgent MCP 工具。
-4. 恢复时在 `ClaudeAgentOptions(resume=claude_session_id)` 中加载 transcript，每轮只调用 `client.query(prompt)`。
-5. 新会话第一轮完成后保存 SDK 返回的真实 session ID；后续只发送最新用户消息。
-6. SDK transcript 保存在 `.claude/sessions/projects/<project>/<claude_session_id>.jsonl`。
-7. adapter 重启后从 chat-map 读取 session ID，并通过 `resume` 继续原 SDK session。
+## 配置
 
-空闲 client 会在超时后断开；FastAPI shutdown 时会断开所有 client。当前部署仍假设单个 uvicorn worker。
+完整的新机器部署、Cyclone 路径和 `.env` 配置见根目录 [Developer Guide](../README.md#developer-guide)。本机 `agent/.env` 被 Git 忽略，tracked `agent/.env.example` 是唯一配置模板。
 
-## Agent 能力
+RPC 控制进程、tmux supervisor 与 analysis runner 使用同一套 home Pixi Python；Snakemake 与 SeqKit 使用 Pixi 的全局入口。这样可避开高负载 `/data` 上大量小文件读取，也无需维护第二套 adapter。缺少这些路径时 toolchain 会拒绝新任务，不会回退旧环境；新增命令行工具时使用 `pixi global install -c bioconda <tool>`。
 
-- 会话开始时通过 `setting_sources=["project"]`、`skills="all"` 加载 `.claude/skills/`。
-- 默认 `/plan`：活动 SDK permission mode 为 `dontAsk`，并注入只输出 BioAgent `analysis_plan`、禁止 EnterPlanMode/ExitPlanMode 和 plan 文件的 runtime prompt。
-- `/execute`：调用 `set_permission_mode("bypassPermissions")`，并在用户消息前额外注入执行提示和 runtime 分配的 run reservation，要求按既有方案执行、保持 Markdown 输出、更新 `.bioagent/state.json` 和 `.bioagent/execution.log`。
-- 成功执行的最终回复以隐藏 `diagnostic_report` block 携带无样式 HTML fragment；runtime 验证允许的语义标签、生成 A4 HTML 文件，并向 Open WebUI 发送报告 output item。失败执行不生成报告。
-- `/plan` 和 `/execute` 命令由 adapter 拦截，不发送给 Claude，不污染对话上下文。
-- 固定 Snakemake 工作流的识别和一次确认后直接执行规则位于 `bioinformatics-workflow-gatekeeper` Skill。
-- ICTV 相关问题通过 MCP Streamable HTTP 调用 TaxonAgent，工具权限为 `mcp__taxonagent__*`。
+标准交付报告使用独立的 `BIOAGENT_REPORT_PYTHON`、`BIOAGENT_RSCRIPT` 与 `BIOAGENT_WEASYPRINT`；正常 run 完成后自动生成，也可用 `standard_report.py --state <run>/.bioagent/state.json` 单独重建。
 
-## TaxonAgent MCP 集成
+优先 Demo 的本地条目位于 `skills/bioagent-w1-read-qc/`、`tool_library.py` 与 `assets/scientific-report-literature-v1.json`。公开 capabilities 不包含工具执行路径；生成物仅写入 run root 的 `reports/standard/scientific/`、`tool-demo/` 或 `skill-demo/`。
 
-```text
-用户问题（Open WebUI）
-  ↓
-BioAgent Adapter（cyclone:8001）
-  ↓  识别 ICTV 意图并调用 MCP tool
-TaxonAgent MCP Server（5090:8765/mcp）
-  ↓  ictv_family_info(family_name)
-TaxonAgent 核心（ICTV knowledge graph + Ollama glm4）
-```
+Workflow 1 在 run root 建立副本时会把 run-local `config.yaml` 的 `software.seqkit` 改为上述 Pixi 入口；Cyclone 上的 Workflow 源码保持不变。
 
-`runtime.py` 通过 `ClaudeAgentOptions.mcp_servers` 注册名为 `taxonagent` 的 HTTP server；endpoint 由 `config.TAXONAGENT_MCP_URL` 定义为 `http://172.24.202.246:8765/mcp`。System Prompt 指示模型在查询 ICTV taxonomy、demarcation criteria、classification rules、marker genes、genome type 或特定病毒科时调用 `ictv_family_info(family_name)`。
+远端 fingerprint 验证暂时不可用与指纹真实变化是不同状态：前者可重试且不会把 dataset 标记 stale，后者才会阻止规划或执行。
 
-初始实现细节与既有端到端结果分别见 [TaxonAgent MCP 初始集成记录](taxonagent_mcp_integration.md) 和 [2026-07-19 测试报告](e2e_test_result_20260719.md)。集成记录中的旧部署路径仅供追溯，当前启动方式以本 README 为准。
+不要把 `MINIMAX_API_KEY` 写入 `.env`；`start.sh` 由 login zsh 启动并从现有 shell 环境继承。依赖通过 `requirements.txt` 安装，其中固定 `claude-agent-sdk==0.2.103`（Claude Code 2.1.179）。MiniMax 使用中国大陆 `https://api.minimax.cn/anthropic` 端点，SDK 内部默认模型映射为 `MiniMax-M3[1m]`，对外 provider 契约仍回报 `MiniMax-M3`。
 
-### 启动 TaxonAgent MCP Server
+`BIOAGENT_MODEL_POLICY` 默认 `local_only`，目前尚未安装本地后端，模型入口会明确不可用。当前开发实例获得授权后使用 `minimax_explicit`；缺少密钥不阻止确定性服务启动。
 
-在 5090 的专用 terminal 中执行：
+## M0 开发回放
+
+- `provider.py` 定义四类任务的统一请求／结果；MiniMax SDK 的会话与审计文件使用独立 `minimax-m0` 命名空间，旧会话文件保留。有效 Open WebUI UUID 使用既有 SDK session/resume；缺失、`local:` 或其他非 UUID chat ID 以宿主传入的有限历史执行单次临时 SDK session。宿主管理受控历史、动作校验和执行权限，provider 不持有业务工具。
+- `evidence_replay.py` 将真实初筛统计复算为候选证据；数值占位符、引用身份和规则发现由宿主校验。源码中既有 `reads` 字段对应的配对分类计数，在新证据中显式记为 `read_pairs`。
+- `assets/m0` 是约 16 KiB 的开发资料与规则包。`knowledge.py` 验证哈希后构建内存 SQLite 关系表和 FTS5 索引；索引可从冻结 JSON 重建。所有片段仍待审核，默认检索不返回它们。
+- 根仓库 `m0-replay.py` 用 `--include-unreviewed` 开启开发草稿，用 `--allow-cloud` 显式授权本次 MiniMax 调用。这些开关不启用多人知识服务或正式报告发布。
+
+完整复现与限制见 [M0 实施记录](../docs/m0-implementation-record.md)。本次没有本地模型生成、专家审核或生物学性能验收。
+
+## M2 工程研判检查
+
+`candidate_assessment.py` 只读解析已完成的 Workflow 2 run，并用 `assets/m2` 中逐档校验的 capability／工程规则 release 生成聚合检查：
 
 ```bash
-ssh 5090
-conda activate taxonagent
-python ~/projects/taxonagent/mcp/taxonagent_mcp.py
+python candidate_assessment.py --state <run>/.bioagent/state.json --summary
 ```
 
-Server 启动后监听 `0.0.0.0:8765`，MCP endpoint 为 `/mcp`。BioAgent adapter 必须能从 cyclone 访问 `172.24.202.246:8765`。
+命令不接受输出路径，也不写回 run。当前没有核准的领域规则、知识或正式 reference release，因此每个候选都保持 `Assessment(status="not_generated")`；输出只有来源哈希与候选、观测、finding、assessment 聚合计数，不包含候选 ID 或序列。NT／NR 的来源 checksum 清单只能登记为观察，不能证明已安装数据库的完整内容身份，也不会提升 Workflow 2–6 的恢复资格。
 
-### 已知限制
-
-- 当前只暴露 `ictv_family_info` 一个工具。
-- 首次调用通常需要 150–250 秒，因为 5090 上的 Ollama glm4 推理没有缓存。
-- MCP Server 目前需手动启动，尚未配置 systemd 守护。
-
-## 用户命令
-
-```text
-/plan
-/execute
-```
-
-## cyclone 部署
-
-```text
-Agent:          /data/bioagent/agent
-Open WebUI:     /data/bioagent/open-webui
-Sessions:       /data/bioagent/agent/.claude/sessions
-Workflows:      /data/user/guojindan/Projects/Workflows
-Runs:           ${BIOAGENT_RUN_ROOT:-/data/runs}
-TaxonAgent MCP: http://172.24.202.246:8765/mcp
-```
-
-BioAgent 与 Open WebUI 服务由用户级 systemd 管理：
+## 测试
 
 ```bash
-systemctl --user restart bioagent-adapter open-webui-backend
-systemctl --user status bioagent-adapter open-webui-backend
+PYTHONPATH=/Users/lfz/miniconda3/envs/open-webui/lib/python3.11/site-packages \
+  /Users/lfz/miniconda3/envs/adapter/bin/python -m pytest -q
 ```
 
-Open WebUI 必须启用：
-
-```text
-ENABLE_FORWARD_USER_INFO_HEADERS=True
-```
-
-## 验证
-
-```bash
-python -m unittest discover -s tests -v
-curl http://127.0.0.1:8001/v1/models
-```
-
-`BIOAGENT_RUN_ROOT` 可覆盖 run 根目录；未设置时默认为 `/data/runs`。开发脚本默认写入项目内 `runs/`。
+原始 dataset 始终只读；测试产物只能写入远端 run root。

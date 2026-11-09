@@ -1,0 +1,347 @@
+{
+  "release_id": "m0-screening-knowledge-v1",
+  "sources": [
+    {
+      "id": "S01",
+      "origin": "agent/adaptive_routing.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:13-17",
+      "license": "unknown",
+      "content": "MIN_KNOWN_VIRUS_READS = 1_000\nMIN_SAMPLE_FRACTION = 0.01\nMIN_VIRAL_DOMINANCE = 0.80\nCONFIDENCE_THRESHOLDS = {\n    \"top_species_reads\": MIN_KNOWN_VIRUS_READS,",
+      "sha256": "3b9322a1291a06ea3970e705a1c4cec692614a3e4011b95af2886f4ecc731cca"
+    },
+    {
+      "id": "S02",
+      "origin": "agent/adaptive_routing.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:39-45",
+      "license": "unknown",
+      "content": "def parse_kraken_report(path: Path) -> dict[str, Any]:\n    \"\"\"Parse one Kraken report and retain species below the Viruses clade.\"\"\"\n    total_reads = 0\n    viral_reads = 0\n    species: list[dict[str, Any]] = []\n    viral_depth: int | None = None\n    for line in path.read_text(encoding=\"utf-8\", errors=\"replace\").splitlines():",
+      "sha256": "113243c96f8a799fc15e0b17e0b1e5da10e19bf117ff427589a79fa48e00dc5a"
+    },
+    {
+      "id": "S03",
+      "origin": "agent/adaptive_routing.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:58-64",
+      "license": "unknown",
+      "content": "        if rank == \"R\" and taxid == \"1\":\n            total_reads = max(total_reads, clade_reads)\n        if taxid == \"10239\" or name == \"Viruses\":\n            viral_reads = max(viral_reads, clade_reads)\n            viral_depth = depth\n            continue\n        if viral_depth is not None and depth <= viral_depth:",
+      "sha256": "ef559dbdff6bba7f15d04ea586b87a640d10b8151313777c571365dedae3875d"
+    },
+    {
+      "id": "S04",
+      "origin": "agent/adaptive_routing.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:78-83",
+      "license": "unknown",
+      "content": "    top = max(report.get(\"species\") or [], key=lambda item: item[\"reads\"], default=None)\n    top_reads = int((top or {}).get(\"reads\") or 0)\n    viral_reads = int(report.get(\"viral_reads\") or 0)\n    sample_fraction = top_reads / sampled_pairs if sampled_pairs else 0.0\n    viral_fraction = top_reads / viral_reads if viral_reads else 0.0\n    checks = [",
+      "sha256": "52bd404ffbd2225319a6b6acbec85d1d3c03baf65f8decccfc02dee991ab5fb0"
+    },
+    {
+      "id": "S05",
+      "origin": "agent/adaptive_screening.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:16-17",
+      "license": "unknown",
+      "content": "SAMPLE_FRACTION = 0.05\nSAMPLE_SEED = 17",
+      "sha256": "06e9a865795bb650149941bc03bddb2ec86c5a90dc16146bad46bcdfb6e63d50"
+    },
+    {
+      "id": "S06",
+      "origin": "agent/adaptive_screening.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:210-210",
+      "license": "unknown",
+      "content": "            sampled_pairs = validate_paired_fastq(sampled1, sampled2)",
+      "sha256": "98989fa2c82594afecc8451c66c5ff809ca5d134aea0b30a2c7c3fb7734cc53d"
+    },
+    {
+      "id": "S07",
+      "origin": "agent/adaptive_screening.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:255-262",
+      "license": "unknown",
+      "content": "                    \"--paired\",\n                    \"--gzip-compressed\",\n                    \"--output\",\n                    str(sample_dir / \"kraken.output\"),\n                    \"--report\",\n                    str(report),\n                    \"--confidence\",\n                    str(kraken_params.get(\"kraken2_confidence\") or \"0.3\"),",
+      "sha256": "d5f295eb12266c97d7512b3c462e8bfdf2fec60fb6320fe6735ed9a1d66b686a"
+    },
+    {
+      "id": "S08",
+      "origin": "agent/adaptive_screening.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:237-245",
+      "license": "unknown",
+      "content": "            _rrna_filter(\n                str(software[\"bowtie2\"]),\n                str(software[\"samtools\"]),\n                str(database[\"rrna_bowtie2\"]),\n                fastp1,\n                fastp2,\n                clean1,\n                clean2,\n                threads,",
+      "sha256": "2d85dbf62540f5eb58b6a2d63c0f4084ae94b135c14e6ab8e8cb9f5119a45b53"
+    },
+    {
+      "id": "S09",
+      "origin": "agent/workflow_catalog.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:221-227",
+      "license": "unknown",
+      "content": "        \"read_qc\",\n        \"序列质控\",\n        \"workflow1\",\n        ((\"raw_paired_reads\",),),\n        \"qc_paired_reads\",\n        (\"fastp\",),\n    ),",
+      "sha256": "1eaf411817d5304491cc914accaf4502b35ede240e85d9e100208330ebab01c6"
+    },
+    {
+      "id": "S10",
+      "origin": "agent/workflow_catalog.py",
+      "version": "3ba16a0a13cf7f0fe2cf19843074724911311d54",
+      "locator": "lines:229-235",
+      "license": "unknown",
+      "content": "        \"rrna_filter\",\n        \"去除 rRNA\",\n        \"workflow1\",\n        ((\"qc_paired_reads\",),),\n        \"clean_run_paired_reads\",\n        (\"bowtie2\",),\n    ),",
+      "sha256": "6b7a4c0cf330173f85cf636a2449f87a84609e9e4ff0dcc9bf012c5d343bc2c6"
+    },
+    {
+      "id": "S11",
+      "origin": "https://github.com/DerrickWood/kraken2/blob/master/docs/MANUAL.markdown",
+      "version": "accessed-2026-09-12; upstream-commit-unknown",
+      "locator": "Sample Report Output Format, column 2",
+      "license": "unknown; short attributed excerpt, redistribution not approved",
+      "content": "Number of fragments covered by the clade rooted at this taxon",
+      "sha256": "16658598bb77d6de1ccbceaffb272d8a331c30f37ba40f324a673534325426ec"
+    },
+    {
+      "id": "S12",
+      "origin": "https://github.com/OpenGene/fastp",
+      "version": "accessed-2026-09-12; upstream-commit-unknown",
+      "locator": "examples of report",
+      "license": "unknown; short attributed excerpt, redistribution not approved",
+      "content": "fastp creates reports in both HTML and JSON format.",
+      "sha256": "cdd404ed5265a8b37b8eb6a9cddb955ea543914273e8a68f9652b3e688f383b1"
+    }
+  ],
+  "passages": [
+    {
+      "id": "K01",
+      "source_id": "S01",
+      "lines": [1, 5],
+      "corpus": "faq_policy",
+      "terms": "工程路由阈值 初筛 不是分类真值 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K02",
+      "source_id": "S02",
+      "lines": [1, 7],
+      "corpus": "tools_databases",
+      "terms": "Kraken 分类报告 病毒分支 分类层次 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K03",
+      "source_id": "S03",
+      "lines": [1, 7],
+      "corpus": "artifact_glossary",
+      "terms": "Kraken 根节点 病毒分支 计数 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K04",
+      "source_id": "S04",
+      "lines": [1, 6],
+      "corpus": "artifact_glossary",
+      "terms": "候选 抽样 分母 病毒分支 占比 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K05",
+      "source_id": "S05",
+      "lines": [1, 2],
+      "corpus": "workflow_capabilities",
+      "terms": "初筛 抽样比例 随机种子 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K06",
+      "source_id": "S06",
+      "lines": [1, 1],
+      "corpus": "artifact_glossary",
+      "terms": "初筛 配对 样本身份 验证 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K07",
+      "source_id": "S07",
+      "lines": [1, 8],
+      "corpus": "tools_databases",
+      "terms": "Kraken 配对 过滤后 输入 报告 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K08",
+      "source_id": "S08",
+      "lines": [1, 9],
+      "corpus": "workflow_capabilities",
+      "terms": "过滤 rRNA 非宿主识别 非宿主去除 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K09",
+      "source_id": "S09",
+      "lines": [1, 7],
+      "corpus": "workflow_capabilities",
+      "terms": "质控 fastp 上游 输入输出能力 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K10",
+      "source_id": "S10",
+      "lines": [1, 7],
+      "corpus": "workflow_capabilities",
+      "terms": "去除 rRNA 上游 输入输出能力 2955291",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K11",
+      "source_id": "S11",
+      "lines": [1, 1],
+      "corpus": "tools_databases",
+      "terms": "Kraken 配对 分类计数 分支 fragments 分母",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "id": "K12",
+      "source_id": "S12",
+      "lines": [1, 1],
+      "corpus": "tools_databases",
+      "terms": "fastp 质控 JSON 统计 初筛",
+      "taxids": [],
+      "review_status": "pending",
+      "review_record": null
+    }
+  ],
+  "entities": [
+    {
+      "id": "screening",
+      "name": "抽样初筛"
+    },
+    {
+      "id": "kraken",
+      "name": "Kraken2",
+      "aliases": ["Kraken", "配对分类"]
+    },
+    {
+      "id": "fastp",
+      "name": "fastp"
+    },
+    {
+      "id": "candidate",
+      "name": "初筛候选 taxon",
+      "taxid": "2955291"
+    }
+  ],
+  "relations": [
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K01",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "kraken",
+      "passage_id": "K02",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "kraken",
+      "passage_id": "K03",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K04",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K05",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K06",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "kraken",
+      "passage_id": "K07",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K08",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K09",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    },
+    {
+      "subject": "screening",
+      "predicate": "documented_by_method",
+      "object": "fastp",
+      "passage_id": "K10",
+      "scope": "development_screening",
+      "review_status": "pending",
+      "review_record": null
+    }
+  ]
+}

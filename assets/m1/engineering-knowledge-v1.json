@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "release_id": "engineering-knowledge-v1",
+  "release_scope": "engineering_contract",
+  "catalog_sha256": "2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170",
+  "sources": [
+    {
+      "id": "ENGINEERING-CATALOG-V1",
+      "origin": "bioagent://capability-catalog",
+      "version": "schema-v1@2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170",
+      "locator": "$",
+      "sha256": "fa4acfd42c10d064135a82f6dac059fc46155a337dfd6852bc5025f7b67c12e5",
+      "content": "工程知识发布仅描述 capability catalog 中已注册的能力、交付目标、artifact、参数与版本；不代表生物学审核或所有 workflow 已完成真实运行验证。\nread_qc（仅序列质控）接收 raw_paired_reads，仅执行 fastp，输出 qc_paired_reads 与质控报告。\nrrna_filter（质控与去 rRNA）依赖 read_qc，接收 qc_paired_reads，输出 clean_run_paired_reads；去 rRNA 不等于宿主识别或宿主序列去除。\nsample_merge（质控、去 rRNA 与样本合并）依赖 rrna_filter，把同一样本的已确认技术重复合并为 clean_sample_paired_reads。\nassembly（质控与序列组装）依赖 sample_merge，使用 MEGAHIT 从 clean_sample_paired_reads 生成 assembled_contigs。\ncontig_filter（质控与组装）依赖 assembly，对 assembled_contigs 重命名并过滤，输出 filtered_contigs。\nvirus_summary、host_summary、microbe_summary、virus_rpm 与 annotation_delivery 是已注册公开交付目标；其实际开放仍受对应 workflow、参考库和验证状态约束。\nWorkflow 1 五个阶段分别登记 fastp、Bowtie2／samtools／rRNA 索引、SeqKit、MEGAHIT 与 SeqKit 依赖；只有 read_qc 为 validated，rrna_filter 为 dry_run_validated，其余保持 code_exists。\nfastp 可控整数参数为 length_required 1–1000 bp、qualified_quality_phred 0–40、unqualified_percent_limit 0–100%、n_base_limit 0–1000、average_qual 0–40。\nfastp 可控布尔参数 detect_adapter_for_pe 用于双端 adapter 自动检测；当前唯一预设 workflow_default 不展开 workflow 内部默认数值。\n方案只接受 manifest 中的具名白名单字段，不接受命令、原始 CLI、路径、输出位置、线程或未发布参数；参数变更须重新编译方案。"
+    }
+  ],
+  "entities": [],
+  "relations": [],
+  "passages": [
+    {
+      "id": "ENG-K00",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [1, 1],
+      "locator": "$.schema_version",
+      "corpus": "faq_policy",
+      "terms": "工程知识 能力目录 capability catalog 验证状态 生物学审核",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K01",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [2, 2],
+      "locator": "$.deliverables[?(@.id=='read_qc')]",
+      "corpus": "workflow_capabilities",
+      "terms": "read_qc 仅序列质控 fastp raw_paired_reads qc_paired_reads 质控报告",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K02",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [3, 3],
+      "locator": "$.deliverables[?(@.id=='rrna_filter')]",
+      "corpus": "workflow_capabilities",
+      "terms": "rrna_filter 去 rRNA read_qc qc_paired_reads clean_run_paired_reads 宿主识别 宿主去除",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K03",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [4, 4],
+      "locator": "$.deliverables[?(@.id=='sample_merge')]",
+      "corpus": "workflow_capabilities",
+      "terms": "sample_merge 样本合并 技术重复 rrna_filter clean_sample_paired_reads",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K04",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [5, 5],
+      "locator": "$.deliverables[?(@.id=='assembly')]",
+      "corpus": "workflow_capabilities",
+      "terms": "assembly 序列组装 sample_merge MEGAHIT clean_sample_paired_reads assembled_contigs",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K05",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [6, 6],
+      "locator": "$.deliverables[?(@.id=='contig_filter')]",
+      "corpus": "workflow_capabilities",
+      "terms": "contig_filter 质控 组装 assembly assembled_contigs filtered_contigs 重命名 过滤",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K06",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [7, 7],
+      "locator": "$.deliverables",
+      "corpus": "workflow_capabilities",
+      "terms": "virus_summary host_summary microbe_summary virus_rpm annotation_delivery 病毒识别 宿主识别 微生物谱 病毒定量 病毒注释 workflow2 workflow3 workflow4 workflow5 workflow6",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K07",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [8, 8],
+      "locator": "$.capabilities",
+      "corpus": "tools_databases",
+      "terms": "workflow1.read_qc.fastp workflow1.rrna_filter.bowtie2 workflow1.sample_merge.seqkit workflow1.assembly.megahit workflow1.contig_filter.seqkit manifest v1 adapter v1 validated dry_run_validated code_exists software reference rRNA 索引",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K08",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [9, 9],
+      "locator": "$.capabilities[?(@.id=='workflow1.read_qc.fastp')].parameters",
+      "corpus": "tools_databases",
+      "terms": "fastp 参数 length_required qualified_quality_phred unqualified_percent_limit n_base_limit average_qual 最短保留长度 质量",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K09",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [10, 10],
+      "locator": "$.capabilities[?(@.id=='workflow1.read_qc.fastp')].presets",
+      "corpus": "tools_databases",
+      "terms": "fastp detect_adapter_for_pe adapter 自动检测 workflow_default 默认 预设",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    },
+    {
+      "id": "ENG-K10",
+      "source_id": "ENGINEERING-CATALOG-V1",
+      "lines": [11, 11],
+      "locator": "$.capabilities[?(@.id=='workflow1.read_qc.fastp')].parameters",
+      "corpus": "faq_policy",
+      "terms": "参数白名单 命令 CLI 路径 输出 线程 未发布参数 重新编译方案",
+      "taxids": [],
+      "review_status": "approved",
+      "review_record": "engineering-contract:2abf4c14321c182237dbef08665e7d0b20d362a7b4b818e67bb1678bfdf4c170"
+    }
+  ]
+}

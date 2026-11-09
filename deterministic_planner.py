@@ -1,0 +1,394 @@
+"""Deterministic analysis planning and execution admission."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from typing import Any
+
+from asset_release_binding import (
+    AssetReleaseBindingError,
+    normalize_release_binding,
+)
+from pipeline_spec import (
+    EXECUTION_SPEC_VERSION,
+    ExecutionSpecError,
+    canonical_steps,
+    compile_execution_spec,
+    normalize_execution_spec,
+    validate_plan_rules,
+)
+from workflow_catalog import PUBLIC_DELIVERABLES
+
+PLANNER_VERSION = 8
+GOAL_LABELS = {
+    goal_id: metadata["label"] for goal_id, metadata in PUBLIC_DELIVERABLES.items()
+}
+GOAL_ORDER = tuple(GOAL_LABELS)
+VIRAL_TYPES = {"RNA", "DNA", "RNA+DNA"}
+ROUTING_MODES = {"auto", "standard", "emergency"}
+RUN_ID_RE = re.compile(r"^analysis-[A-Za-z0-9_.-]+$")
+
+
+class PlannerError(ValueError):
+    """Raised when structured planning input is invalid."""
+
+    def __init__(self, message: str, *, code: str = "PLAN_INPUT_INVALID") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _dataset_inputs(dataset: dict[str, Any]) -> list[dict[str, Any]]:
+    artifacts = dataset.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise PlannerError("analysis dataset has no assigned artifacts")
+
+    inputs = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise PlannerError("analysis dataset artifacts must be objects")
+        records = []
+        for record in artifact.get("records") or []:
+            files = record.get("files") if isinstance(record, dict) else None
+            if not isinstance(files, dict):
+                raise PlannerError("analysis dataset record files are missing")
+            records.append(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"record_id", "files"}
+                }
+                | {
+                    "files": {
+                        role: value.get("path")
+                        for role, value in files.items()
+                        if isinstance(value, dict)
+                    }
+                }
+            )
+        inputs.append(
+            {
+                "id": artifact.get("id"),
+                "type": artifact.get("type"),
+                "records": records,
+            }
+        )
+    return inputs
+
+
+def _normalize_goals(raw: Any) -> list[str]:
+    if not isinstance(raw, list) or not raw:
+        raise PlannerError("at least one analysis goal is required")
+    unknown = {value for value in raw if value not in GOAL_LABELS}
+    if unknown:
+        raise PlannerError(
+            "unsupported analysis goal: " + ", ".join(sorted(map(str, unknown)))
+        )
+    return [goal for goal in GOAL_ORDER if goal in raw]
+
+
+def _normalize_options(raw: Any) -> dict[str, Any]:
+    value = raw if isinstance(raw, dict) else {}
+    viral_type = value.get("viral_type", "RNA+DNA")
+    if viral_type not in VIRAL_TYPES:
+        raise PlannerError("viral_type must be RNA, DNA, or RNA+DNA")
+    return {
+        **value,
+        "viral_type": viral_type,
+        "excluded_stages": value.get("excluded_stages") or [],
+        "capability_parameters": value.get("capability_parameters") or [],
+    }
+
+
+def _normalize_routing(raw: Any) -> dict[str, Any]:
+    value = raw if isinstance(raw, dict) else {}
+    mode = value.get("mode", "auto")
+    if mode not in ROUTING_MODES:
+        raise PlannerError("routing mode must be auto, standard, or emergency")
+    unsupported = set(value) - {"mode"}
+    if unsupported:
+        raise PlannerError(
+            "unsupported routing fields: " + ", ".join(sorted(unsupported))
+        )
+    return {"mode": mode}
+
+
+def _dataset_label(dataset: dict[str, Any]) -> str:
+    samples: list[str] = []
+    for artifact in dataset.get("artifacts") or []:
+        for record in artifact.get("records") or []:
+            value = record.get("sample_id") or record.get("run_id")
+            if isinstance(value, str) and value not in samples:
+                samples.append(value)
+    if samples:
+        return "、".join(samples[:2]) + (
+            f" 等 {len(samples)} 个样本" if len(samples) > 2 else ""
+        )
+    return str(dataset.get("id") or "数据集")
+
+
+class DeterministicPlanner:
+    def __init__(
+        self,
+        session_manager: Any,
+        enabled_goals: Any = None,
+        release_resolver: Callable[[], dict[str, Any]] | None = None,
+    ):
+        self.session_manager = session_manager
+        requested = GOAL_ORDER if enabled_goals is None else tuple(enabled_goals)
+        unknown = set(requested) - set(GOAL_ORDER)
+        if unknown:
+            raise PlannerError(
+                "unsupported enabled analysis goal: "
+                + ", ".join(sorted(map(str, unknown)))
+            )
+        self.enabled_goals = tuple(goal for goal in GOAL_ORDER if goal in requested)
+        self.release_resolver = release_resolver
+
+    def compile(
+        self,
+        *,
+        dataset: dict[str, Any],
+        goals: Any,
+        options: Any,
+        routing: Any,
+        _resolve_assets: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(dataset, dict):
+            raise PlannerError("analysis dataset is required")
+        status = dataset.get("status")
+        if status not in {"checking", "ready"}:
+            raise PlannerError(
+                "analysis dataset cannot be planned in its current state"
+            )
+
+        normalized_goals = _normalize_goals(goals)
+        disabled = set(normalized_goals) - set(self.enabled_goals)
+        if disabled:
+            raise PlannerError(
+                "analysis goal is not enabled: " + ", ".join(sorted(disabled))
+            )
+        normalized_options = _normalize_options(options)
+        normalized_routing = _normalize_routing(routing)
+        try:
+            execution_spec = compile_execution_spec(
+                {
+                    "version": EXECUTION_SPEC_VERSION,
+                    "adapter": "analysis_pipeline",
+                    "inputs": _dataset_inputs(dataset),
+                    "deliverables": normalized_goals,
+                    "options": normalized_options,
+                    "policy": normalized_routing,
+                }
+            )
+        except ExecutionSpecError as exc:
+            raise PlannerError(str(exc), code=exc.code) from exc
+
+        normalized_options = execution_spec["options"]
+
+        steps = canonical_steps(execution_spec)
+        labels = [GOAL_LABELS[goal] for goal in normalized_goals]
+        title = f"{_dataset_label(dataset)} · {'、'.join(labels)}"
+        ready = status == "ready"
+        asset_release_set = None
+        if _resolve_assets and self.release_resolver is not None:
+            try:
+                asset_release_set = normalize_release_binding(self.release_resolver())
+            except (AssetReleaseBindingError, OSError) as exc:
+                raise PlannerError(
+                    f"active asset ReleaseSet is unavailable: {exc}",
+                    code="ASSET_RELEASE_UNAVAILABLE",
+                ) from exc
+        plan = {
+            "schema_version": 1,
+            "planner_version": PLANNER_VERSION,
+            "title": title,
+            "summary": f"针对 {_dataset_label(dataset)} 执行{'、'.join(labels)}。",
+            "dataset": dataset,
+            "goals": normalized_goals,
+            "options": normalized_options,
+            "routing": {
+                **execution_spec["policy"],
+                "available_routes": (
+                    ["A"]
+                    if execution_spec["policy"].get("effective_mode") == "emergency"
+                    else ["A", "B"]
+                    if execution_spec["policy"].get("adaptive")
+                    else []
+                ),
+            },
+            "execution_spec": execution_spec,
+            **(
+                {"asset_release_set": asset_release_set}
+                if asset_release_set is not None
+                else {}
+            ),
+            "steps": steps,
+            "ready_to_execute": ready,
+            **(
+                {"blocking_reason": "数据集正在执行全量预检，完成前不能启动分析。"}
+                if not ready
+                else {}
+            ),
+            "decision_trace": [
+                {
+                    "kind": "dataset",
+                    "status": status,
+                    "revision": dataset.get("revision"),
+                },
+                {"kind": "goals", "values": normalized_goals},
+                {"kind": "routing", "value": execution_spec["policy"]},
+                {"kind": "compiler", "planner_version": PLANNER_VERSION},
+                *(
+                    [
+                        {
+                            "kind": "asset_release_set",
+                            "release_set_id": asset_release_set["release_set_id"],
+                            "sha256": asset_release_set["sha256"],
+                        }
+                    ]
+                    if asset_release_set is not None
+                    else []
+                ),
+            ],
+        }
+        try:
+            plan["resource_estimate"] = (
+                self.session_manager.resource_calibrator.estimate(execution_spec)
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
+        return plan
+
+    async def start(
+        self,
+        *,
+        persisted_plan: dict[str, Any],
+        dataset: dict[str, Any],
+        chat_id: str,
+        plan_id: str,
+        plan_revision: int,
+        run_id: str,
+        queue_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise PlannerError("invalid analysis run ID")
+        if dataset.get("status") != "ready":
+            raise PlannerError("analysis dataset is not ready")
+        compiled = self.compile(
+            dataset=dataset,
+            goals=persisted_plan.get("goals"),
+            options=persisted_plan.get("options"),
+            routing={
+                "mode": (persisted_plan.get("routing") or {}).get("requested_mode"),
+            },
+        )
+        try:
+            persisted_spec = normalize_execution_spec(
+                persisted_plan.get("execution_spec")
+            )
+            validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
+            persisted_release = (
+                normalize_release_binding(persisted_plan["asset_release_set"])
+                if "asset_release_set" in persisted_plan
+                else None
+            )
+        except ExecutionSpecError as exc:
+            raise PlannerError(
+                f"persisted analysis plan is invalid: {exc}", code=exc.code
+            ) from exc
+        except AssetReleaseBindingError as exc:
+            raise PlannerError(
+                f"persisted asset ReleaseSet is invalid: {exc}",
+                code="ASSET_RELEASE_INVALID",
+            ) from exc
+        if (
+            persisted_spec != compiled["execution_spec"]
+            or persisted_plan.get("steps") != compiled["steps"]
+            or persisted_release != compiled.get("asset_release_set")
+        ):
+            raise PlannerError(
+                "persisted analysis plan does not match the authoritative dataset or active assets"
+            )
+
+        run_dir = self.session_manager.analysis_run_root / run_id
+        runtime_plan = {
+            **persisted_plan,
+            "dataset": dataset,
+            "execution_spec": persisted_spec,
+            "plan_ref": {"id": plan_id, "revision": plan_revision},
+            "run": {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "state_path": str(run_dir / ".bioagent" / "state.json"),
+                "log_path": str(run_dir / ".bioagent" / "execution.log"),
+            },
+            "queue_context": queue_context,
+        }
+        return await self.session_manager.launch_deterministic_plan(
+            runtime_plan, chat_id
+        )
+
+    async def resume(
+        self,
+        *,
+        persisted_plan: dict[str, Any],
+        dataset: dict[str, Any],
+        chat_id: str,
+        plan_id: str,
+        plan_revision: int,
+        run_id: str,
+    ) -> dict[str, Any]:
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise PlannerError("invalid analysis run ID")
+        if dataset.get("status") != "ready":
+            raise PlannerError("analysis dataset is not ready")
+        compiled = self.compile(
+            dataset=dataset,
+            goals=persisted_plan.get("goals"),
+            options=persisted_plan.get("options"),
+            routing={
+                "mode": (persisted_plan.get("routing") or {}).get(
+                    "requested_mode"
+                ),
+            },
+            _resolve_assets=False,
+        )
+        try:
+            persisted_spec = normalize_execution_spec(
+                persisted_plan.get("execution_spec")
+            )
+            validate_plan_rules(persisted_spec, persisted_plan.get("steps") or [])
+            if "asset_release_set" in persisted_plan:
+                normalize_release_binding(persisted_plan["asset_release_set"])
+        except ExecutionSpecError as exc:
+            raise PlannerError(
+                f"persisted analysis plan is invalid: {exc}", code=exc.code
+            ) from exc
+        except AssetReleaseBindingError as exc:
+            raise PlannerError(
+                f"persisted asset ReleaseSet is invalid: {exc}",
+                code="ASSET_RELEASE_INVALID",
+            ) from exc
+        if (
+            persisted_spec != compiled["execution_spec"]
+            or persisted_plan.get("steps") != compiled["steps"]
+        ):
+            raise PlannerError(
+                "persisted analysis plan does not match the authoritative dataset"
+            )
+        run_dir = self.session_manager.analysis_run_root / run_id
+        runtime_plan = {
+            **persisted_plan,
+            "dataset": dataset,
+            "execution_spec": persisted_spec,
+            "plan_ref": {"id": plan_id, "revision": plan_revision},
+            "run": {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "state_path": str(run_dir / ".bioagent" / "state.json"),
+            },
+        }
+        return await self.session_manager.resume_deterministic_plan(
+            runtime_plan, chat_id
+        )

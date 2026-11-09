@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "releases": [
+    {
+      "asset_id": "candidate-evidence-v2",
+      "asset_type": "capability",
+      "version": "2",
+      "source": "BioAgent CandidateEvidence v2 engineering contract",
+      "license": "same as BioAgent source",
+      "files": {
+        "candidate-evidence-v2.json": "3d211080cc792492f288997097290e5234b2e67268500d5fda520cdb112d291c"
+      },
+      "compatible_with": ["b3-engineering-integrity-rules-v1"],
+      "review_status": "approved"
+    },
+    {
+      "asset_id": "b3-engineering-integrity-rules-v1",
+      "asset_type": "rules",
+      "version": "1",
+      "source": "BioAgent deterministic CandidateEvidence v2 integrity rules",
+      "license": "same as BioAgent source",
+      "files": {
+        "engineering-rules-v1.json": "d9916f62a67bea0c9823ce30faba01404a100b75ad59fba5f9fcda99963975af"
+      },
+      "compatible_with": ["candidate-evidence-v2"],
+      "review_status": "approved"
+    }
+  ]
+}

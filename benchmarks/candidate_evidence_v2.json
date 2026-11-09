@@ -1,0 +1,148 @@
+{
+  "schema_version": 2,
+  "run_id": "analysis-20260905-003912-6e535218",
+  "attempt": "unknown",
+  "report_scope": "sampled_screening",
+  "sample_id": "BJ-2024-615-f98f3838",
+  "candidate_id": "BJ-2024-615-f98f3838:taxon:2955291",
+  "candidate_kind": "screening_taxon",
+  "taxid": "2955291",
+  "name": "Alphainfluenzavirus influenzae",
+  "observations": [
+    {
+      "evidence_id": "E-SAMPLED-READS",
+      "metric": "sampled_reads",
+      "value": 276448,
+      "unit": "reads",
+      "population": "sampled_input",
+      "source_group": "fastp",
+      "source": {
+        "artifact_type": "fastp_json",
+        "artifact_path": "artifacts/fastp.json",
+        "locator": "$.summary.before_filtering.total_reads",
+        "sha256": "8532e80ba07fc02c08c52d0850c20b5ea536e961d85fd54c8fc59856b60ee73a",
+        "tool_id": "fastp",
+        "tool_version": "1.3.2"
+      }
+    },
+    {
+      "evidence_id": "E-SAMPLED",
+      "metric": "sampled_read_pairs",
+      "value": 138224,
+      "unit": "read_pairs",
+      "population": "sampled_input",
+      "source_group": "derived-read-pairs",
+      "derivation": {
+        "operation": "paired_read_pairs",
+        "input_evidence_ids": ["E-SAMPLED-READS"]
+      }
+    },
+    {
+      "evidence_id": "E-FILTERED",
+      "metric": "classified_or_unclassified_read_pairs",
+      "value": 125242,
+      "unit": "read_pairs",
+      "population": "filtered_reads",
+      "source_group": "kraken-screening",
+      "source": {
+        "artifact_type": "kraken_report",
+        "artifact_path": "artifacts/screening.kraken.report",
+        "locator": "root and unclassified aggregate",
+        "sha256": "7ca4f5175891596218082ee33d937660b38a19bedbcd82ef8242c5691baf263e",
+        "tool_id": "kraken2",
+        "tool_version": "unknown",
+        "reference_id": "screening-kraken",
+        "reference_version": "unknown"
+      }
+    },
+    {
+      "evidence_id": "E-VIRAL",
+      "metric": "viral_read_pairs",
+      "value": 33248,
+      "unit": "read_pairs",
+      "population": "viral_screening_hits",
+      "source_group": "kraken-screening",
+      "source": {
+        "artifact_type": "kraken_report",
+        "artifact_path": "artifacts/screening.kraken.report",
+        "locator": "viral clade aggregate",
+        "sha256": "7ca4f5175891596218082ee33d937660b38a19bedbcd82ef8242c5691baf263e",
+        "tool_id": "kraken2",
+        "tool_version": "unknown",
+        "reference_id": "screening-kraken",
+        "reference_version": "unknown"
+      }
+    },
+    {
+      "evidence_id": "E-CANDIDATE",
+      "metric": "candidate_read_pairs",
+      "value": 33247,
+      "unit": "read_pairs",
+      "population": "taxon_2955291",
+      "source_group": "kraken-screening",
+      "source": {
+        "artifact_type": "kraken_report",
+        "artifact_path": "artifacts/screening.kraken.report",
+        "locator": "taxid 2955291 clade count",
+        "sha256": "7ca4f5175891596218082ee33d937660b38a19bedbcd82ef8242c5691baf263e",
+        "tool_id": "kraken2",
+        "tool_version": "unknown",
+        "reference_id": "screening-kraken",
+        "reference_version": "unknown"
+      }
+    },
+    {
+      "evidence_id": "E-SAMPLE-FRACTION",
+      "metric": "candidate_fraction_of_sampled",
+      "value": 0.2405298645676583,
+      "unit": "ratio",
+      "population": "taxon_2955291_over_sampled_input",
+      "source_group": "derived-screening-ratios",
+      "denominator_evidence_id": "E-SAMPLED",
+      "derivation": {
+        "operation": "ratio",
+        "input_evidence_ids": ["E-CANDIDATE", "E-SAMPLED"]
+      }
+    },
+    {
+      "evidence_id": "E-VIRAL-FRACTION",
+      "metric": "candidate_fraction_of_viral",
+      "value": 0.9999699230028873,
+      "unit": "ratio",
+      "population": "taxon_2955291_over_viral_screening_hits",
+      "source_group": "derived-screening-ratios",
+      "denominator_evidence_id": "E-VIRAL",
+      "derivation": {
+        "operation": "ratio",
+        "input_evidence_ids": ["E-CANDIDATE", "E-VIRAL"]
+      }
+    },
+    {
+      "evidence_id": "E-FILTERED-FRACTION",
+      "metric": "candidate_fraction_of_filtered",
+      "value": 0.26546206544130563,
+      "unit": "ratio",
+      "population": "taxon_2955291_over_filtered_reads",
+      "source_group": "derived-screening-ratios",
+      "denominator_evidence_id": "E-FILTERED",
+      "derivation": {
+        "operation": "ratio",
+        "input_evidence_ids": ["E-CANDIDATE", "E-FILTERED"]
+      }
+    }
+  ],
+  "issues": [
+    {
+      "issue_id": "LIMIT-SAMPLED-SCOPE",
+      "kind": "limitation",
+      "message": "该证据来自冻结的初筛抽样，不代表全量分析。",
+      "evidence_ids": ["E-SAMPLED", "E-CANDIDATE"]
+    },
+    {
+      "issue_id": "LIMIT-REFERENCE-VERSION",
+      "kind": "limitation",
+      "message": "冻结证据未记录 Kraken 参考库版本。",
+      "evidence_ids": ["E-FILTERED", "E-VIRAL", "E-CANDIDATE"]
+    }
+  ]
+}

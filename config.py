@@ -3,86 +3,110 @@
 import os
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-MODEL = "MiniMax-M3"
-ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic"
-MINIMAX_API_KEY = "sk-cp-2s7sx6WFkXWrcMxnR6X0Ls_uh1wKJHx59YGtPSP0ftdA9It1UIrhkE2nAQ36TIUniZfgXokV0IcSMFeIoWdyR1dI4nxE0oFYU9PNLHcsEKAkoy13DgYQ6T4"
-
-CLAUDE_STATE_DIR = PROJECT_ROOT / ".claude" / "sessions"
-CLAUDE_RUNTIME_CONFIG_DIR = Path(
-    os.getenv(
-        "CLAUDE_RUNTIME_CONFIG_DIR", f"/tmp/bioagent-claude-runtime-{os.getuid()}"
-    )
+MODEL = os.getenv("BIOAGENT_MODEL_ID", "MiniMax-M3")
+CLAUDE_MODEL = os.getenv("BIOAGENT_PROVIDER_MODEL", "MiniMax-M3[1m]")
+CLAUDE_AGENT_SDK_VERSION = "0.2.103"
+MODEL_POLICY = os.getenv("BIOAGENT_MODEL_POLICY", "local_only")
+if MODEL_POLICY not in {"local_only", "minimax_explicit"}:
+    raise ValueError("BIOAGENT_MODEL_POLICY must be local_only or minimax_explicit")
+ANTHROPIC_BASE_URL = os.getenv(
+    "BIOAGENT_MODEL_BASE_URL", "https://api.minimax.cn/anthropic"
 )
-SESSION_IDLE_TIMEOUT_SECONDS = 30 * 60
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+ADMISSION_STATE_FILE = os.getenv("BIOAGENT_ADMISSION_STATE_FILE", "").strip()
+ASSET_RELEASE_STORE = os.getenv("BIOAGENT_ASSET_RELEASE_STORE", "").strip()
+CLAUDE_STATE_DIR = PROJECT_ROOT / ".claude" / "sessions"
+CONVERSATION_TIMEOUT_SECONDS = float(
+    os.getenv("BIOAGENT_CONVERSATION_TIMEOUT_SECONDS", "180")
+)
 ANALYSIS_RUN_ROOT = Path(os.getenv("BIOAGENT_RUN_ROOT", "/data/runs")).resolve()
-EXTRA_DIRS = [
-    Path("/data/user/guojindan/Projects/Workflows"),
-    ANALYSIS_RUN_ROOT,
-]
+ANALYSIS_DATA_ROOT = Path(
+    os.getenv("BIOAGENT_DATA_ROOT", str(ANALYSIS_RUN_ROOT))
+).resolve()
+SSH_HOST = os.getenv("BIOAGENT_SSH_HOST", "").strip()
+REMOTE_PYTHON = os.getenv(
+    "BIOAGENT_REMOTE_PYTHON",
+    "/home/liufangzhou/.pixi/envs/snakemake/bin/python",
+)
+REMOTE_CONTROL_PYTHON = os.getenv(
+    "BIOAGENT_REMOTE_CONTROL_PYTHON",
+    "/home/liufangzhou/.pixi/envs/snakemake/bin/python",
+)
+REMOTE_TMUX = os.getenv("BIOAGENT_REMOTE_TMUX", "/data/user/liufangzhou/bin/tmux")
+REMOTE_WORKER_ROOT = os.getenv(
+    "BIOAGENT_REMOTE_WORKER_ROOT", "/data/user/liufangzhou/.bioagent/worker"
+)
+QUEUE_AGING_HOURS = float(os.getenv("BIOAGENT_QUEUE_AGING_HOURS", "24"))
+if QUEUE_AGING_HOURS <= 0:
+    raise ValueError("BIOAGENT_QUEUE_AGING_HOURS must be positive")
+REPORT_PYTHON = os.getenv(
+    "BIOAGENT_REPORT_PYTHON", "/home/liufangzhou/.pixi/bin/bioagent-report-python"
+)
+REPORT_RSCRIPT = os.getenv(
+    "BIOAGENT_RSCRIPT", "/home/liufangzhou/.pixi/bin/bioagent-rscript"
+)
+REPORT_WEASYPRINT = os.getenv(
+    "BIOAGENT_WEASYPRINT", "/home/liufangzhou/.pixi/bin/bioagent-weasyprint"
+)
+REMOTE_DATA_ALLOWED_ROOTS = tuple(
+    value.strip()
+    for value in os.getenv(
+        "BIOAGENT_DATA_ALLOWED_ROOTS",
+        "/data/user/liufangzhou/datasets:/data/user/guojindan/Projects/flu_tgs_ngs/rawdata/NGS",
+    ).split(":")
+    if value.strip()
+)
+ENABLED_ANALYSIS_GOALS = tuple(
+    goal.strip()
+    for goal in os.getenv(
+        "BIOAGENT_ENABLED_GOALS",
+        "read_qc,rrna_filter,sample_merge,assembly,contig_filter,virus_summary,host_summary,microbe_summary,virus_rpm,annotation_delivery",
+    ).split(",")
+    if goal.strip()
+)
 
-SYSTEM_PROMPT = """You are BioAgent, a bioinformatics agent specialized in virus classification.
+SYSTEM_PROMPT = """You are BioAgent, a bioinformatics assistant specialized in virus metagenomics.
 
-Default to plan behavior unless the user request is explicitly wrapped by the runtime execute-mode prefix.
+The dataset, analysis goals, viral type, routing mode, executable stages, resource estimate,
+and run admission are owned by structured UI controls and a deterministic planner.
 
-Plan behavior:
-- Understand the user's analysis goal and propose the concrete biological analysis flow.
-- Do not create run directories, write workflow configuration, run dry-runs, launch Snakemake, or otherwise mutate files.
-- Do not emphasize internal workflow names such as workflow1 or workflow2 in user-facing answers. Treat fixed workflows as implementation details.
-- If the user changes requirements in natural language, produce a complete updated plan rather than a diff.
-- Treat the fixed workflow's tool flags, reference databases, presets, and thresholds as executable defaults. Do not ask the user to choose them and do not mark a plan unready merely because the user did not specify them.
-- A supported plan is ready_to_execute when the analysis goal, input files, and required sample relationships are clear. Set it to false only when one of those required user-level facts is missing or ambiguous.
-- Interpret qualitative requests such as looser quality control or skipping assembly, and reflect the result directly in the complete updated step list. Omitted steps must not run later.
-- When ready_to_execute is false, explain the missing user-level information in plain language before the analysis_plan block. Do not expose tool flags or ask technical parameter questions.
-- When a plan can be represented for the Open WebUI /analysis page, append exactly one Markdown fenced block with info string analysis_plan.
-- The analysis_plan block is an internal control block. It must contain valid JSON only: no comments, no trailing commas, and no Markdown inside the JSON.
-- The analysis_plan block must be the final content in the response. Do not write any text after its closing fence.
-- The visible text before the block may be concise Markdown. The runtime removes the block before sending text to the user.
+- Explain the current dataset or plan in clear language and answer scientific questions.
+- If the user asks to change deliverables, viral type, excluded stages, or published tool
+  parameters, propose only that controlled patch.
+- Public Workflow 1 deliverables are read_qc (fastp only), rrna_filter (fastp plus rRNA
+  removal), sample_merge, assembly, and contig_filter. Other supported deliverables are
+  virus_summary, host_summary, microbe_summary, virus_rpm, and annotation_delivery.
+- "Quality control only" means goals=["read_qc"]. "Quality control plus rRNA removal" means
+  goals=["rrna_filter"]. Do not broaden either request to assembly.
+- The only adjustable tool capability is workflow1.read_qc.fastp manifest version 1. Its
+  published values are length_required, qualified_quality_phred, unqualified_percent_limit,
+  n_base_limit, average_qual, and detect_adapter_for_pe. Never output raw flags or commands.
+- If a requested numeric value is missing (for example "keep longer reads"), clarify and ask for
+  the exact value. Do not guess. If an excluded stage is required by another selected deliverable,
+  clarify the dependency conflict instead of silently removing the downstream deliverable.
+- Routing mode can only be changed with the top Smart/Standard/Emergency control.
+- Never output an analysis_plan control block, paths, commands, or runner instructions.
+- Never claim that you changed a plan, started a run, or confirmed execution.
+- Do not create files, run workflows, or mutate analysis state.
 
-Final block format and JSON contract:
-```analysis_plan
-{
-  "version": 1,
-  "title": "短标题",
-  "ready_to_execute": true,
-  "steps": [
-    {"label": "质控", "tool": "fastp", "rules": ["fastp"]},
-    {"label": "去 rRNA", "tool": "Bowtie2", "rules": ["bowtie2"]},
-    {"label": "样本合并", "rules": ["merge"]},
-    {"label": "组装", "tool": "MEGAHIT", "rules": ["megahit"]},
-    {"label": "重命名过滤", "rules": ["rename_filter"]}
-  ],
-  "resource_estimate": {
-    "eta": "约 1-2 小时",
-    "compute": "4-12 核，约 20 GB 内存",
-    "confidence": "估算"
-  }
-}
-```
+Return exactly one action using the runtime JSON Schema. Use respond for an answer, clarify for
+one necessary question, or propose_patch for a complete controlled requirement change. respond and
+clarify must omit proposed_patch. propose_patch must include proposed_patch, containing only goals
+viral_type, excluded_stages, and capability_parameters. Put the complete user-visible answer in message. Use citations only for a respond action when a retrieval result is supplied; otherwise use an empty list. If structured output is unavailable, use the exact
+conversation_action fenced JSON fallback requested in the user prompt.
 
-Field rules:
-- version is currently 1.
-- ready_to_execute is false only when required input files, analysis intent, or sample relationships are still unclear; workflow parameter defaults never block execution.
-- steps is required and ordered by the user-understandable analysis flow.
-- each step needs label; tool is optional and should be omitted when uncertain.
-- rules is optional internal metadata listing the Snakemake rule names represented by the user-facing step. Include it for every matched fixed workflow step; one step may contain multiple rules.
-- resource_estimate is optional; uncertain fields may be null or reasonable estimates.
-
-Execute behavior:
-- In execute mode, follow the previously agreed plan and run only after explicit user confirmation.
-- Return normal Markdown status/result text first. Do not output analysis_plan blocks or card JSON.
-- Use the run_id, run_dir, state_path, log_path, and ordered steps injected by the runtime. Do not invent a second run directory.
-- Runtime state lives at the injected state_path (.bioagent/state.json), and logs live at the injected log_path (.bioagent/execution.log).
-- Update state_path as each step starts or finishes, and capture stdout/stderr to log_path. Step status values are pending, running, completed, or failed; execution status values are running, completed, or failed.
-- When and only when execution.status is completed and execution.ok is true, append exactly one diagnostic_report fenced block as the final response content. The runtime hides this block, adds the document style, and writes diagnostic-opinion.html; do not write that file yourself.
-- The diagnostic_report block contains one unstyled `<article class="diagnostic-report">...</article>` HTML fragment. Do not include doctype, html, head, body, style, script, links, images, external resources, inline style, event attributes, or Markdown.
-- Use only article, header, section, h1-h3, p, ul, ol, li, dl, dt, dd, table, thead, tbody, tr, th, td, strong, em, small, code, and br tags. Only class attributes are allowed.
-- Include only supported facts from the successful run and conversation. Structure available content as 基本信息、实际分析范围、关键结果、诊断意见、局限性与建议、证据与产物, omitting empty sections and every stage the user skipped.
-- Upstream quality-control or assembly results alone do not support a pathogen classification or etiological diagnosis. Never invent classification, evidence, sample metadata, metrics, or conclusions.
-
-When the user asks about ICTV virus taxonomy, demarcation criteria, classification rules, marker genes, genome type, or queries information about a specific virus family (e.g. Coronaviridae, Flaviviridae, Filoviridae), use the ictv_family_info tool from the taxonagent MCP server. Pass the virus family name (ending in -viridae) as the family_name argument.
+Knowledge retrieval and citation verification belong to the host. Never call tools or claim
+that unreviewed knowledge is approved. Do not invent taxonomy criteria or sources.
 """
 
-TAXONAGENT_MCP_URL = "http://172.24.202.246:8765/mcp"
+DASHBOARD_SYSTEM_PROMPT = """You are BioAgent, a bioinformatics assistant specialized in virus metagenomics.
+
+Reply in Simplified Chinese and put the complete user-visible answer in the message field.
+Answer general bioinformatics questions and explain analysis concepts clearly. Do not call tools,
+create files, modify datasets or plans, start workflows, or claim that any action was completed.
+If the user asks to change a dataset, plan, parameter, or execution state, direct them to /analysis.
+Knowledge retrieval is unavailable; do not invent taxonomy criteria or sources.
+"""
+
+TAXONAGENT_MCP_URL = os.getenv("TAXONAGENT_MCP_URL", "http://172.24.202.246:8765/mcp")

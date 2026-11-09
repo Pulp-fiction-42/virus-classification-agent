@@ -1,0 +1,33 @@
+{
+  "release_id": "b3-engineering-integrity-rules-v1",
+  "scope": "engineering_integrity_only",
+  "review_status": "approved",
+  "review_record": "deterministic integrity checks derived from CandidateEvidence v2; no domain thresholds or biological conclusions",
+  "rules": [
+    {
+      "rule_id": "EVIDENCE_MISSING",
+      "severity": "missing",
+      "message": "候选证据存在缺失观测；缺失值保持缺失，不按零处理。"
+    },
+    {
+      "rule_id": "EVIDENCE_CONFLICT",
+      "severity": "conflict",
+      "message": "候选证据包含必须保留并复核的冲突。"
+    },
+    {
+      "rule_id": "DEPENDENCY_IDENTITY_INCOMPLETE",
+      "severity": "limitation",
+      "message": "计算工具、流程源码、解析器或参考资料身份不完整，不能据此形成正式研判。"
+    },
+    {
+      "rule_id": "CORRELATED_EVIDENCE",
+      "severity": "limitation",
+      "message": "多项观测来自同一来源分组，不得重复视为相互独立的支持证据。"
+    },
+    {
+      "rule_id": "DOMAIN_ASSETS_PENDING",
+      "severity": "missing",
+      "message": "尚无核准的领域规则与知识资产，本次仅保留工程检查，不生成生物学研判。"
+    }
+  ]
+}
