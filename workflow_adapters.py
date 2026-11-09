@@ -114,7 +114,7 @@ class AdapterSettings:
             workflow2_source=Path(
                 os.getenv(
                     "BIOAGENT_WORKFLOW2_SOURCE",
-                    "/data/user/guojindan/Projects/Workflows/workflow2_virusid_2026db",
+                    "/data/user/guojindan/Projects/Workflows/workflow2_virusid_2026viral",
                 )
             ),
             workflow3_source=Path(

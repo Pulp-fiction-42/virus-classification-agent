@@ -5,10 +5,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from fastapi import HTTPException
-from pydantic import ValidationError
-from starlette.requests import Request
-
 import adapter
 from adapter import (
     CandidateAssessmentsRequest,
@@ -19,9 +15,12 @@ from adapter import (
     error_sse,
 )
 from deterministic_planner import PlannerError
+from fastapi import HTTPException
+from pydantic import ValidationError
 from remote_client import RemoteConnectionError, RemoteExecutionError
 from runtime import SessionStateError, TextDelta
 from runtime_errors import ConversationPublicError
+from starlette.requests import Request
 
 
 def request_with_headers(**headers: str) -> Request:
@@ -219,6 +218,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["knowledge"]["provider"], "sqlite_fts5")
         self.assertEqual(result["knowledge"]["release_id"], "engineering-knowledge-v4")
         self.assertEqual(result["knowledge"]["scope"], "engineering_contract")
+        self.assertEqual(result["knowledge"]["taxonomy"]["status"], "disabled")
         self.assertEqual(result["admission"]["status"], "accepting")
         self.assertEqual(result["asset_release"]["status"], "not_configured")
 
@@ -360,12 +360,17 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 plan_id="pl_test",
                 plan_revision=3,
                 run_id="analysis-fixed",
-                queue_context={"project_id": "project-test", "project_priority": "high"},
+                queue_context={
+                    "project_id": "project-test",
+                    "project_priority": "high",
+                },
             )
         )
         self.assertEqual(result["status"], "running")
         self.assertEqual(fake.start_calls[0]["run_id"], "analysis-fixed")
-        self.assertEqual(fake.start_calls[0]["queue_context"]["project_priority"], "high")
+        self.assertEqual(
+            fake.start_calls[0]["queue_context"]["project_priority"], "high"
+        )
 
     def test_start_api_rejects_extra_queue_context_fields(self):
         with self.assertRaises(ValidationError):
@@ -400,7 +405,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.resume_calls[0]["run_id"], "analysis-fixed")
         self.assertNotIn("queue_context", fake.resume_calls[0])
 
-    async def test_resume_api_maps_temporary_verification_failure_to_retryable_503(self):
+    async def test_resume_api_maps_temporary_verification_failure_to_retryable_503(
+        self,
+    ):
         adapter.planner = FakePlanner(
             resume_error=RemoteConnectionError("Cyclone unavailable")
         )
@@ -417,9 +424,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.resume_analysis_run(request)
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(
-            raised.exception.detail["code"], "RECOVERY_CHECK_UNAVAILABLE"
-        )
+        self.assertEqual(raised.exception.detail["code"], "RECOVERY_CHECK_UNAVAILABLE")
         self.assertTrue(raised.exception.detail["retryable"])
 
     async def test_resume_api_preserves_stable_worker_rejection_code(self):
@@ -463,9 +468,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.resume_analysis_run(request)
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(
-            raised.exception.detail["code"], "RECOVERY_CHECK_UNAVAILABLE"
-        )
+        self.assertEqual(raised.exception.detail["code"], "RECOVERY_CHECK_UNAVAILABLE")
         self.assertTrue(raised.exception.detail["retryable"])
 
     async def test_metadata_task_uses_ephemeral_session(self):

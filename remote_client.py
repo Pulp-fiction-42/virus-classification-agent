@@ -51,7 +51,7 @@ RUNNER_ENV_DEFAULTS = {
     "BIOAGENT_SNAKEMAKE": "/home/liufangzhou/.pixi/bin/snakemake",
     "BIOAGENT_SEQKIT": "/home/liufangzhou/.pixi/bin/seqkit",
     "BIOAGENT_WORKFLOW1_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow1_upstream",
-    "BIOAGENT_WORKFLOW2_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow2_virusid_2026db",
+    "BIOAGENT_WORKFLOW2_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow2_virusid_2026viral",
     "BIOAGENT_WORKFLOW3_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow3_hostid",
     "BIOAGENT_WORKFLOW4_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow4_kraken_bracken",
     "BIOAGENT_WORKFLOW5_SOURCE": "/data/user/guojindan/Projects/Workflows/workflow5_virus_quantification",

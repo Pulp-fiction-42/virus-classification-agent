@@ -11,10 +11,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
-
 import config
 from admission_control import AdmissionUnavailable, admission_status, require_admission
 from asset_release_binding import (
@@ -29,6 +25,8 @@ from conversation_events import (
 )
 from deterministic_planner import DeterministicPlanner, PlannerError
 from deterministic_runtime import DeterministicRuntime, RemoteDeterministicRuntime
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from priority_reports import (
     build_fact_packet,
     build_reasoning_plan,
@@ -41,6 +39,7 @@ from provider import (
     claude_agent_sdk_ready,
     claude_agent_sdk_version,
 )
+from pydantic import BaseModel, ConfigDict, Field
 from remote_client import (
     RemoteConnectionError,
     RemoteExecutionError,
@@ -294,7 +293,7 @@ async def list_models():
 @app.get("/v1/analysis/health")
 @app.get("/analysis/health")
 async def analysis_health():
-    knowledge = conversation_sessions().knowledge_status()
+    knowledge = await conversation_sessions().knowledge_status()
     remote = {"status": "local"}
     if remote_worker.enabled:
         try:
@@ -449,7 +448,9 @@ async def remote_analysis_status_summary(req: RunStatusSummaryRequest):
     if any(not RUN_ID_RE.fullmatch(run_id) for run_id in req.run_ids):
         raise HTTPException(status_code=422, detail="invalid analysis run ID")
     worker = _remote_required()
-    return await run_status_cache.summary(list(dict.fromkeys(req.run_ids)), worker.invoke)
+    return await run_status_cache.summary(
+        list(dict.fromkeys(req.run_ids)), worker.invoke
+    )
 
 
 @app.post("/v1/analysis/runs/candidate-assessments")
@@ -485,9 +486,7 @@ async def remote_analysis_delivery_report(run_dir: str, format: Literal["html", 
 @app.post("/v1/analysis/runs/priority-reports")
 @app.post("/analysis/runs/priority-reports")
 async def generate_priority_report_artifacts(req: PriorityReportRequest):
-    snapshot = await _remote_call(
-        "snapshot", run_dir=req.run_dir, report_kind="final"
-    )
+    snapshot = await _remote_call("snapshot", run_dir=req.run_dir, report_kind="final")
     state = snapshot.get("state")
     telemetry = snapshot.get("telemetry")
     if not isinstance(state, dict) or not isinstance(telemetry, dict):
@@ -679,7 +678,9 @@ async def resume_analysis_run(req: ResumeRunRequest):
         raise HTTPException(
             status_code=503 if unavailable else 409,
             detail={
-                "code": code if separator and code.startswith("RECOVERY_") else "RECOVERY_REJECTED",
+                "code": code
+                if separator and code.startswith("RECOVERY_")
+                else "RECOVERY_REJECTED",
                 "message": message.strip() if separator else raw,
                 "retryable": bool(unavailable),
             },

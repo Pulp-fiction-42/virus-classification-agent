@@ -109,4 +109,4 @@ If the user asks to change a dataset, plan, parameter, or execution state, direc
 Knowledge retrieval is unavailable; do not invent taxonomy criteria or sources.
 """
 
-TAXONAGENT_MCP_URL = os.getenv("TAXONAGENT_MCP_URL", "http://172.24.202.246:8765/mcp")
+TAXONAGENT_MCP_URL = os.getenv("TAXONAGENT_MCP_URL", "").strip()
